@@ -1,0 +1,1168 @@
+    Sabre: Hardware-Accelerated Snapshot
+     Compression for Serverless MicroVMs
+Nikita Lazarev and Varun Gohil, MIT, CSAIL; James Tsai, Andy Anderson,
+    and Bhushan Chitlur, Intel Labs; Zhiru Zhang, Cornell University;
+                   Christina Delimitrou, MIT, CSAIL
+        https://www.usenix.org/conference/osdi24/presentation/lazarev
+
+
+
+
+    This paper is included in the Proceedings of the
+    18th USENIX Symposium on Operating Systems
+             Design and Implementation.
+                July 10–12, 2024 • Santa Clara, CA, USA
+                             978-1-939133-40-3
+
+
+                                      Open access to the Proceedings of the
+                                      18th USENIX Symposium on Operating
+                                       Systems Design and Implementation
+                                                is sponsored by
+    Sabre: Hardware-Accelerated Snapshot Compression for Serverless MicroVMs
+
+               Nikita Lazarev Varun Gohil James Tsai† Andy Anderson† Bhushan Chitlur†
+                                   Zhiru Zhang§ Christina Delimitrou
+                              MIT, CSAIL † Intel Labs § Cornell University
+
+
+
+                         Abstract                                 are terminated, achieving a pay-as-you-go model. This both
+                                                                  avoids resource overprovisioning, which has been a long-
+MicroVM snapshotting significantly reduces the cold start
+                                                                  standing issue with cloud infrastructures [22, 28, 58] and re-
+overheads in serverless applications. Snapshotting enables
+                                                                  duces the end-to-end deployment cost [33, 46].
+storing part of the physical memory of a microVM guest into
+                                                                     Serverless is based on lightweight virtualization/isolation
+a file, and later restoring from it to avoid long cold start-up
+                                                                  technologies [19] such as Docker, Google gVisor [3], Kata
+times. Prefetching memory pages from snapshots can further
+                                                                  containers [10], NEC’s LightVMs [53], and AWS Firecracker
+improve the effectiveness of snapshotting. However, the effi-
+                                                                  microVMs [17]. These technologies implement sandboxes for
+cacy of prefetching depends on the size of the memory that
+                                                                  executing containerized applications with different levels of
+needs to be restored. Lossless page compression is therefore
+                                                                  isolation. For example, gVisor implements a lightweight user
+a great way to improve the coverage of the memory foot-
+                                                                  space kernel capable of executing most of the system calls
+print that snapshotting with prefetching achieves. Unfortu-
+                                                                  within the sandbox. On the other hand, Firecracker is a full
+nately, the high overhead and high CPU cost of software-based
+                                                                  lightweight virtualization technology, based on KVM, which
+(de)compression make this impractical.
+                                                                  can boot standard Linux kernels in sub-second time [17]. Due
+   We introduce Sabre, a novel approach to snapshot page
+                                                                  to the high isolation guarantees of microVMs, security, and
+prefetching based on hardware-accelerated (de)compression.
+                                                                  performance, Firecracker is widely used in serverless clouds.
+Sabre leverages an increasingly pervasive near-memory ana-
+lytics accelerator available in modern datacenter processors.        Despite its advantages, serverless and microVMs introduce
+We show that by appropriately leveraging such accelerators,       a few critical overheads to performance. A major overhead is
+microVM snapshots of serverless applications can be com-          cold starts (or cold boots) – the overhead of the initial boot
+pressed up to a factor of 4.5⇥, with nearly negligible decom-     of container sandboxes upon a function invocation. Both in-
+pression costs. We use this insight to build an efficient page    dustry and academia have proposed numerous techniques to
+prefetching library capable of speeding up memory restora-        mitigate cold start overheads [31, 35, 64, 73], with one of the
+tion from snapshots by up to 55%. We integrate the library        most promising being VM snapshotting [31]. VM snapshots
+with the production-grade Firecracker microVMs and eval-          capture the current state of the VM and its physical memory
+uate its end-to-end performance on a wide set of serverless       and save them in a file. During the next boot, the guest sys-
+applications.                                                     tem is restored from the file instead of booting from scratch.
+                                                                  Several different techniques can be used to make snapshots,
+                                                                  depending on which parts of the guest’s physical memory
+1    Introduction                                                 should be saved. For instance, Firecracker can snapshot the
+                                                                  full guest memory or only the dirty pages. Additionally, re-
+Serverless is an emerging cloud computing paradigm gain-          cent studies have proposed using working sets of pages [71]
+ing widespread popularity across applications of different        to make serverless VM snapshots smaller, faster to fetch, and
+classes, from lightweight interactive services [73] to highly     overall more efficient [20, 64] in reducing cold starts. How-
+data-parallel applications, such as machine learning and video    ever, independent of the underlying techniques used to create
+encoding [21,24,40,47,67]. Serverless offers a Function-as-a-     snapshots, the overhead of storing and prefetching them is
+Service (FaaS) execution model, where applications instanti-      non-negligible. Unfortunately, the latter is on the critical path
+ate short-lived, fine-grained resources on-demand without the     of VM restoration and therefore directly impacts cold starts.
+overhead of provisioning and deployment typical cloud envi-          Reducing the size of snapshots can make them signifi-
+ronments incur. When requests are processed, the resources        cantly more efficient, for example through lossless memory
+
+
+
+USENIX Association                             18th USENIX Symposium on Operating Systems Design and Implementation              1
+compression. While memory compression has been used                 enabling higher elasticity for applications with high paral-
+in domains where the application performance is not crit-           lelism and intermittent activity. Lightweight virtualization
+ical (e.g., zswap [39], zram [38] in Android OS for mo-             technologies (or microVMs) became a popular choice for
+bile devices), in serverless the restoration of a memory            cloud providers due to the isolation and fast instantiation they
+snapshot is on the critical path, precluding the use of ex-         provide [17, 69]. Fully virtualized VMs running over Type-
+isting software-based (de)compression algorithms. At the            1 hypervisors, such as KVM [37] or Hyper-V [70], allow
+same time, there are numerous hardware implementations              isolating tenants down to hardware and provide the highest
+of (de)compression [23, 41, 51, 52, 56], however, they had          security guarantees for applications running in the cloud. On
+not, until now, been implemented in mainstream datacenter           the other hand, microVMs are much faster to boot and have a
+processors [43]. In particular, Intel recently released the In-     much smaller memory footprint than traditional Type-1 vir-
+Memory Analytics Accelerator (IAA) [6] in their 4th Gen             tual machines. This means that microVMs achieve the best
+Xeon Scalable CPUs, which enables efficient compression for         of both worlds between containers and Type-1 hypervisors.
+datacenter applications at scale.                                   MicroVMs are widely used in serverless, where applications
+   We present Sabre, a hardware-accelerated general-purpose         require both strong isolation guarantees and fast start-up.
+memory prefetching system, which uses lossless compression             Modern microVMs, such as AWS Firecracker [17], use
+mechanisms, such as IAA, to compress and restore microVM            several optimizations to boot up in sub-seconds. However,
+snapshots. This paper makes two major contributions. First,         booting the VM itself is only part of the end-to-end applica-
+we characterize, for the first time, the IAA accelerator on a set   tion execution latency [31, 64], with a significant component
+of diverse benchmarks, and show its potential for compressing       corresponding to the initialization of the software dependen-
+memory pages. We show that IAA can compress pages by                cies after the boot. For applications based on complex multi-
+2 4.5⇥, depending on the underlying page selection algo-            layer stacks, such as gRPC servers and JavaScript runtimes,
+rithm. Moreover, we show that decompression can be done             bringing up the dependencies might be as high as several
+up to 10⇥ faster with hardware acceleration, and with careful       seconds [31]. Additionally, the applications themselves can
+design, this time can be entirely hidden behind the disk I/O        contain long-running initialization routines, which also con-
+and page fault handling. This results in near-free decompres-       tribute to end-to-end latency. For example, machine learning
+sion in terms of the overall memory restoration latency, while      (ML) services need to load the models before serving infer-
+reducing the size and the loading time of snapshot pages.           ence queries. Altogether, this makes the end-to-end execu-
+   Second, based on this characterization, we build Sabre           tion of the first batch of requests running on freshly booted
+and integrate it with the Firecracker virtual machine mon-          microVMs an order of magnitude slower than subsequent
+itor (VMM) in a serverless environment with snapshotting            requests. This is known as cold start, and all microVMs are
+support. Sabre is agnostic to the underlying page snapshotting      prone to it.
+policy, it operates entirely in the host’s user space, and inter-      Mitigating cold starts is one of the most well-researched
+acts with the IAA accelerator via the Shared Virtual Memory         aspects of microVMs [65]. Existing solutions range from
+(SVM) mechanism. The latter enables out-of-box and trans-           scheduling techniques optimized for specific applications to
+parent integration of Sabre with existing VMMs at scale.            runtime and infrastructure optimizations [54, 73]. One solu-
+   We evaluate Sabre on its efficiency in restoring microVMs        tion that is generally agnostic to applications is VM snapshot-
+from snapshots across a wide range of end-to-end serverless         ting [31].
+applications using two methods of creating snapshots: dirty
+page-based and working set-based. We show that Sabre com-
+presses microVM snapshots up to 4.5⇥ without introducing            2.2    MicroVM Snapshotting and Prefetching
+any decompression overheads. Moreover, we show that Sabre           Snapshotting is a technology that allows storing the VM state
+enables up to 55% faster memory restoration, which results          and guest OS physical memory in a file in the local or remote
+in an additional reduction of the end-to-end cold start time by     filesystem. Snapshots are usually created after the VM and the
+20% with respect to already optimized state-of-the-art snap-        application logic with all its dependencies are fully initialized
+shotting baselines.                                                 and ready to serve requests. Upon the next invocation of the
+   Sabre is open-source software and it is available at the         VM the hypervisor restores the VM state and guest memory
+following link [13].                                                from the snapshot, instead of booting the VM from scratch.
+                                                                    This dramatically reduces cold start overheads.
+2     Background                                                       In the most basic case, snapshots contain the entire guest
+                                                                    physical memory. Some hypervisors, such as Firecracker, also
+2.1     MicroVMs for Serverless                                     allow dirty-memory tracking, which only stores the dirty guest
+                                                                    pages as seen by the hypervisor. Snapshots can be organized
+Serverless is gaining popularity across many application            hierarchically following the software dependencies of appli-
+domains by reducing the cloud provisioning overhead and             cations [31]. However, recovering from snapshots is far from
+
+
+
+2     18th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+free. In some cases, the size of the snapshots can be as high as      ping for non-performance critical applications. Unfortunately,
+the whole guest memory, therefore precluding the possibility          this does not apply to microVM memory restoration, where
+of loading pages from snapshots in advance. For this reason,          decompression directly impacts the cold start overhead.
+existing commercial microVMs implement memory restora-                   There have been many proposals for accelerating mem-
+tion via on-demand paging. Unfortunately, on-demand paging            ory compression in hardware. For example, Pekhimenko et.
+yields a lot of page faults on the critical path of the restoration   al. [56] propose base-delta compression for on-chip caches.
+from snapshots, which slows down request execution.                   Hoyong et. al. [41] derive a novel compression algorithm
+   A way to reduce the overhead of page faults is to enable           for GPU memory. Li et al. [52] introduced a hardware accel-
+prefetching of pages from snapshots. This can be efficiently          erator for the compression of genome sequences. All such
+done through, for example, working set (WS) estimation. This          proposals are based on application-specific, special-purpose
+approach has been used to create VM checkpoints [71], and             compression accelerators and algorithms, and therefore have
+recently – for serverless microVMs [64]. Here, each snapshot          never been implemented on commodity datacenter proces-
+is accommodated in a WS file, storing pages that are likely           sors. Many (de)compression accelerators are based on FPGA
+to be accessed during subsequent invocations. There are dif-          cards [25, 34, 50, 57] which are only available in a small set
+ferent ways of constructing WS files [20, 64, 71] according           of public clouds. However, the demand for general-purpose
+to various working set estimation techniques. For example,            (de)compression acceleration at scale is actively growing.
+in Record-and-Replay (REAP) [64], the authors propose to                 (De)Compression is known to be one of the major sources
+record all guest pages being accessed during the first invo-          of datacenter tax [36,42,61]. A recent study from Google [36]
+cation of serverless functions and put them into the WS file.         showed that compression accounts for up to 30% of cycles for
+Upon the next invocation, the WS file can be prefetched from          large-scale database applications, such as BigTable and Big-
+the disk, and the WS pages can be installed in the guest’s            Query [32,62], and it is also extensively used in many other ap-
+memory to speed up the next cold invocations. REAP works              plications. This motivates cloud providers and chip vendors to
+well for applications with a similar working set across dif-          build efficient hardware accelerators [43] for general-purpose
+ferent invocations of the same function. When this does not           lossless (de)compression. The primary use cases for such
+hold, REAP can fail to deliver good performance; in this              accelerators are databases and query-processing engines. In
+case, prefetching some other subset of dirty pages (or even           particular, Intel recently introduced the In-Memory Analytic
+all dirty pages) can be more beneficial. Snapshots generally          Accelerator (IAA), which is now part of commodity datacen-
+consume a lot of disk space and require cloud providers to            ter processors, such as the Xeon 4th Generation CPUs, which
+carefully provision their storage resources [2]. Even working-        are already widely available. This accelerator can perform
+set-based snapshots can sometimes be as large as a few hun-           DEFLATE compression, which is suitable for compressing
+dred megabytes [20]. This is non-negligible given that a single       memory footprints. While other compression algorithms that
+server might host hundreds of microVMs.                               are optimized for performance (e.g., Snappy, zstd, LZ4) can
+   Independently of the underlying technique to create mi-            compress memory faster, they typically result in much lower
+croVM snapshots and/or WS files, the efficiency of prefetch-          compression ratios, which is critical for microVM snapshot-
+ing depends on the memory size that needs to be restored              ting. Their software implementations increase the amount
+from the disk into the guest memory. A general rule to make           of CPU resources required for making snapshots, especially
+prefetching-based techniques more efficient is to reduce the          when configured for more aggressive compression [1]. At the
+size of the snapshots/WS files. This also reduces the disk            same time, hardware-accelerated DEFLATE yields high com-
+space needed to store snapshots. This size reduction can be           pression ratios as well as high speed, while requiring no CPU
+achieved through memory compression. However, memory                  cycles for (de)compression. It should also be noted that hard-
+restoration happens on the critical path of the VM boot-up,           ware accelerators for other compression algorithms are also
+and for compression algorithms with high deflate ratios, the          feasible [16, 26, 60] but not yet implemented in mainstream
+decompression might take a long time. Moreover, such al-              datacenter processors at scale.
+gorithms usually consume a lot of CPU time for compres-                  IAA and other similar accelerators are designed for cloud
+sion and therefore VM snapshotting. This makes the use of             environments. They are typically implemented as on-chip
+software memory compression for microVM snapshotting                  near-memory PCIe components, which allows them to be
+undesirable.                                                          easily integrated with cloud services. For instance, IAA can
+                                                                      run entirely in user space, it operates transparently over the
+                                                                      application’s virtual memory and can be virtualized through
+2.3    Hardware-Accelerated (De)Compression
+                                                                      standard technologies, such as S-IOV [8]. All this makes IAA
+Software-based memory compression has been extensively                attractive for microVM memory snapshotting and prefetching.
+used in applications where performance is not critical. For           In this work, we explore this direction.
+example, zram [38] is used in Android OS on mobile devices,              We first characterize the capabilities of IAA when it comes
+while zswap [39] can improve the efficiency of memory swap-           to compressing memory pages. Based on this characterization,
+
+
+
+USENIX Association                                18th USENIX Symposium on Operating Systems Design and Implementation              3
+we design Sabre, a memory prefetching system for microVMs           to the accelerator’s Processing Units (PEs), such as the lo-
+built using IAA. Finally, we show how our memory prefetch-          cations of the source and destination buffers, opcodes, and
+ing unit integrates with serverless microVMs and evaluate its       operational and memory policy flags. Descriptors are submit-
+impact on end-to-end serverless benchmarks.                         ted to the accelerator via the ENQCMD instruction directly
+                                                                    from user space, which writes them into the device’s memory-
+                                                                    mapped I/O (MMIO) registers. Upon receiving descriptors,
+3     In-Memory Analytic Accelerator: Overview,
+                                                                    the PEs fetch data based on the pointers in the descriptors.
+      Characterization, Insights                                    This is done through SVM which enables transparent sharing
+                                                                    of the application’s virtual memory with accelerators. When
+We now present an overview and characterization of the Intel
+                                                                    a PE finishes processing, it writes the corresponding com-
+In-Memory Analytic Accelerator (IAA) [6] using a set of
+                                                                    pletion record with the status information. The software can
+diverse benchmarks [15]. This work mainly focuses on the
+                                                                    poll the completion records to identify the termination of
+compression/decompression capabilities of the accelerator.
+                                                                    tasks and any error information. If some application memory
+However, given that other capabilities share the same IAA
+                                                                    pages associated with data buffers are not available, the ac-
+frontend pipeline, interfaces, and software semantics, most
+                                                                    celerator can request them via either Page Request Service
+of our findings also apply to these other domains. To our
+                                                                    (PRS) or through userspace page fault handling. In the latter
+knowledge, this is the first publicly available characterization
+                                                                    case, software applications can resolve the page faults in a
+of the IAA hardware. The insights from this characterization
+                                                                    more suitable for a particular usage scenario way (e.g., by
+are used to derive the design of Sabre, described in Section 4.
+                                                                    requesting pages from, for example, the network) in the user
+   Note that given the diverse set of execution models, con-
+                                                                    space.
+figurations, workloads, and variations of IAA hardware in
+different SKUs, it may be possible to achieve even higher              IAA’s       job    submission       mechanism         enables
+performance compared to what we showcase in our char-               asynchronous/non-blocking and out-of-order process-
+acterization. Specifically, benchmarks designed specifically        ing of descriptors. The current hardware permits a large
+to stress test the accelerator may be able to improve IAA’s         number of in-flight requests, which can be submitted from dif-
+performance further. For the purpose of this paper, we only         ferent threads and processes/tenants. The micro-architectural
+benchmark the accelerator with a set of scenarios required to       pipeline of the IAA hardware contains multiple PEs that can
+give comprehensive insights into using in-memory compres-           execute jobs concurrently. The DSA specification [4] and
+sion techniques in serverlerss microVMs and to derive the           in-depth characterization [48] contain more details since both
+design of Sabre.                                                    accelerators share the same specification for this part.
+                                                                       The IAA hardware contains PEs implementing different
+                                                                    processing capabilities. These include encryption, compres-
+3.1     Overview of the IAA                                         sion, CRC offload, data filtering, scanning, extraction, selec-
+Intel’s IAA is a hardware accelerator first introduced in Intel’s   tion, and expansion [5] (Table 3-1). Due to the scope of this
+4th Gen Xeon Scalable Processors (code-named Sapphire               work, we only focus on characterizing the (de)compression
+Rapids) [12] to speed up data processing across application         capability of IAA. IAA performs DEFLATE [30] compres-
+classes. It was designed with the primary use case being            sion, as defined in RFC 1951. DEFLATE is based on LZ77
+databases and query processing systems [7]. The accelerator         matching and Huffman encoding. LZ77 matching eliminates
+physically resides in the uncore part of the processor’s SoC        redundancy by replacing repeated occurrences of substrings
+near the memory controller and Last Level Cache. A single           with references to a single version of the substring. This is
+CPU can accommodate multiple IAA devices on its SoC.                a computationally intensive process making software imple-
+   The IAA accelerators are logically integrated as PCIe de-        mentations slow. The Huffman coder further deflates data by
+vices and exposed to the host as a single root complex inte-        re-encoding the most common symbols with fewer bits using
+grated endpoint. This is set up to enable transparent integra-      statistics of data distribution in the input stream. Internally,
+tion of the accelerators with software. IAA features scalabil-      the IAA compression unit operates in three modes.
+ity, full virtualization support via PCIe S-IOV, Shared Virtual        In the first – Huffman-mode, IAA performs hardware-
+Memory support (SVM or SVA as defined by Linux kernel               accelerated LZ77 dictionary coding, using 4 KB windows,
+documentation) [11], and transparent user-space interaction         and encodes the results with pre-defined static Huffman tables.
+with applications via a new ISA extension, called ENQCMD.           The second IAA mode – Statistics-mode is designed to sam-
+   Communication and job submission to the accelerator are          ple input streams and construct the statistical data distribution
+handled via Work Queues (WQs), similar to another emerg-            to optimize Huffman tables for a particular input. Compres-
+ing hardware – Data Streaming Accelerator (DSA) [48]. For           sion with input-specific Huffman tables usually allows much
+this, software needs to create descriptors and completions          higher compression ratios. In Statistics-mode, IAA only con-
+allocated anywhere in the application virtual address space.        structs the histogram of the distribution of Huffman codes,
+Descriptors contain information describing the jobs assigned        but it does not write the actual Huffman tables yet. The latter
+
+
+
+4     18th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+   Style                                                        Description
+ Fixed        Standard static DEFLATE; based on Huffman-mode with standard Huffman tables; enables faster
+ Block        compression, but under general Huffman tables, which usually results in low compression ratios.
+ Static       Similar to Fixed Block, but using user-defined Huffman tables; can result in good compression ratios if the
+ Block        application is able to provide Huffman tables fitting all inputs well.
+ Dynamic      Standard dynamic DEFLATE; two-phase compression with Statistics-mode followed by Huffman-mode;
+ Block        enables optimal Huffman tables per block and a better compression ratio, but requires more time to compress.
+              Allows sharing the same Huffman tables between multiple blocks of compressed data; this is important when
+ Canned
+              compressing many small scattered chunks to avoid having to keep/access Huffman tables per block.
+                                                Table 1: End-to-end compression styles supported in Intel IAA.
+
+
+                                                                                                                                             
+                                                                                                                                                                               
+                                                                                                                               
+
+
+
+
+                                                                                                                                                                                     
+                                                                                                                                                                            
+
+
+                                                                                                                               
+                                                                                                                                                                               
+
+
+
+
+                                                                                                                        
+
+
+
+
+                                                                                                                                                                      
+                                                                                                            
+
+
+
+
+                                                                                                                                                               
+                                                                                                                               
+                                                                                             
+                                                                                   
+                                                                   
+                                                    
+                                      
+                         
+               
+
+
+
+
+                                                                                                                                                  
+                                                                                                                                        
+                                                                                                                                                                               
+                                                                                                                                 
+
+                                                                                 ( ))                                                                                ((
+
+
+
+
+                                                                                                                                                                                            )
+  )
+
+
+
+
+                                                                                                                                                                                            ((
+                                                                                                                         
+
+
+
+
+                                                                                                                                                                          
+                                                                                                              
+                                                                                                 
+                                                                                     
+
+
+
+
+                                                                                                                                                    
+                                                                     
+
+
+
+
+                                                                                                                                           
+                                                       
+                                         
+                          
+
+
+
+
+                                                                                                                                                                
+                  
+
+
+
+
+                                                                                            )
+
+
+
+
+                                                                                                                                      ()
+                                                              ,
+                                                              (
+
+
+
+                                                                             )
+                                                )
+                                  ,
+
+
+
+
+                                                                                                                                                           )
+                                                                                                        )
+                                  (
+
+
+
+
+Figure 1: Comparison of software- and hardware-based DEFLATE compression for different datasets (sorted by uncompressed size) from
+Silesia Corpus and serverless VM snapshots (last two); the numbers denote speed-up of the hardware execution; a single IAA device with a
+single PE (engine) in blocking/synchronous mode is used; the software baseline runs on a single thread.
+
+
+is done in the third mode – Huffman-Generation mode, which                                              obtained during request execution for two serverless applica-
+is only supported in some IAA implementations.                                                          tions from vSwarm [66] and FunctionBench [44,45]: a Python
+   Based on these modes, IAA defines four main styles of com-                                           gRPC server (pythongrpc) and the Pillow image processing
+pression (Table 1), and it is up to the control plane software to                                       library (pillow). Both datasets only contain dirty pages of
+implement them. To make end-to-end (de)compression easier                                               guest memory. Table 2 shows the specification of our testbed.
+to implement, Intel has recently released the Query Processing                                          At the time of writing, we had access to two Sapphire Rapids
+Library (QPL) [7], which abstracts away the IAA modes and                                               systems (SKUs) with slightly different configurations. We use
+allows users to express compression in any of the supported                                             the most recent production-grade SKU (Server #2 in Table 2)
+modes. We next show the results of microbenchmarking IAA                                                in all experiments unless otherwise noted.
+with different modes and implementations.
+
+                                                                                                        3.2.1       Benchmarking IAA: Core Compute
+3.2    Characterizing Compression Using IAA
+                                                                                                        We start with the characterization of the in-memory core com-
+We characterize IAA (de)compression with a set of bench-                                                puting capability of IAA. We assume that data is always avail-
+marks written using the Intel QPL library v1.3.1. As input                                              able in memory, both for the source and destination buffers.
+data, we use 11 datasets from the standard Silesia Corpus [29];                                         We ensure that memories are initialized and touched to avoid
+a common way to evaluate (de)compression. We also add                                                   page faults. This is important as page fault handling affects
+two more datasets specific to our use case representing the                                             the accelerator’s performance, and therefore we evaluate it
+dirty memory snapshots of microVMs. The snapshots were                                                  separately. For all experiments in this section, we use a single
+
+
+
+USENIX Association                                                18th USENIX Symposium on Operating Systems Design and Implementation                                                                  5
+                   Intel 4th Gen Xeon Scalable Processor;
+                   2 NUMA nodes, 56 cores/112 threads;
+    CPU
+                   Core/Uncore frequency (GHz): 1.7/ 1.8;
+    (Server #1)
+                   LLC capacity (MB): 110
+                   IAA devices: 8 (4 per NUMA node)
+                   Intel(R) Xeon(R) Gold 6438Y+;
+                   2 NUMA nodes, 32 cores/64 threads;
+    CPU
+                   Core/Uncore frequency (GHz): 2.3/ 1.8;
+    (Server #2)
+                   LLC capacity (MB): 60
+                   IAA devices: 2 (1 per NUMA node)
+                   available PEs per device: 8
+                   capabilities (as per GENCAP register):
+                   - Huffman generation mode: disabled;
+    IAA                                                               Figure 2: Comparison of software- and hardware-based DEFLATE
+                   - Page Request Service (PRS): enabled;
+                   - Block-on-Fault: enabled;                         decompression on the same datasets and setup as in Figure 1
+                   WQ configuration: shared, 8 per device, size: 32
+    Memory         Type: DDR5; Capacity (GB): 250
+                   Intel SSDSC2KG960G8
+    Disk
+                   Sequential O_DIRECT read bandwidth (MB/s): 550
+                   Ubuntu 22.04;
+    Host OS        Kernel: 5.15, patched with [9] to enable ENQCMD;
+                   Kernel boot arguments: intel_iommu = on, sm_on
+    Guest OS       Rootfs: Debian GNU/Linux 12 (bookworm)
+    (Section 5)    Kernel: 4.14.174
+                   Driver: idxd
+    IAA stack
+                   Middleware: Intel QPL v1.3.1
+           Table 2: Testbed hardware and software configuration.
+
+                                                                       Figure 3: (De)compression of scattered 4kB pages across modes.
+IAA device configured with a single PE (engine); we sub-
+mit the jobs to the accelerator from a single CPU thread in
+the blocking/synchronous mode and wait till completion by             gorithm. To compare against many other software compres-
+polling associated completion records. The software baseline          sion algorithms (e.g., Snappy, zstd, LZ4, etc.), please refer to
+runs on a single CPU core.                                            the publicly available in-memory benchmarks based on the
+   We first compare the performance and compression ratios            Silesia Corpus (for example, lzbench [1]). The synchronous
+of IAA-enabled compression and its software implementation            throughput of IAA’s (de)compression can be obtained from
+in QPL. Since the IAA hardware does not allow explicitly              Figures 1 and 2 based on the size of the datasets. For example,
+selecting compression levels (compression levels are                  the fixed-DEFLATE compression on the nci dataset reaches
+subjective and vary across implementations), we set the               1800 MB/s, and its decompression - 4600 MB/s on a single
+default compression level-1, as defined by QPL, for the corre-        engine. These numbers are expected to be lower than the asyn-
+sponding software implementation. Since our version of IAA            chronous streaming (de)compression (using the non-blocking
+does not offload Huffman table generation, the hardware im-           mode of IAA) which we do not characterize in this paper.
+plementation of dynamic DEFLATE compression is actually                  We then profile (Figure 3) IAA’s (de)compression for
+hybrid: statistics collection, LZ77 encoding, and compressed          many small 4 KB sized chunks for the same datasets. As
+stream generation run in hardware, while Huffman table                previously mentioned, the Canned—which is essentially a
+generation runs in software. The hybrid operations run on             Static Block—mode allows sharing Huffman tables between
+a single CPU core. Figure 1 shows the compression results.            data chunks, therefore reducing both the space and processing
+   The hardware implementation always overperforms soft-              time when data is scattered over many small blocks. This
+ware in compression time. The difference reaches 6.1⇥ and             is very useful when compressing individual memory pages.
+13.5⇥ for dynamic and fixed compression, respectively. In our         In Figure 3, the first group of bars shows the baseline
+datasets of dirty memory snapshots, the speedup reaches 9⇥.           compression using Dynamic Block over a continuous region.
+The achieved compression ratios for software and hardware             We then break it into 4 KB chunks and compress them naïvely,
+executions are similar. Figure 2 shows the performance of             with the Dynamic Block, independently for each chunk.
+decompression. We only show the decompression of dynamic              As a result, compression time explodes due to processing
+streams, as in these datasets, decompression performance              tables separately; the decompression time also suffers, as
+does not depend on the compression mode. In all cases, IAA            the Huffman tables need to be parsed. The Canned operation
+decompresses an order of magnitude faster than software.              reduces the overhead of scattered compression. Most
+   Note that in this paper, our experiments only compare IAA          interestingly, it enables fast decompression of scattered data,
+to the software implementation of the same DEFLATE al-                which is only marginally higher than the continuous baseline.
+
+
+
+6     18th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+                                                                   Figure 5: Impact of page faults and translation fetch on IAA perfor-
+                                                                   mance via PRS with block-on-fault enabled
+                                                                                                    .
+
+
+                                                                   reaches 4 7⇥ with respect to sequential execution. Dynamic
+Figure 4: Latency of single-thread synchronous (de)compression
+with parallel hardware execution on 4 IAA devices with 8 engines
+                                                                   Block compression scales worse due to the software overhead
+each; only two benchmarks are shown for brevity.                   of Huffman table creation. Decompression scales up to 26
+                                                                   jobs, reaching 17⇥ latency reduction for the pillow dataset.
+                                                                   These results demonstrate how multiple IAA engines can be
+3.2.2   Benchmarking IAA: System Integration                       used to achieve even lower (de)compression latency.
+                                                                      Until now, we have only tested the behavior of IAA when
+We now characterize the IAA hardware together with system-         processing in-memory data, which was the majority of initial
+level aspects. We use the same datasets and setup as before.       use cases for the accelerator. In-memory operation is achieved
+   We first evaluate how job parallelization within the IAA        when source and destination buffers are present both in the
+PEs may further speed up (de)compression. Given that our           memory and page table of the calling process. This holds
+earlier SKU has more IAA engines/PEs (refer to Table 2),           when, e.g., streaming over the same buffers. However, in cer-
+we use Server #1 in this experiment. Note that at the time         tain cases, data is not entirely present in memory, e.g., when
+of writing, the QPL library did not allow crossing NUMA            processing inputs from a file or into newly allocated memory.
+boundaries between the data and IAA devices. Therefore,            In these cases, the accelerator must resolve page faults.
+only 4 IAA devices (32 PEs/engines in total) are utilized at          The fundamental source of page faults in systems such as
+most for this experiment.                                          IAA and DSA is the fact that they operate directly on the
+   There are two main ways to leverage parallelism within          application’s virtual address spaces via SVM [11]. As a result,
+the IAA: with synchronous and asynchronous job submission.         similarly to CPU processing, when a page requested by the
+In the first case, a large chunk of data can be split into mul-    accelerator is not found in the page table, a major or minor
+tiple smaller blocks, and these blocks are then submitted to       page fault occurs. The result of the page fault handling (e.g.,
+multiple available PEs. The software then blocks and waits         the translation) is then cached in the accelerator’s Address
+until all PEs finish processing. This allows us to reduce the      Translation Service (ATS). When the translation is available
+time/latency of a single (de)compression job. In the asyn-         in the CPU/kernel, the page fault does not happen, but the ATS
+chronous case, a stream of multiple blocks from potentially        must fetch the translation from the host via a translation fetch
+different dataflows/threads is supplied into the accelerator       request. We now benchmark IAA in the case of page faults
+without waiting for the completion of the previous blocks,         and translation fetch requests. We use standard 4 KB pages
+therefore utilizing the hardware at maximum capacity. This         and an SSD disk with 550 MB/s of provisioned sequential
+yields the highest IAA utilization and throughput. For fast mi-    read bandwidth. For compression, we use a single-pass Fixed
+croVM restoration, the only performance metric that matters        Block to avoid the side effects of hybrid two-phase operations.
+is how fast the system can decompress a single snapshot from          IAA supports two modes to handle page faults: via
+a single CPU thread into the microVM guest memory. We              hardware-initiated on-demand paging via PRS or in user
+therefore only benchmark the synchronous job parallelization       space with custom application-defined page fault handlers.
+in this paper.                                                     The mode is controlled via the work queue configuration or
+   We implement parallel synchronous processing via the            through the PCIe device configuration if the former is not
+non-blocking synchronous descriptor submission. Here multi-        available. When PRS is enabled, the hardware can request up
+ple descriptors are submitted at the same time from a single       to N (specified in PRSREQCAP register) pages from the host
+CPU thread without waiting for immediate completion of in-         concurrently. The actual page fault handling is done by the
+dividual descriptors. Figure 4 shows that for a hardware con-      kernel through IOMMU interrupts. Figure 5 shows the time
+currency of up to 8 compression jobs, the latency reduction        required to process descriptors in case of different hardware-
+
+
+
+USENIX Association                              18th USENIX Symposium on Operating Systems Design and Implementation                 7
+                                                                    with partial completion and cannot continue decompression
+                                                                    from the place where it stopped; as a result, the job needs to
+                                                                    restart from scratch. Given the streaming nature of IAA, it is
+                                                                    possible to entirely close the gap between direct disk I/O and
+                                                                    decompression by using block-on-fault in combination with
+                                                                    O_DIRECT reads in a custom page service handler, either in
+                                                                    a driver or user space. We leave this to future work.
+
+
+                                                                    4     Sabre Design
+Figure 6: Single-job, single-engine, synchronous decompression      4.1    Memory Prefetching Accelerator
+bandwidth when reading disk inputs via PRS with block-on-fault
+enabled.                                                            We use the insights from the characterization study of Sec-
+                                                                    tion 3 to design Sabre. Sabre is a hardware-accelerated mem-
+initiated page faults. We benchmark the worst-case scenario         ory snapshotting and restoration system for microVMs that
+when the entire dataset causes page faults (12492 pages for         is agnostic to the underlying algorithm used to identify dirty
+mozila and 44672 pages for pillow). As expected, major page         pages and create VM snapshots.
+faults have a severe impact on the accelerator’s performance.          Sabre is designed to efficiently compress the guest VM
+The impact of minor page faults is lower, but still ⇡ 2⇥ for        physical pages to create snapshots, such that they can be
+decompression. The ATS translation fetch has the smallest           decompressed (and mapped) quickly when restoring the snap-
+impact of ⇡ 20 us across all pages. In general, decompres-          shot upon a function invocation resulting in a cold start. As
+sion is more sensitive to page faults than compression; this is     an input, Sabre accepts a vector of addresses for each of the
+because the former is less compute-bounded.                         guest physical memory pages which need to be placed in the
+   Finally, we characterize the achieved decompression band-        snapshot, according to the underlying dirty page selection
+width when reading input data from an SSD (Figure 6), which         mechanism. It then compresses pages using IAA and writes
+is critical for our memory restoration use case. The dashed         them in a file. During the VM restoration process, Sabre
+black and gray lines show achieved sequential disk read band-       uses fast IAA decompression in combination with efficient
+width with and without direct I/O (O_DIRECT). Direct I/O            sequential disk I/O to quickly fetch the pages from the snap-
+allows bypassing the page cache when reading files from the         shot, decompress, and install them in the target VM’s physical
+disk. In certain cases, this helps to reach the highest bandwidth   memory. The main goal of Sabre is to hide the decompression
+of I/O operations. The solid black line shows the achievable        latency as much as possible behind the disk I/O and page
+bandwidth of a single-job synchronous decompression over            fault handling (when mapping pages) such that the overhead
+data in memory, and the red line when reading input from the        of decompression is minimized. This is possible to achieve
+disk via hardware on-demand paging (i.e., via PRS). The latter      given the streaming nature of IAA decompression.
+is achieved through shared mapping of the input file into the          Sabre shows that irrespective of the method used to identify
+IAA buffers and enforcing sequential I/O using posix_fadvise.       dirty pages and create VM snapshots, hardware-accelerated
+   IAA decompression is a streaming operation, and it al-           compression, and restoration can have a significant impact
+ways accesses input buffers sequentially. In an ideal system,       on performance. In the simplest case, dirty pages can be
+the decompression phase will completely overlap with the            identified by the page tracking mechanism in the VMM (e.g.,
+operation fetching data from the disk. Hence, the achieved          Firecracker’s Diff snapshots); in more complicated cases,
+end-to-end throughput will be decided by the slower opera-          custom algorithms can be used (e.g., different working set
+tion - be it decompression or disk I/O. As Figure 6 shows,          estimation techniques [64, 72]).
+with default hardware on-demand paging, the achieved end-              Figure 7-A shows an overview of Sabre’s snapshot creation
+to-end bandwidth is the same as disk read without direct I/O.       pipeline along with two designs for memory prefetching, both
+This demonstrates that IAA streaming processing can entirely        of which are used by Sabre under different scenarios.
+overlap with disk I/O. It is 10 15% lower, however, than the        Snapshot creation: We first describe our snapshot creation
+achievable bandwidth of reads with direct I/O, because IAA          process, which is based on two observations. First, creating a
+communicates with the disk via the OS page cache when run-          snapshot is outside of the VM restoration’s critical path, so the
+ning over PRS. A way to further improve IAA over data from          objective is selecting the compression algorithm that achieves
+disk is to replace PRS with application-specific page fault han-    the highest compression ratio, which as we showed in Sec-
+dling. However, in that case, the end-to-end behavior depends       tion 3 is dynamic DEFLATE. Second, since the VM dirty
+on whether IAA is configured with enabled block-on-fault, a         pages are distributed in a non-contiguous manner across the
+feature that allows the accelerator to block and wait until data    guest’s physical memory space, the (de)compressor should
+becomes available. Without block-on-fault, IAA terminates           operate over separate (often small) chunks of memory. As
+
+
+
+8   18th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+             (A) Snapshot creation                          (B) Singe-chunk prefetching                (C) Scattered prefetching
+          Guest physical memory                            snapshot ﬁle      partition ﬁle          snapshot ﬁle      partition ﬁle
+
+
+
+                IAA: Statistics pass                        mmap:: shared         read()             mmap:: shared        read()
+
+      IAA:                  Huﬀman                                                     Partitions                              Partitions
+
+
+
+
+                                                mem pool
+   Huﬀman pass                                                 via PRS                                   via PRS
+                            tables
+                                                           IAA: Decompress
+      Compressed
+                                                                                                     IAA: scattered
+       partitions                                                                 userfaultd
+                                                                                                      decompress
+
+
+
+
+     snapshot ﬁle              partition ﬁle                 Guest physical memory                     Guest physical memory
+                                        Figure 7: High-level overview of snapshotting with Sabre.
+
+
+Figure 3 shows, the “Canned” style compression works best                    sum of the sizes of dirty pages of the VMs currently restored
+in this case: it enables implementing static DEFLATE with                    simultaneously. This space is reusable across different restora-
+pre-computed Huffman tables, which closely resembles the                     tion processes and therefore does not consume much memory.
+efficiency of Dynamic DEFLATE. Sabre’s snapshot creation                     However, users of Sabre can always disable the memory pool
+process first runs IAA in Statistics mode to sample the statisti-            (at ⇡ 10% cost of memory restoration) if the pool’s impact on
+cal distribution of data in all dirty pages and create appropriate           the memory density is an important concern. Sabre’s memory
+Huffman tables. It then compresses the scattered regions of                  prefetching relies heavily on the PRS hardware mechanism
+dirty pages with these Huffman tables. The resulting com-                    to bring snapshots from the disk. This is achieved by running
+pression stream alongside the Huffman tables is written into                 IAA against a shared not pre-faulted (i.e. the actual file I/O
+the snapshot file. For experimentation reasons, we also en-                  gets initiated by PRS) mapping of the snapshot file. As Fig-
+able using Dynamic DEFLATE as well. In addition to the                       ure 6 shows, default PRS is near-optimal at handling IAA
+snapshot file itself, Sabre also writes the partition file con-              inputs from the disk, and it allows hiding the decompression
+taining the “schema” of the dirty pages, i.e., the offsets and               time by overlapping it with the disk I/O. In most cases, the
+original/compressed sizes of each partition.                                 difference with sequential disk read bandwidth is marginal.
+Memory prefetching: The memory prefetching process is                        We confirm that running IAA over pre-faulted or pre-fetched
+more complicated to engineer as it is on the critical path of                (via read) snapshot files is much slower than via PRS.
+VM restoration, and therefore needs to be carefully optimized.                  To address the high cost of partition placement when
+The main trade-off Sabre must navigate is balancing the desire               treating the entire memory region as contiguous, Sabre also
+to handle all partitions of dirty pages as a single contiguous               implements memory prefetching based on scattered IAA
+memory region and the cost that comes with that.                             decompression (Figure 7-C). Here, Sabre directly DMAs
+    Handling all partitions of dirty pages as a single continuous            decompressed partitions into the right locations in the guest’s
+memory region is better for the accelerator, as continuous                   physical memory, while still handling inputs from disk via
+DMA is more efficient than scattered DMA, and it is also bet-                PRS. This allows the system to bypass page installation,
+ter for the PRS and disk I/O, as the underlying PRS-initiated                however, it makes the IAA hardware less efficient due to the
+page faults are sequential. The latter works well with sequen-               large number of scattered DMAs and the bookkeeping of
+tial disk reads, therefore yielding the best utilization in terms            the corresponding descriptors (the current implementation
+of disk bandwidth. However, continuous decompressed par-                     of IAA does not allow chaining and batching of descriptors,
+titions need to be placed by the same addresses in the guest                 so each one must be submitted separately by software). In
+VM physical memory as in the original VM when the snap-                      addition, splitting the decompression stream into multiple
+shot was taken. Sabre implements it using userfaultfd, which                 jobs hurts the efficiency of PRS at reading data from the disk,
+comes at the cost of memory copy.                                            which further slows down memory prefetching. The latter
+    We implement this approach in Sabre’s single-chunk mem-                  can be addressed by implementing a custom user-space page
+ory prefetching shown in Figure 7-B. To reduce the overhead                  fault handler, as discussed in Section 3.
+of allocating the decompression buffers, Sabre can optionally                   In both designs for memory prefetching, IAA decompres-
+use a pre-allocated memory pool for the buffer for the time                  sion can be done using a single IAA job/engine or parallelized
+of decompression. The size of the pool is bounded by the                     across all available engines. This is implemented via non-
+
+
+
+USENIX Association                                   18th USENIX Symposium on Operating Systems Design and Implementation                   9
+blocking job submission with a rotating pool of descriptors.
+In this mode, Sabre attempts to submit N decompression jobs
+at the same time, where N is the desired concurrency degree
+or the number of available free engines (whichever is smaller).
+Upon asynchronous out-of-order completion, the correspond-
+ing descriptors are returned to the pool for later reuse. This en-
+ables a streaming operation for Sabre’s decompression when
+multiple engines are used. Note that a single IAA engine
+in blocking synchronous mode is capable of achieving ⇡
+1.2 GB/s at decompressing our snapshot datasets. Since this
+is higher than our disk read bandwidth, we always use a single
+IAA job in all remaining experiments, unless otherwise noted.
+   The exact operation of the memory prefetching unit, such
+as the choice of the restoration design (between single-chunk
+and scattered), the compression style (dynamic or static DE-
+FLATE) for snapshot creation, the number of concurrent de-
+compression jobs, etc. are configured by Sabre during run-
+time. The desired configuration can be selected differently
+for each microVM’s snapshotting/restoration call. Next, we
+microbenchmark our memory prefetching unit under different           Figure 8: Single-chunk and scattered prefetching across different
+configurations and types of snapshots.                               page sparsities; passthrough denotes the time to read uncompressed
+                                                                     snapshots; the system runs at 2.3 GHz with a single IAA engine.
+
+4.2 Microbenchmarking Memory Restoration
+                                                                     O_DIRECT file I/O and installed via user f ault f d. Sabre’s
+We now analyze the two design options for memory prefetch-           memory restoration overperforms prefetching of uncom-
+ing shown in Figure 7 using a dataset of microVM dirty mem-          pressed snapshots by up to 1.9⇥. Note that the achieved
+ory snapshots with different sparsities. We create synthetic         compression ratio on this dataset is 2.2⇥, meaning that the
+datasets from the pillow snapshot (Section 3) that range from        theoretical upper bound of memory restoration speed-up with
+most scattered, when each page is separated, to a case with          respect to uncompressed baselines is also 2.2⇥. Sabre’s mem-
+few large contiguous regions of dirty pages. In practice, the        ory prefetching is very close to this because it hides decom-
+pattern depends on the underlying mechanism used to identify         pression behind disk I/Os. For faster disks, these results would
+snapshot pages and the applications running in the VMs.              still hold.
+   Figure 8 shows the restoration time with each of the two             Figure 8 (bottom) shows the same results when running
+restoration mechanisms when the restoration is done in hard-         Sabre with software-based DEFLATE decompression. Across
+ware and software. The x-axis shows the sparsity of the              all different memory sparsities, the overhead of software de-
+dataset. In all cases, the total size of the dataset is 174.5 MB.    compression kills the speed-up of fetching deflated snapshots.
+The sparsity index denotes the number of pages in contin-            This demonstrates that hardware acceleration is required to
+uous regions; each region is separated by its neighbor via           make snapshot compression practical.
+an empty page, which is not included in the snapshot. For               For the sake of completeness, we additionally integrate
+instance, in sparsity 1, each individual page is separated. We       other software compression algorithms optimized for per-
+use a single IAA engine in all experiments. As the top figure        formance in Sabre: Snappy, Zstandard (zstd), and LZ4. We
+shows, the scattered memory prefetching design outperforms           run them on a dedicated CPU core under the highest possi-
+single-chunk prefetching for sparsities of more than 4 pages.        ble turbo boost frequency of 4 GHz and repeat the snapshot-
+This is because this design avoids additional page copying           ting microbenchmark experiment. As Figure 9 shows, across
+during the installation phase via userfaultfd. However, when         all sparsities, the memory restoration with IAA outperforms
+memory partitions become as sparse as every page or two              these algorithms. The restoration times under Zstd level-3,10,
+pages, the overhead of scattered DMA and suboptimal PRS              and 20 are very close to IAA results and are much lower than
+handling make scattered prefetching slower than single-chunk.        prefetching uncompressed snapshots. However, as Figure 9
+Given this, Sabre uses different memory prefetching strategies       (Bottom) shows, they require a significant amount of CPU
+depending on the sparsity of the underlying snapshots.               resources at the snapshot creation stage (up to several sec-
+   The dashed line in Figure 8 (Top) denotes the time required       onds at the highest frequency), and they do not demonstrate
+to restore memory from uncompressed snapshots. We op-                performance as high as IAA when running at lower CPU fre-
+timize this path similarly to REAP [64], where the whole             quencies. We do not show results for LZ4 as its compression
+snapshot is fetched as a single continuous disk read via             ratios are low.
+
+
+
+10   18th USENIX Symposium on Operating Systems Design and Implementation                                       USENIX Association
+                                                                                     FaaS                  Firecracker-containerd
+                                                                                    images              (with Sabre prefetching API)
+
+
+
+
+                                                                        snapshots
+                                                                     VMsnapshots
+                                                                       snapshots
+                                                                                                                     microVMs
+                                                                                          Sabre
+                                                                                     prefetching unit
+                                                                                                             Firecracker VMM
+
+
+
+
+                                                                    VM
+                                                                    VM
+                                                                                         Intel Xeon Scalable CPU with IAA
+                                                                   Figure 10: Sabre’s integration in end-to-end serverless frameworks.
+
+
+                                                                   shotting/restoration thread, and does not require additional
+                                                                   CPU resources. To expose Sabre’s snapshotting to the higher
+                                                                   layers of serverless frameworks, we additionally extend the
+                                                                   Firecracker’s Go SDK 1.0.0 with several new APIs. Figure 10
+                                                                   shows the simplified overview of the full system design. Sim-
+                                                                   ilarly to vHive [64], our infrastructure enables running end-
+                                                                   to-end serverless applications in Firecracker microVMs with
+                                                                   standard Docker environments.
+
+
+                                                                   5          End-to-End Evaluation
+                                                                   Methodology: We evaluate Sabre on a large set of end-
+                                                                   to-end serverless benchmarks from vSwarm [66], Function-
+                                                                   Bench [44, 45], and SeBS [27]. We modify the benchmarks
+                                                                   to run grpc servers and support server reflection so that we
+                                                                   can invoke functions using grpcurl. The set includes only
+                                                                   one synthetic benchmark – python-list implementing travers-
+Figure 9: Sabre with different fast software (de)compression al-   ing a large sparse Python list; we include it to showcase
+gorithms running on dedicated CPU cores under the turbo boost      the upper-bound of compression achievable with Sabre. We
+frequency of 4 GHz; the bottom plots show CPU resources (in sec-   slightly modify the dna-visualisation benchmark from SeBS
+onds) consumed to make the snapshots (averaged over sparsities).
+                                                                   to make it use different DNA sequence datasets across dif-
+                                                                   ferent invocations (the default benchmark is always based on
+                                                                   the same dataset; dna-visualisation-1). Similarly, we modify
+4.3    Full System Implementation
+                                                                   the datasets for the model training benchmark to use smaller
+We now discuss how we integrate Sabre’s memory prefetch-           2 MB and larger 10 MB images. All other benchmarks are
+ing unit in an end-to-end serverless framework. We choose          taken from the aforementioned suites. In all experiments, we
+Firecracker microVMs [17] as the target serverless sandbox.        use a single IAA engine for memory prefetching.
+Firecracker is the current industry-leading VMM, and it al-           Sabre’s memory prefetching unit is agnostic to the under-
+ready provides good VM snapshotting capabilities. Most re-         lying mechanism of creating a snapshot. It can be used with
+cent work in this space, such as REAP [64], is also based          dirty page-based snapshots, with working sets, and even when
+on Firecracker. To build the end-to-end serverless pipeline,       snapshotting the whole guest’s VM memory. Since the latter
+we partially reuse the infrastructure of vHive – an academic       is not practical for realistic serverless workloads, and there-
+framework for serverless used to showcase the effective-           fore rarely used in practice, we only evaluate Sabre on the first
+ness of REAP working sets. vHive allows running serverless         two options. In all experiments, we use our testbed with the
+Docker images inside Firecracker microVMs via firecracker-         configuration shown in Table 2. We focus our evaluation on
+containerd. vHive also extends the native Firecracker Go SDK       two metrics: (1) how well Sabre is able to compress snapshots
+to support snapshotting and implements a simple orchestrator       of different types, and (2) what is the impact of decompression
+to simplify managing the serverless environment.                   on the end-to-end cold start time.
+   We write Sabre’s snapshotting unit in ⇡ 3500 LoC in             End-to-end performance impact: Figure 11 shows the re-
+C++17 excluding unit tests and benchmarks, using Intel’s           sult of running the default dirty page-based snapshots of Fire-
+QPL library v1.3.1 and build it as a dynamic library. We then      cracker (Diff snapshots [2]) with Sabre. Diff snapshotting is
+integrate it with Firecracker VMM v1.5.0 in only 50 LoC in         enabled via dirty page tracking in the hypervisor. We find
+Rust via FFI. Sabre runs in the default Firecracker’s snap-        Diff snapshots to be relatively large (a few hundred MB)
+
+
+
+USENIX Association                            18th USENIX Symposium on Operating Systems Design and Implementation                     11
+Figure 11: End-to-end evaluation of serverless cold starts with Sabre on Firecracker’s default Diff snapshots with prefetching; annotated
+numbers show speedup of Sabre over the baseline.
+
+
+and coarse-grained for all applications, which means that the          the passthrough functionality of Sabre’s memory prefetching
+scattered prefetching (Figure 7-C) works best in this case.            unit, which resembles the original REAP specification [64],
+   Figure 11 compares the end-to-end cold start latency when           i.e., direct I/O disk reads combined with page installation in
+serving requests from a VM restored with on-demand paging              the guest physical memory via userfaultfd. After prefetching,
+(default mechanism in Firecracker) and via prefetching with            the hypervisor continues serving the rest of the pages outside
+Sabre. We find that in all cases, Sabre is able to compress            of the working set via standard on-demand paging.
+Diff snapshots by up to 4⇥, and 2.5⇥ on average. This is a
+significant reduction in storage requirements, given the large            REAP working set files tend to be much more scattered than
+original size of Diff snapshots, ranging from hundreds of              Firecracker’s Diff snapshots. We make a similar observation
+megabytes to several gigabytes. This is even more significant          in our applications as well. Therefore, memory restoration
+given that in serverless deployments, a physical node can host         through single-chunk prefetching works best in this case, and
+hundreds or thousands of snapshotted VMs [17].                         we configure Sabre accordingly for REAP snapshots. Table 3
+  Most importantly, in all cases, the hardware-accelerated             shows the achieved compression ratios of REAP working set
+decompression in Sabre allows restoring a compressed snap-             files and the corresponding prefetching speedup when using
+shot without any negative impact on the end-to-end latency.            Sabre. Figure 12 shows the end-to-end cold start latencies
+Moreover, in some applications, we observe up to 60% lower             across the same set of serverless benchmarks as before.
+cold start overhead, enabled by the fast memory prefetching.
+The speed-up and compression effect are particularly evi-                 Table 3 shows that working set files are better compressible
+dent for our synthetic python-list benchmark, where the dirty          than dirty pages. The compression ratio reaches up to 4.7⇥;
+memory, i.e., the Python runtime heap storing the list, is well        3.2⇥ on average. The prefetching time itself with Sabre is
+compressible. The same holds for dna-visualization as well.            accelerated by 25 55%. On the synthetic application python-
+Optimizing the VM snapshotting strategy: While Diff snap-              list, the speedup reaches 70%. As expected, there is an ob-
+shots and dirty page tracking currently represent the industry         vious correlation between the achieved compression ratio
+standard in microVM snapshotting, they are not the most                and prefetching speedup. End-to-end, working set prefetch-
+efficient way to restore memory via prefetching. More ef-              ing speedup translates in up to 20% of improvement in the
+ficient mechanisms are enabled via working set estimation.             application’s cold start latency. For several of the examined
+We implement working sets in Sabre which are used with                 applications, the speedup is diminished due to the working set
+our memory prefetching unit for evaluation purposes. Our               size being small or their compute time being high. In the latter
+implementation is based on the record-and-replay technique.            case, the impact of accelerated restoration gets hidden behind
+Similarly to the original paper [64], Sabre records working            computing. In general, compression of snapshots/working set
+sets during the first invocation of serverless functions after the     files is more impactful on applications with larger working
+standard restoration from vanilla Firecracker snapshots. We in-        sets, especially if they are memory-bounded (as in the case
+tercept in user-space the guest memory page faults and record          of the python-list benchmark). Even when Sabre does not
+all accessed addresses in a vector. The recorder then groups           accelerate cold start time significantly, it still greatly reduces
+the accessed pages to form continuous chunks, whenever pos-            the size of the working set files without a negative impact on
+sible, and saves them in a WS file. The REAP restoration uses          prefetching latency and/or CPU cycles for restoration.
+
+
+
+12   18th USENIX Symposium on Operating Systems Design and Implementation                                         USENIX Association
+Figure 12: End-to-end evaluation of serverless cold starts with Sabre on REAP snapshots; annotated numbers show the speedup over REAP.
+
+
+Table 3: Compression ratios and page prefetching speedup of Sabre             including networking. This makes Sabre attractive for remote
+over REAP working sets.                                                       snapshotting – another technology in serverless microVMs
+                           Size of REAP   Compression   Sabre’s prefetching   where snapshots and/or working set files are served from
+Application
+                             WS (MB)         ratio           speedup          centralized storage or a remote server. Fast streaming decom-
+fibonacci                         12.93         2.64⇥        29.02%           pression can have a dramatic reduction of network bandwidth
+python list                      405.23        14.82⇥        70.81%
+image-processing-low              27.67         3.74⇥        45.17%
+                                                                              consumed for snapshotting, which is critical for highly multi-
+image-processing-hd              120.66         2.73⇥        35.27%           tenant and geographically distributed datacenters.
+matmull                           13.02         2.62⇥        32.65%
+chameleon                         18.45         2.90⇥        36.05%
+video-processing                  44.91         3.21⇥        43.30%           6.2   Further Optimizing Sabre
+rnn-serving                       17.64         2.50⇥        26.59%
+ml-serving                        22.10         2.67⇥        35.00%           The biggest limitation in our current design of Sabre is its
+cnn-image-classification         136.36         3.10⇥        38.73%           integration with the disk via the standard IAA’s PRS mech-
+bfs                               44.22         4.29⇥        49.39%
+dna-visualization                 16.04         2.76⇥        28.73%           anism. This disallows bypassing the OS page cache when
+dna-visualization-1              720.95         4.70⇥        55.01%           feeding an input to IAA, and results in lower effective band-
+pagerank                          62.23         2.94⇥        34.60%
+model-training-2MB               171.28         3.60⇥        43.48%
+                                                                              width utilization than direct I/O. This can be optimized by
+model-training-10MB              111.71         3.57⇥        45.54%           redesigning the default PRS in one of two ways.
+                                                                                 First, PRS can be replaced with user-space page fault han-
+                                                                              dling for input buffers. Disk I/O can be initiated separately
+6     Discussion and Future Work                                              in user space using the read system call combined with
+6.1 Prefetching on Faster Disks and Networks                                  O_DIRECT file opening. In this case, the IAA page fault
+                                                                              handler only needs to wait until the disk DMA catches up
+While the performance impact of memory prefetching be-                        with the sequential data transfer. This requires enabling the
+comes less critical as the speed of disks and NVMe/persistent                 block-on-fault feature of IAA, otherwise, the input stream
+memory devices increases, Sabre benefits when it comes to                     would need to be resubmitted from the beginning every time
+storage space reduction remain. This is even more critical,                   IAA reaches pages that have not been fetched yet. Alterna-
+given the higher cost per Byte of new memory technologies.                    tively, one can directly connect the disk’s and IAA’s DMA
+CPU-free memory decompression, especially at zero negative                    engines, and allow streaming of compressed inputs directly
+impact on end-to-end latency will always be beneficial, inde-                 into the accelerator through a small FIFO buffer. However,
+pendent of the underlying storage technology. In future work,                 this can only be done in the host kernel in custom IAA drivers
+we plan to evaluate Sabre on CXL-enabled memory devices                       and is challenging to implement in a scalable way.
+and explore the potential of serving compressed snapshots                        A second limitation in the current design’s single-
+from them. The byte-addressable organization of CXL and                       chunk prefetching (Figure 7-B) is using the COPY-based
+other similar memory disaggregation devices will make the in-                 userfaultfd mechanism. The original REAP snapshots [64]
+tegration with near-memory accelerators, such as IAA, much                    suffer from the same inefficiency. Starting with Linux kernel
+more efficient than when using commodity disks, essentially                   5.13, userfaultfd can be handled via minor page faults and
+eliminating all overheads of PRS discussed in Section 3.                      UFFDIO_CONTINUE page installation. Instead of copying
+   Additionally, the streaming nature of hardware accelerators,               pages from the continuous buffers, one can install them from
+such as IAA, allows combining Sabre with any streaming I/O,                   the page cache via the underlying page table modification
+
+
+
+USENIX Association                                      18th USENIX Symposium on Operating Systems Design and Implementation             13
+with zero-copy. This will, however, complicate managing the            firecracker/blob/main/docs/snapshotting/
+decompression/prefetching buffers to ensure they are never             snapshot-support.md, 2023.
+reclaimed, while the corresponding microVM is running.
+                                                                   [3] Google gvisor. https://gvisor.dev/docs/, 2023.
+6.3    Beyond MicroVM Snapshotting
+                                                                   [4] Intel data streaming accelerator (dsa), architecture.
+VM memory compression and fast restoration go well beyond              https://www.intel.com/content/www/us/en/
+microVM snapshotting and serverless. For example, VM live              content-details/759709, 2023.
+migration [18,59] can benefit from hardware-accelerated com-
+pression and on-the-fly decompression of memory pages. The         [5] Intel in-memory analytic accelerator (iaa), architecture
+recent work [14] is exploring this opportunity for KVM. This           specification. https://www.intel.com/content/
+can dramatically accelerate applications heavily relying on            www/us/en/content-details/721858, 2023.
+VM migration, including VM bin-packing for cloud man-              [6] Intel in-memory analytic accelerator (iaa), use guide.
+agement [55], low-latency cloud-native applications such as            https://www.intel.com/content/www/us/en/
+vRAN [49, 68], and fast fault-tolerance solutions [63]. We             content-details/780887, 2023.
+plan to extend Sabre to benefit these applications as well.
+                                                                   [7] Intel query processing library (qpl). https:
+7     Conclusion                                                       //www.intel.com/content/www/us/en/
+MicroVM snapshotting and restoration via page prefetching              developer/tools/query-processing-library/
+is the most effective technique for reducing the cold start            overview.html, 2023.
+overhead in serverless. Memory compression is a promising          [8] Introducing  intel  scalable  i/o   virtualiza-
+technique to reduce the size of VM snapshots and speed up              tion.         https://www.intel.com/content/
+prefetching during memory restoration, but it is only efficient        www/us/en/developer/articles/technical/
+if decompression is fast. We showed that emerging hardware             introducing-intel-scalable-io-virtualization.
+accelerators for general-purpose compression are suitable for          html, 2023.
+microVM memory restoration as well. We first characterized
+the Intel IAA accelerator and then designed Sabre, a system        [9] Linux kernel patch to enable enqcmd.  https:
+for fast prefetching of VM memory from compressed snap-                //lore.kernel.org/lkml/20210920192349.
+shots. We showed that Sabre compresses snapshots of real               2602141-1-fenghua.yu@intel.com/T/
+serverless applications up to 4.5⇥, and speeds up prefetching          #rd6d542091da1d1159eda0a44a16e57d0c0dfb209,
+by up to 55% compared to uncompressed baselines. This re-              2023.
+sults in up to 20% of end-to-end performance improvement
+for cold function invocations over the most optimized snap-       [10] The operstack foundation. kata containers - the
+shotting technologies.                                                 speed of containers, the security of vms. https://
+                                                                       katacontainers.io/, 2023.
+
+Acknowledgements                                                  [11] Shared virtual addressing (sva) with enqcmd. https:
+                                                                       //docs.kernel.org/next/x86/sva.html, 2023.
+We sincerely thank our shepherd, the Intel IAA team, and the
+anonymous reviewers for their feedback on earlier versions        [12] Technical overview of intel 4th gen xeon scalable pro-
+of this manuscript. This work was supported in part by NSF             cessor family. https://www.intel.com/content/
+CAREER Award CCF-2326182, a Sloan Research Fellowship,                 www/us/en/developer/articles/technical/
+an Intel Research Award, and by ACE, one of the seven centers          fourth-generation-xeon-scalable-family-overview.
+in JUMP 2.0, a Semiconductor Research Corporation (SRC)                html#gs.0466t8, 2023.
+program sponsored by DARPA.                                       [13] Implementation of sabre. https://github.com/
+                                                                       barabanshek/sabre, 2024.
+References
+                                                                  [14] Kvm live migration with iaa in-memory compression.
+ [1] In-memory benchmarks for compression alogorithms.                 https://lore.kernel.org/all/20240319164527.
+     https://github.com/inikep/lzbench.                                1873891-1-yuan1.liu@intel.com/T/, 2024.
+
+ [2] Firecracker   snapshotting     documentation.                [15] Sabre iaa benchmarks.   https://github.com/
+     https://github.com/firecracker-microvm/                           barabanshek/IAA_benchmarking.git, 2024.
+
+
+
+
+14    18th USENIX Symposium on Operating Systems Design and Implementation                               USENIX Association
+[16] Bulent Abali, Bart Blaner, John Reilly, Matthias Klein,        page 13–24, New York, NY, USA, 2019. Association
+     Ashutosh Mishra, Craig B. Agricola, Bedri Sendir, Alper        for Computing Machinery.
+     Buyuktosunoglu, Christian Jacobi, William J. Starke,
+     Haren Myneni, and Charlie Wang. Data compression ac-      [25] Jianyu Chen, Maurice Daverveldt, and Zaid Al-Ars.
+     celerator on ibm power9 and z15 processors : Industrial        Fpga acceleration of zstd compression algorithm. pages
+     product. In 2020 ACM/IEEE 47th Annual International            188–191, 06 2021.
+     Symposium on Computer Architecture (ISCA), pages          [26] Jianyu Chen, Maurice Daverveldt, and Zaid Al-Ars.
+     1–14, 2020.                                                    Fpga acceleration of zstd compression algorithm. In
+[17] Alexandru Agache, Marc Brooker, Alexandra Iordache,            2021 IEEE International Parallel and Distributed Pro-
+     Anthony Liguori, Rolf Neugebauer, Phil Piwonka, and            cessing Symposium Workshops (IPDPSW), pages 188–
+     Diana-Maria Popa. Firecracker: Lightweight virtual-            191, 2021.
+     ization for serverless applications. In 17th USENIX       [27] Marcin Copik, Grzegorz Kwasniewski, Maciej Besta,
+     Symposium on Networked Systems Design and Imple-               Michal Podstawski, and Torsten Hoefler. Sebs: A server-
+     mentation (NSDI 20), pages 419–434, Santa Clara, CA,           less benchmark suite for function-as-a-service comput-
+     February 2020. USENIX Association.                             ing. In Proceedings of the 22nd International Middle-
+[18] Mahdi Aiash, Glenford Mapp, and Orhan Gemikonakli.             ware Conference, Middleware ’21, page 64–78, New
+     Secure live virtual machines migration: Issues and so-         York, NY, USA, 2021. Association for Computing Ma-
+     lutions. In 2014 28th International Conference on Ad-          chinery.
+     vanced Information Networking and Applications Work-      [28] Christina Delimitrou and Christos Kozyrakis. Quasar:
+     shops, pages 160–165, 2014.                                    Resource-Efficient and QoS-Aware Cluster Manage-
+[19] Anjali, Tyler Caraza-Harter, and Michael M. Swift.             ment. In Proceedings of the Nineteenth International
+     Blending containers and virtual machines: A study of           Conference on Architectural Support for Programming
+     firecracker and gvisor. In Proceedings of the 16th ACM         Languages and Operating Systems (ASPLOS). Salt Lake
+     SIGPLAN/SIGOPS International Conference on Virtual             City, UT, USA, 2014.
+     Execution Environments, VEE ’20, page 101–113, New
+                                                               [29] Sebastian Deorowicz.    Silesia compression cor-
+     York, NY, USA, 2020. Association for Computing Ma-
+                                                                    pus. https://sun.aei.polsl.pl//~sdeor/index.
+     chinery.
+                                                                    php?page=silesia, 2023.
+[20] Lixiang Ao, George Porter, and Geoffrey M. Voelker.
+                                                               [30] P. Deutsch. Rfc1951: Deflate compressed data format
+     Faasnap: Faas made fast using snapshot-based vms. In
+                                                                    specification version 1.3, 1996.
+     Proceedings of the Seventeenth European Conference
+     on Computer Systems, EuroSys ’22, page 730–746, New       [31] Dong Du, Tianyi Yu, Yubin Xia, Binyu Zang, Guanglu
+     York, NY, USA, 2022. Association for Computing Ma-             Yan, Chenggang Qin, Qixuan Wu, and Haibo Chen. Cat-
+     chinery.                                                       alyzer: Sub-millisecond startup for serverless computing
+                                                                    with initialization-less booting. In Proceedings of the
+[21] Amine Barrak, Fabio Petrillo, and Fehmi Jaafar. Server-
+                                                                    Twenty-Fifth International Conference on Architectural
+     less on machine learning: A systematic mapping study.
+                                                                    Support for Programming Languages and Operating
+     IEEE Access, 10:99337–99352, 2022.
+                                                                    Systems, ASPLOS ’20, page 467–481, New York, NY,
+[22] Luiz Barroso and Urs Hoelzle. The Datacenter as a              USA, 2020. Association for Computing Machinery.
+     Computer: An Introduction to the Design of Warehouse-
+                                                               [32] Sérgio Fernandes and Jorge Bernardino. What is
+     Scale Machines. MC Publishers, 2009.
+                                                                    bigquery? In Proceedings of the 19th International
+[23] Jacob Breiholz, Farah Yahya, Christopher J. Lukas, Xing        Database Engineering & Applications Symposium,
+     Chen, Kevin Leach, David Wentzloff, and Benton H.              IDEAS ’15, page 202–203, New York, NY, USA, 2015.
+     Calhoun. A 4.4 nw lossless sensor data compression             Association for Computing Machinery.
+     accelerator for 2.9x system power reduction in wireless
+                                                               [33] Sadjad Fouladi, Riad S. Wahby, Brennan Shacklett,
+     body sensors. In 2017 IEEE 60th International Midwest
+                                                                    Karthikeyan Vasuki Balasubramaniam, William Zeng,
+     Symposium on Circuits and Systems (MWSCAS), pages
+                                                                    Rahul Bhalerao, Anirudh Sivaraman, George Porter, and
+     1041–1044, 2017.
+                                                                    Keith Winstein. Encoding, fast and slow: Low-Latency
+[24] Joao Carreira, Pedro Fonseca, Alexey Tumanov, Andrew           video processing using thousands of tiny threads. In
+     Zhang, and Randy Katz. Cirrus: A serverless frame-             14th USENIX Symposium on Networked Systems Design
+     work for end-to-end ml workflows. In Proceedings of            and Implementation (NSDI 17), pages 363–376, Boston,
+     the ACM Symposium on Cloud Computing, SoCC ’19,                MA, March 2017. USENIX Association.
+
+
+USENIX Association                          18th USENIX Symposium on Operating Systems Design and Implementation         15
+[34] Jeremy Fowers, Joo-Young Kim, Doug Burger, and Scott             Borivoje Nikolic, Krste Asanovic, and Parthasarathy
+     Hauck. A scalable high-bandwidth architecture for loss-          Ranganathan. Cdpu: Co-designing compression and
+     less compression on fpgas. In 2015 IEEE 23rd Annual              decompression processing units for hyperscale systems.
+     International Symposium on Field-Programmable Cus-               In Proceedings of the 50th Annual International Sympo-
+     tom Computing Machines, pages 52–59, 2015.                       sium on Computer Architecture, ISCA ’23, New York,
+                                                                      NY, USA, 2023. Association for Computing Machinery.
+[35] Alexander Fuerst and Prateek Sharma. Faascache: Keep-
+     ing serverless computing alive with greedy-dual caching.    [44] Jeongchul Kim and Kyungyong Lee. Functionbench: A
+     In Proceedings of the 26th ACM International Confer-             suite of workloads for serverless cloud function service.
+     ence on Architectural Support for Programming Lan-               In 2019 IEEE 12th International Conference on Cloud
+     guages and Operating Systems, ASPLOS ’21, page                   Computing (CLOUD), pages 502–504, 2019.
+     386–400, New York, NY, USA, 2021. Association for
+     Computing Machinery.                                        [45] Jeongchul Kim and Kyungyong Lee. Practical cloud
+                                                                      workloads for serverless faas. In Proceedings of the
+[36] Abraham Gonzalez, Aasheesh Kolli, Samira Khan, Si-               ACM Symposium on Cloud Computing, SoCC ’19, page
+     hang Liu, Vidushi Dadu, Sagar Karandikar, Jichuan                477, New York, NY, USA, 2019. Association for Com-
+     Chang, Krste Asanovic, and Parthasarathy Ranganathan.            puting Machinery.
+     Profiling hyperscale big data processing. In Proceed-
+     ings of the 50th Annual International Symposium on          [46] Ana Klimovic, Yawen Wang, Patrick Stuedi, Animesh
+     Computer Architecture, ISCA ’23, New York, NY, USA,              Trivedi, Jonas Pfefferle, and Christos Kozyrakis. Pocket:
+     2023. Association for Computing Machinery.                       Elastic ephemeral storage for serverless analytics. In
+                                                                      13th USENIX Symposium on Operating Systems Design
+[37] Yasunori Goto. Kernel-based virtual machine technol-             and Implementation (OSDI 18), pages 427–444, Carls-
+     ogy. Fujitsu scientific & technical journal, 47, 07 2011.        bad, CA, October 2018. USENIX Association.
+[38] Junyeong Han, Sungeun Kim, Sungyoung Lee, Jaehwan           [47] Kamil Kojs. A survey of serverless machine learning
+     Lee, and Sung Jo Kim. A hybrid swapping scheme based             model inference, 2023.
+     on per-process reclaim for performance improvement
+     of android smartphones (august 2018). IEEE Access,          [48] Reese Kuper, Ipoom Jeong, Yifan Yuan, Jiayu Hu, Ren
+     6:56099–56108, 2018.                                             Wang, Narayan Ranganathan, and Nam Sung Kim. A
+                                                                      quantitative analysis and guideline of data streaming
+[39] Seth Jennings. The zswap compressed swap cache.                  accelerator in intel 4th gen xeon scalable processors,
+     https://lwn.net/Articles/537422/, 2023.                          2023.
+[40] Jiawei Jiang, Shaoduo Gan, Yue Liu, Fanlin Wang, Gus-       [49] Nikita Lazarev, Tao Ji, Anuj Kalia, Daehyeok Kim, Ilias
+     tavo Alonso, Ana Klimovic, Ankit Singla, Wentao Wu,              Marinos, Francis Y. Yan, Christina Delimitrou, Zhiru
+     and Ce Zhang. Towards demystifying serverless ma-                Zhang, and Aditya Akella. Resilient baseband process-
+     chine learning training. In Proceedings of the 2021              ing in virtualized rans with slingshot. In Proceedings
+     International Conference on Management of Data, SIG-             of the ACM SIGCOMM 2023 Conference, ACM SIG-
+     MOD ’21, page 857–871, New York, NY, USA, 2021.                  COMM ’23, page 654–667, New York, NY, USA, 2023.
+     Association for Computing Machinery.                             Association for Computing Machinery.
+[41] Hoyong Jin, Donghun Jeong, Taewon Park, Jong Hwan           [50] Morgan Ledwon, Bruce F. Cockburn, and Jie Han. High-
+     Ko, and Jungrae Kim. Multi-prediction compression:               throughput fpga-based hardware accelerators for deflate
+     An efficient and scalable memory compression frame-              compression and decompression using high-level syn-
+     work for gp-gpu. IEEE Computer Architecture Letters,             thesis. IEEE Access, 8:62207–62217, 2020.
+     21(2):37–40, 2022.
+                                                                 [51] Sang Muk Lee, Jung Hwan Oh, Ji Hoon Jang, Seong Mo
+[42] Svilen Kanev, Juan Pablo Darago, Kim Hazelwood,                  Lee, Ji Kwang Kim, and Seung Eun Lee. Live demon-
+     Parthasarathy Ranganathan, Tipp Moseley, Gu-Yeon                 stration: An fpga based hardware compression accel-
+     Wei, and David Brooks.     Profiling a warehouse-                erator for hadoop system. In 2016 IEEE Asia Pacific
+     scale computer. SIGARCH Comput. Archit. News,                    Conference on Circuits and Systems (APCCAS), pages
+     43(3S):158–169, jun 2015.                                        744–745, 2016.
+[43] Sagar Karandikar, Aniruddha N. Udipi, Junsun Choi,          [52] Weigang Li. Optimize genomics data compression with
+     Joonho Whangbo, Jerry Zhao, Svilen Kanev, Edwin Lim,             hardware accelerator. In 2017 Data Compression Con-
+     Jyrki Alakuijala, Vrishab Madduri, Yakun Sophia Shao,            ference (DCC), pages 446–446, 2017.
+
+
+
+16   18th USENIX Symposium on Operating Systems Design and Implementation                                USENIX Association
+[53] Filipe Manco, Costin Lupu, Florian Schmidt, Jose                Systems, page 733–750. Association for Computing Ma-
+     Mendes, Simon Kuenzer, Sumit Sati, Kenichi Yasukata,            chinery, 2020.
+     Costin Raiciu, and Felipe Huici. My vm is lighter (and
+     safer) than your container. In Proceedings of the 26th     [62] Rajesh Thallam. Bigquery explained: An overview
+     Symposium on Operating Systems Principles, SOSP ’17,            of bigquery’s architecture.      https://cloud.
+     page 218–233, New York, NY, USA, 2017. Association              google.com/blog/products/data-analytics/
+     for Computing Machinery.                                        new-blog-series-bigquery-explained-overview,
+                                                                     2023.
+[54] Anup Mohan, Harshad Sane, Kshitij Doshi, Saikrishna
+     Edupuganti, Naren Nayak, and Vadim Sukhomlinov. Ag-        [63] Wen-Hsiu Tsai, Po-Jui Tsao, and Che-Rung Lee. Fvmm:
+     ile cold starts for scalable serverless. In 11th USENIX         Fast vm migration for virtualization-based fault toler-
+     Workshop on Hot Topics in Cloud Computing (HotCloud             ance using templates. In 2022 IEEE International Con-
+     19), Renton, WA, July 2019. USENIX Association.                 ference on Cloud Computing Technology and Science
+                                                                     (CloudCom), pages 9–16, 2022.
+[55] Khine Moe Nwe, Mi Khine Oo, and Maung Maung
+     Htay. Efficient resource management for virtual machine    [64] Dmitrii Ustiugov, Plamen Petrov, Marios Kogias,
+     allocation in cloud data centers. In 2018 IEEE 7th              Edouard Bugnion, and Boris Grot. Benchmarking, analy-
+     Global Conference on Consumer Electronics (GCCE),               sis, and optimization of serverless function snapshots. In
+     pages 419–420, 2018.                                            Proceedings of the 26th ACM International Conference
+                                                                     on Architectural Support for Programming Languages
+[56] Gennady Pekhimenko, Vivek Seshadri, Onur Mutlu,                 and Operating Systems, ASPLOS ’21, page 559–572,
+     Phillip B. Gibbons, Michael A. Kozuch, and Todd C.              New York, NY, USA, 2021. Association for Computing
+     Mowry. Base-delta-immediate compression: Practical              Machinery.
+     data compression for on-chip caches. In Proceedings
+     of the 21st International Conference on Parallel Archi-    [65] Parichehr Vahidinia, Bahar Farahani, and Ferei-
+     tectures and Compilation Techniques, PACT ’12, page             doon Shams Aliee. Cold start in serverless computing:
+     377–388, New York, NY, USA, 2012. Association for               Current trends and mitigation strategies. In 2020
+     Computing Machinery.                                            International Conference on Omni-layer Intelligent
+                                                                     Systems (COINS), pages 1–7, 2020.
+[57] Weikang Qiao, Jieqiong Du, Zhenman Fang, Libo Wang,
+     Michael Lo, Mau-Chung Frank Chang, and Jason Cong.         [66] vhive-serverless. vswarm: Serverless framework for
+     High-throughput lossless compression on tightly cou-            multi-tenant serverless computing. https://github.
+     pled cpu-fpga platforms. pages 291–291, 05 2018.                com/vhive-serverless/vSwarm, 2023. Accessed:
+                                                                     Dec 6, 2023.
+[58] Charles Reiss, Alexey Tumanov, Gregory Ganger, Randy
+     Katz, and Michael Kozych. Heterogeneity and dynam-         [67] Hao Wang, Di Niu, and Baochun Li. Distributed ma-
+     icity of clouds at scale: Google trace analysis. In Pro-        chine learning with a serverless architecture. In IEEE
+     ceedings of SOCC. 2012.                                         INFOCOM 2019 - IEEE Conference on Computer Com-
+                                                                     munications, pages 1288–1296, 2019.
+[59] Adam Ruprecht, Danny Jones, Dmitry Shiraev, Greg
+     Harmon, Maya Spivak, Michael Krebs, Miche Baker-           [68] Jiarong Xing, Junzhi Gong, Xenofon Foukas, Anuj
+     Harvey, and Tyler Sanderson. Vm live migration at scale.        Kalia, Daehyeok Kim, and Manikanta Kotaru. Enabling
+     SIGPLAN Not., 53(3):45–56, mar 2018.                            Resilience in Virtualized RANs with Atlas. Association
+                                                                     for Computing Machinery, New York, NY, USA, 2023.
+[60] Sudhir Satpathy, Vikram Suresh, Raghavan Kumar, Vin-
+     odh Gopal, James Guilford, Mark Anders, Himanshu           [69] Tianyi Yu, Qingyuan Liu, Dong Du, Yubin Xia, Binyu
+     Kaul, Amit Agarwal, Steven Hsu, Ram Krishnamurthy,              Zang, Ziqian Lu, Pingchao Yang, Chenggang Qin, and
+     Vivek De, and Sanu Mathew. A 1.4ghz 20.5gbps gzip               Haibo Chen. Characterizing serverless platforms with
+     decompression accelerator in 14nm cmos featuring                serverlessbench. In Proceedings of the 11th ACM Sym-
+     dual-path out-of-order speculative huffman decoder and          posium on Cloud Computing, SoCC ’20, page 30–44,
+     multi-write enabled register file array. In 2019 Sympo-         New York, NY, USA, 2020. Association for Computing
+     sium on VLSI Circuits, pages C238–C239, 2019.                   Machinery.
+
+[61] Akshitha Sriraman and Abhishek Dhanotia. Accelerom-        [70] Cheng Zhang, Jun Bi, Yu Zhou, Abdul Basit Dogar, and
+     eter: Understanding acceleration opportunities for data         Jianping Wu. Hyperv: A high performance hypervisor
+     center overheads at hyperscale. In Proceedings of the           for virtualization of the programmable data plane. In
+     Twenty-Fifth International Conference on Architectural          2017 26th International Conference on Computer Com-
+     Support for Programming Languages and Operating                 munication and Networks (ICCCN), pages 1–9, 2017.
+
+
+USENIX Association                          18th USENIX Symposium on Operating Systems Design and Implementation           17
+[71] Irene Zhang, Alex Garthwaite, Yury Baskakov, and Ken-          Machinery.
+     neth C. Barr. Fast restore of checkpointed memory using
+     working set estimation. SIGPLAN Not., 46(7):87–98,        [73] Zhuangzhuang Zhou, Yanqi Zhang, and Christina Delim-
+     mar 2011.                                                      itrou. Aquatope: Qos-and-uncertainty-aware resource
+                                                                    management for multi-stage serverless workflows. In
+[72] Irene Zhang, Alex Garthwaite, Yury Baskakov, and Ken-          Proceedings of the 28th ACM International Conference
+     neth C. Barr. Fast restore of checkpointed memory              on Architectural Support for Programming Languages
+     using working set estimation. In Proceedings of the 7th        and Operating Systems, Volume 1, ASPLOS 2023, page
+     ACM SIGPLAN/SIGOPS International Conference on                 1–14, New York, NY, USA, 2022. Association for Com-
+     Virtual Execution Environments, VEE ’11, page 87–98,           puting Machinery.
+     New York, NY, USA, 2011. Association for Computing
+
+
+
+
+18   18th USENIX Symposium on Operating Systems Design and Implementation                           USENIX Association
+

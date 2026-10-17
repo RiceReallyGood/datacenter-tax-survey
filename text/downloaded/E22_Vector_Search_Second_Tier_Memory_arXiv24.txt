@@ -1,0 +1,2853 @@
+Characterizing the Dilemma of Performance and Index Size in Billion-Scale Vector
+Search and Breaking It with Second-Tier Memory
+Rongxin Cheng1,2 , Yifan Peng1 , Xingda Wei∗ 1,2 , Hongrui Xie1 , Rong Chen1,2 , Sijie Shen3 , and Haibo Chen1
+
+arXiv:2405.03267v2 [cs.DC] 7 May 2024
+
+1
+
+Institute of Parallel and Distributed Systems, SEIEE, Shanghai Jiao Tong University
+2
+Shanghai AI Laboratory
+3
+Alibaba Group
+
+Abstract
+
+the exact closest vector is often impractical, particularly for
+high-dimensional and large-scale vector datasets commonly
+found in real workloads [56, 8]. Therefore, systems typically
+use approximate nearest neighbor search (ANNS) to find an
+approximation of the k closest vectors in the dataset (i.e., find
+the top-k) [47, 60, 7, 6, 56].
+A key system requirement for vector search is high performance. For example, vector search is the backend of Google
+search [9], a service that is latency sensitive [4, 11] and demands high processing rate: e.g., handles 8.5 billion queries
+each day [44]. To accelerate ANNS-based vector search, people have built two types of indexes: graph [47, 36, 15] and
+cluster [7, 14, 56]. Graph indexes use a configurable number
+of edges to link vectors that are close in distance, and conduct
+graph traversal to locate the top-k vectors. Cluster indexes
+group closed vectors into clusters. They then perform a bruteforce search on a configurable number of clusters to find the
+top-k of a query vector.
+For vector searches on large-scale datasets, it is common
+to store the graph and clusters on secondary storage like
+SSD [7, 56, 47]. As the SSD bandwidth is several orders of
+magnitude slower than DRAM, SSD-based vector search
+is I/O bound. For example, a commodify 64-core server
+can search 3,624–5,212 Mvectors/sec with SIMD1 on common vector datasets with 100–384 dimensions. In comparison, an SSD with 5.3 GB/s bandwidth can only search 14–
+53 Mvectors/sec even considering its bandwidth is fully utilized (e.g., in cluster indexes). For indexes like graph, fully
+utilizing the SSD bandwidth is impossible due to the small
+random reads (e.g., 256 B).
+
+Vector searches on large-scale datasets are critical to modern
+online services like web search and RAG, which necessity
+storing the datasets and their index on the secondary storage like SSD. In this paper, we are the first to characterize
+the trade-off of performance and index size in existing SSDbased graph and cluster indexes: to improve throughput by
+5.7 × and 1.7 ×, these indexes have to pay a 5.8 × storage
+amplification and 7.7 × with respect to the dataset size, respectively. The root cause is that the coarse-grained access of
+SSD mismatches the fine-grained random read required by
+vector indexes with small amplification.
+This paper argues that second-tier memory, such as remote
+DRAM/NVM connected via RDMA or CXL, is a powerful storage for addressing the problem from a system’s perspective, thanks to its fine-grained access granularity. However, putting existing indexes—primarily designed for SSD—
+directly on second-tier memory cannot fully utilize its power.
+Meanwhile, second-tier memory still behaves more like storage, so using it as DRAM is also inefficient. To this end,
+we build a graph and cluster index that centers around the
+performance features of second-tier memory. With careful execution engine and index layout designs, we show that vector
+indexes can achieve optimal performance with orders of magnitude smaller index amplification, on a variety of second-tier
+memory devices.
+Based on our improved graph and vector indexes on secondtier memory, we further conduct a systematic study between
+them to facilitate developers choosing the right index for
+their workloads. Interestingly, the findings on the second-tier
+memory contradict the ones on SSDs.
+
+Multi-dimensional vectors with tens or hundreds of dimensions are powerful representations of multi-modal data including but not limited to text, vision, and videos [38, 40]. As a
+result, vector search—searching a database with numerous
+vectors to find the closest one given a query vector—is a key
+pillar in supporting real-world tasks like web search [32] and
+retrieval augmented generation (RAG) [30]. However, finding
+
+The high performance and low index size dilemma for I/Obounded vector searches. One intuitive way to improve I/O
+performance in existing vector indexes is to increase the index
+size, e.g., store extra information (edges and replicated vectors). For the graph, when the size of the graph is increased by
+adding more edges, the number of hops—each corresponding
+to a small random I/O—dramatically decreases. Meanwhile,
+as each hop reads more data (e.g., from 256 to 1024 B), the
+SSD bandwidth utilization also increases. For the cluster, by
+replicating vectors in adjacent clusters, the number of clusters
+required for the search [7, 56] also dramatically reduced, so
+
+∗ Xingda Wei is the corresponding author (wxdwfc@sjtu.edu.cn)
+
+1 Single Instruction Multiple Data.
+
+1
+
+Introduction
+
+1
+
+the overall search performance improves.
+However, the index size required for optimal vector search
+is orders of magnitude higher than the traditional scalar indexes. For example, DiskANN [47] and SPFresh [56]—the
+state-of-the-art graph and cluster indexes—require indexes
+that are 4.9 × and 6.7 × larger than the indexed dataset (index
+amplification) for an optimal performance, respectively (§3).
+In comparison, scalar indexes like B+ Tree or hash table only
+have an index amplification of 0.4–1.2 × [59]2 . Unlike scalar
+indexes, the index size, the number of I/Os and the size of
+each I/O are determined by the machine learning algorithms
+that build the index and search it, which we argue can hardly
+improve to match the requirements of high-performance SSD
+accesses.
+Another way to tackle this problem is from a system’s
+perspective without changing the algorithms. For example,
+we can deduplicate the replicated vectors in cluster indexes
+by replicating the address instead of vectors (§6.1), thereby
+reducing the cluster index with replication by 84%. However,
+naively changing the index layout could result in orders of
+magnitude more small random reads (100–384 B) to read
+replicated vectors, and the resulting performance is only 1.5%
+of the original replicated design on SSD.
+
+reach the optimal performance with 4–44% less index storage,
+and our cluster index can achieve so with 40% index size
+amplification.
+Achieving so is non-trivial. First, existing billion-scale vector indexes are designed for SSDs, so they cannot fully utilize
+the fine-grained access nature of second-tier memory. Second,
+treating the second-tier memory as DRAM also results in poor
+performance because they still behave like storage devices,
+e.g., with an order of magnitude higher latency and should
+minimize the number of small reads. For example, placing
+the graph index on second-tier memory would shift the performance bottleneck from I/O to computation, but the relatively
+long access latency of second-tier memory hinders the CPU
+from fully utilizing the SIMD for vector search (§5). Therefore, we retrofit the execution pipeline of the graph index
+to hide the execution delay caused by reading the secondtier memory. Meanwhile, naively deduplicating the cluster
+index would result in numerous small random I/Os on the
+second-tier memory. This prevents us from fully utilizing
+the I/O bandwidth (§6). To this end, we designed a grouping
+mechanism to minimize the small random I/Os on second-tier
+memory.
+An end-to-end study on comparing graph and vector indexes (§7). To conclude our study of utilizing second-tier
+memory for vector indexes, we conducted a systematic study
+comparing the graph and cluster indexes on second-tier memory. We draw several interesting findings that contradict common findings on SSD. First, it is widely known that graph is
+slower than the cluster because it is unfriendly to the SSD’s
+I/O, which causes its poor performance [7, 56]. However,
+graph can have much better performance than the cluster, not
+only because its I/O is more efficient on second-tier memory,
+but also it reads far fewer vectors than the cluster. Second, the
+cluster index is notoriously for huge index size (6.3–7.7 × of
+original dataset) caused by replication [49]. On the secondtier memory, with our improved design, the index size can be
+kept consistently small (1.1–1.4 ×).
+
+Root cause: workloads mismatch SSD requirements. The
+workloads of graph or vector indexes with small amplification
+share the same characteristics: they are I/O intensive, require
+many random accesses over large datasets, and the sizes of
+reads are small, e.g., a few edges in the graph (e.g., 256 B)
+and a single replicated vector (e.g., 100–384 B) for cluster
+deduplication. The above workloads mismatch with the high
+bandwidth utilization requirements of traditional storage like
+SSD, i.e., using a few sufficient large reads (4 KB) to fully
+utilize the SSD bandwidth.
+The second-tier memory for the rescue. We argue that
+second-tier memory—volatile or non-volatile (NVM) memory that is attached to the host with fast interconnects like
+RDMA and CXL [10] (§4), opens up opportunities to systematically address the problem. Specifically, these devices
+behave like storage but support finer access granularity (256 B
+vs. 4 KB), which matches the workload patterns of vector indexes. Moreover, they are robust to random reads with even
+smaller access granularity (e.g., 100 B). Specifically, adding
+50% such I/O might not affect the memory bandwidth utilization, while in SSD the utilization drops by up to 43%.
+Therefore, we can trade a few sequential accesses in vector
+search for dramatically reducing index size.
+
+Contributions. In summary, our contributions are:
+• We are the first to characterize the high performance
+and low index size amplification dilemma in SSD-based
+indexes for large-scale vector datasets.
+• We provide the first guideline on how to utilize second-tier
+memory for breaking the aforementioned problem.
+• We built the first graph and cluster indexes on second-tier
+memory that achieve orders of magnitude higher performance as well as orders of magnitude smaller index size.
+• We present the first end-to-end study comparing the graph
+and vector indexes on second-tier memory.
+
+Challenges and solutions for utilizing second-tier memory.
+In this paper, we built two indexes around the performance
+features of second-tier memory to show the effectiveness of
+vector indexes in second-tier memory. On various devices
+including RDMA, CXL, and NVM, our graph index can
+
+2
+
+Vector Search and Second-tier Memory
+
+2.1
+
+ANNS-based vector search and its indexes
+
+ANNS-based vector search. Given a query vector and a
+vector dataset, vector search finds the most similar vector in
+
+2 The database community still believes that such an amplification is
+
+huge [59].
+
+2
+
+(b) Execution flow
+Vector
+Compressed
+Graph
+
+Complete
+graph
+
+DRAM
+
+(c) Data layout
+7 5,6
+8 11, 12, 15
+
+Start
+
+1
+
+7 5,6
+
+8 11,12
+
+Vector
+
+4,5,6,7
+
+Vector ID
+
+[0,]
+
+5
+1
+2
+3
+
+…
+
+Centroid
+
+Vector ID
+
+0
+
+Storage block
+5 1,2,3,4
+
+(a) Data structure
+
+Query vector
+
+Traversal
+
+(a) Data structure
+
+…
+…
+
+(b) Execution flow
+Query vector
+
+Graph
+
+[5,0]
+
+Clusters
+
+[1,0,5]
+[2,1,5,0]
+
+TopK
+
+…
+
+…
+1. Find clusters
+…
+
+Vector
+
+TopC (Cluster IDs)
+
+[2,1,3,5,…]
+
+(c) Data layout
+
+Candidate sets
+
+Vector
+
+Cluster 0 [0.1, 0.2, …] …
+
+Figure 1: An illustration of (a) the basic data structures of graphbased vector index, (b) the execution flow of vector search with it
+and (c) how the data structures are stored.
+
+Cluster 1 [0.2, 0.3, …] …
+
+…
+
+Storage block
+
+DRAM
+2 3,4,5,6
+4
+
+2. Search clusters
+
+…
+
+9, 10
+
+Centroid
+Cluster ID
+
+…
+
+TopK
+
+Figure 2: An illustration of (a) the basic data structures of clusterbased vector index, (b) the execution flow of vector search with it
+and (c) how the data structures are stored.
+
+the dataset. Formally, given a vector dataset [x1 , x2 , . . . , xn ]
+and a query vector x, where x ∈ Rd , the search will find
+xi = argminxi dist(x, xi ), where dist is the distance metric,
+e.g., Euclidean distance. Due to the curse of dimensionality [8], it is impractical to find the exact xi especially for
+high-dimensional vectors commonly found in real-world applications [7, 56, 60]. Therefore, systems conduct approximate nearest neighbor search (ANNS) for the vector search,
+which finds K approximate nearest candidates for the xi
+(top-k). To accelerate ANNS, people have built two types of
+indexes3 :
+
+due to its pointer chasing access pattern, resulting in long
+latency and low bandwidth utilization [7, 56]. Moreover, the
+graph index is not friendly to vector insertions, as building
+the graph necessitates reconstructing the graph [56].
+Cluster-based index [7, 14, 56]. The cluster index has been
+optimized for storage access. As shown in Figure 2, The
+vectors are partitioned into clusters where each cluster can be
+stored efficiently in a storage block (e.g., an SSD block), as
+shown in Figure 2 (c). The search then only needs to read the
+closest clusters to get the top-k. To facilitate finding the closest
+clusters, cluster indexes typically use a graph index to record
+the cluster relationships, where the graph node is the centroids
+of the clusters [7, 56, 29]. Since the graph is typically much
+smaller than the cluster (only contains centroids), it is stored
+in memory for efficient search. Figure 2 (b) presents the
+concrete execution flow. The search first traverses the graph
+to find the top-c clusters. Afterward, it reads all the cluster
+data and searches the top-k among them.
+The benefits of cluster-based indexes include: (1) they are
+efficient for secondary storage as they allow large bulk reads
+of clusters, and (2) they are friendly to insertion workloads,
+as vectors can be inserted into the closest clusters without the
+need for rebuilding the whole index like graph [56]. However,
+cluster-based indexes have high read amplification due to
+redundant vectors read in each cluster. Meanwhile, they also
+have high space amplification due to replications required for
+high accuracy (see §2.2 for more details).
+
+Graph-based index [47, 36, 15]. It stores vectors in a directed graph (Figure 1 (a)), where the nodes are vectors and
+the edges connect vectors that are close in distance. For example, if a → b, it means that vector b is the top-k vector of
+a. Figure 1 (b) presents the execution flow of the search. The
+search begins at a start node in the graph and identifies the
+nearest neighbors through best-first graph traversals. Specifically, each hop in the traverse will read a vector and its edges
+from the storage. The starting node of the traverse can be
+fixed [15], chosen randomly [33, 1] or selected by traversing
+a (relative) small or compressed graph that is distilled from
+the original graph [36, 47, 42] (see (a)). During the traversal,
+the search maintains a candidate set containing the closest
+vectors traversed so far (sorted by their distances). After the
+traversal is completed, the search returns the top-k results
+from the candidate set as the final top-k results of the search.
+The traversal stops as long as the candidate set size exceeds a
+pre-defined threshold (a hyperparameter).
+The full graph is typically stored as adjacent lists in the
+secondary storage [47, 42], as shown in Figure 1 (c). Note that
+the nodes and edges are stored together since each traversal
+requires both data. On the other hand, the compressed graph,
+which aids in traversal, is stored in the DRAM [47].
+The benefit of a graph index lies in its ability to capture
+the relationships between vectors in a fine-grained way. As a
+result, the search process has low read amplification, meaning
+it reads only a few extra vectors beyond the required top-k.
+The downside is that graph traversal is not friendly to storage
+
+2.2
+
+Building vector indexes
+
+The space consumed by vector indexes is closely tied to how
+the indexes are constructed. Both types of indexes are built
+using traditional unsupervised machine learning methods.
+Graph-based index. To build a graph index on a dataset of
+vectors, the builder first uses k-Nearest Neighbor (kNN) to
+find the closest neighbors for each vector. The k is a static
+user-configured parameter for index construction. Note that
+this k is unrelated to the top-k required by the query. It then
+
+3 To the best of our knowledge, no other types of billion-scale vector indices
+
+exist.
+
+3
+
+First-tier
+3D XPoint NVM
+60GB/s NVM
+
+DDR
+LPDDR
+
+DRAM RDMA
+
+Compute node
+
+CXL
+
+NVM
+
+…
+
+DRAM 25GB/s
+
+Table 2: Billion-scale datasets used in the experiments.
+
+Second-tier
+NVM
+
+32GB/s NVM
+
+Memory node
+
+Dataset
+SPACEV (S)
+BIGANN (B)
+DEEP (D)
+
+DRAM DDR5
+DRAM 466GB/s
+
+Compute node
+
+|Dataset|
+1 Billion
+1 Billion
+1 Billion
+
+Dimensions
+100 × int8
+128 × uint8
+96 × float32
+
+Total space
+94 GB
+120 GB
+358 GB
+
+|Queryset|
+29 K
+10 K
+10 K
+
+Figure 3: First-tier memory vs. second-tier memory.
+
+to saturate the interconnect bandwidth (see Figure 6).
+To show that our results generalize to a variety of secondtier memory, we considered all three known implementations in production (see Table 1): RDMA-attached DRAM
+(RDMA), CXL-attached DRAM (CXL), and NVM.
+
+Table 1: Performance features of different memory technologies.
+SSD
+
+DRAM
+
+RDMA
+
+CXL
+
+NVM
+
+Bandwidth
+
+5.3 GB/s
+
+35 GB/s
+
+25 GB/s
+
+32 GB/s
+
+60 GB/s
+
+Latency
+
+75 µs
+
+0.1 µs
+
+2.8 µs
+
+0.3 µs
+
+0.4 µs
+
+3
+
+connects each vector with its k closest neighbors to form
+the graph. Graph indexes typically chooses a small k (e.g.,
+32 [47]) as it could significantly amplify the space of the index
+(see §3). Based on the graph formed by kNN, existing indexes
+also prune the edges using methods like sparse neighborhood
+graph (SNG) [3] for improved traversal quality.
+
+Setup, datasets and baseline indexes. We conducted experiments on a machine equipped with an Intel D7-P5520
+SSD (7.7 TB, 5.3 GB/s), and an Intel Xeon Gold 6430 CPU
+(20 cores, 3.4 GHz). We use three popular billion-scale workloads used by existing works [47, 7, 56]—the largest publicly
+available datasets for vector search (see Table 2).
+We choose two vector search systems as our baselines:
+
+Cluster-based index. First, the builder partitions the vectors
+into clusters using kMeans. The number of clusters is selected
+to be orders of magnitude smaller than the number of vectors. One issue with kMeans is that it can cause unbalanced
+partitioning, i.e., one cluster may contain significantly more
+vectors than others. Unbalanced clusters can lead to high variance in search time, so state-of-the-art indexes [7, 56] will
+further balance the cluster size using a multi-constraint balanced clustering algorithm [34]. Another issue with kMeans
+is the boundary issue. Specifically, boundary vectors of a cluster can be assigned to multiple neighboring clusters. However,
+kMeans assigns them to only one cluster. Ignoring this issue
+leads to searching through more clusters for accuracy, which
+further results in significant performance degradation. Therefore, existing indexes replicate boundary vectors to a set of
+close clusters, where the number of replications is statically
+configured before the index build.
+2.3
+
+The Dilemma of High Performance and
+Small Index Size in Vector Indexes
+
+• Graph (DiskANN [47]): DiskANN is the state-of-the-art
+graph index. It follows the graph index design described in
+§2.1, and further leverages product quantization (PQ) to
+compress the graph in memory to accelerate graph search.
+• Cluster (SPFresh [56]): SPFresh is state-of-the-art cluster
+index that utilizes: (1) an in-memory graph index on
+centroids to accelerate finding search clusters for the query
+vector, and (2) a balanced partitioning algorithm to ensure
+low variances in cluster sizes. Additionally, SPFresh
+supports in-place updates.
+Both indexes are optimized with SSD access, e.g., they use
+SPDK [45] to achieve the best I/O performance on SSDs, and
+leverage SIMD for execution.
+Search accuracy and runtime index hyper parameters.
+The accuracy of the vector index is defined in terms of recall,
+i.e., the ratio of result vectors returned by the index in the
+ground-truth top-k. Given the same accuracy, the performance
+of vector search is strongly influenced by the configuration
+of its runtime hyperparameters, i.e., the number of clusters
+to search and the maximum size of the candidate set (that
+determines the graph traversal hops,see Figure 1 (b)).
+Like prior work [7, 56, 47], we choose the parameters that
+achieve the best performance at a given accuracy level, and
+use an overall accuracy of at least 90% across all experiments.
+Note that for a given dataset and index, its hyperparameters
+are configured only once and remain unchanged during its
+query time.
+
+Second-tier memory
+
+Figure 3 presents the second-tier memory architecture that we
+target in this paper. Unlike traditional fast DRAM that is directly connected to the CPU via the memory bus, second-tier
+memory is a relatively slower, but cheaper memory device
+that can be indirectly connected to the CPU through a highbandwidth interconnect like RDMA [63, 16] or CXL [10, 37].
+The memory can be either old-generation DRAM (DDR3),
+which is sufficient to saturate the interconnect bandwidth,
+or persistent memory like NVM [22, 53]4 . They have less
+cost per GB compared to locally attached DRAM because:
+(1) older-generation memory is cheaper and (2) indirection
+allows improved memory utilization by pooling unused memory [31, 61, 19]. However, they are still significantly slower
+than DRAM and behave more like storage (detailed in §4):
+They require a sufficient large request payload (e.g., 256 B)
+
+3.1
+
+Case study: graph index
+
+Sources contribute to the index size. Similar to a traditional
+graph, the additional space occupied by the graph vector index
+
+4 NVM can also be directly attached to the CPU like DRAM.
+
+4
+
+4
+
+6
+
+8
+4
+0
+
+0
+
+1
+
+2
+
+3
+
+4
+
+(a) Size amplified
+
+5
+
+6
+
+DEEP
+
+2.5
+
+8
+
+3
+
+5
+2
+
+2
+
+Payload/IO X
+#IO/query
+
+5.0
+
+Payload/IO
+
+BIGANN
+
+1
+2.5
+
+5.0
+
+2
+
+Query
+
+1.0
+
+4
+
+0.0
+
+2.5
+
+0
+
+Compute
+
+2
+
+4
+
+0
+
+(c) Size amplified
+
+20
+
+IO
+
+0.5
+0.0
+
+SPACEV
+
+7.5
+
+(b) Index size amplifications (Size amplified)
+
+16
+12
+
+DEEP
+
+0.5
+0.0
+
+Query time
+breakdown
+
+Cluster throughput
+
+5
+
+BIGANN
+
+SPACEV
+BIGANN
+
+10
+
+DEEP
+
+2
+
+4
+
+(d) Space amplified
+
+5.0
+
+2
+
+2.5
+1
+
+0
+
+5
+
+0
+
+5
+
+0
+
+(b) Index size amplifications (Size amplified)
+
+5
+
+0
+
+2
+
+4
+
+(c) Size amplified
+
+0
+
+2
+
+Payload/IO X
+#IO/query
+
+3
+
+SPACEV
+
+Payload/IO
+
+2
+
+(a) Size amplified
+
+1.0
+
+#IO/query
+
+DEEP
+
+#IO/query
+
+BIGANN
+
+Query time
+breakdown
+
+Graph throughput
+
+10 SPACEV
+8
+6
+4
+2
+0
+0
+1
+
+4
+
+(d) Space amplified
+
+Figure 4: (a) Performance—index size trade-off in existing graph-based (upper) and cluster-based (bottom) vector indexes. The amplification
+is normalized to the total dataset size without indexing. (b) I/O dominates index performance across various datasets. (c) The performance
+increases when the index size becomes larger is due to the reduced number of I/O sent per-query and (d) the request payload per I/O and its
+trend compared to the reduced number of I/O per query. Note that all the performance data is normalized.
+Vector data
+
+Edges
+
+…
+
+1
+0
+
+index, see Figure 4 (b). Therefore, the graph index faces a
+fundamental dilemma of high performance and low index
+size. More specifically, since I/O dominates the graph search,
+the performance of the graph index can be characterized as:
+
+Centroid
+
+1 2,3,4,5 2 7,8,9,10,11
+6
+
+3
+
+3 0,1,5 4 6,7,8,9
+
+4
+
+…
+
+Top-C centroids
+
+5 1,2,3,4 6 4,5,6,7
+
+2
+5
+
+Fragmentation
+
+…
+
+Storage block
+
+Cluster 0 (C0)
+
+Cluster 1 (C1)
+
+Top-K vectors
+
+Query vector
+
+Throughputsearch = Band. / (#Hops × Sizenode+edge ) (1)
+
+Figure 5: An illustration of (a) the index size amplification problem
+in graph indexing and (b) why a cluster index requires replication.
+
+For our evaluated dataset, the payload read (Sizenode+edge )
+per graph traversal (Hop) cannot exceed the SSD access granularity (4 KB) even if we increase the number of edges, because otherwise would result in a large index size that is 39 ×
+larger than the original dataset, e.g., using 100 B for the node
+and 3,996 B to store the edges. As a result, the achieved bandwidth (Band.) divided by (Sizenode+edge ) can be simplified
+as the IOPS of the storage device—the maximum requests
+per second that the SDD can handle. So we can simplify the
+performance model 1 as:
+Throughputsearch = IOPS / #Hops
+(2)
+
+comes from two sources: the space used to store graph edges,
+and the internal fragmentation that prevents cross-storage
+block graph traversal (see Figure 5 (a)). The space for edges is
+non-trivial and dominates the amplification: For every vector
+in the dataset, the graph stores edges as adjacency list next
+to it (the graph is sparse). For instance, DiskANN by default
+assigns 32 edges to each vector. Given that each edge is a
+4 B vector ID, the size of the list can exceed the original
+data (e.g., 128 vs. 100 in SPACEV). Specifically, DiskANN
+by default introduces an 0.5–1.4 × space amplification in
+existing datasets. Note that this relatively small amplification
+trades graph traversal performance, which we will elaborate
+on later.
+Unlike other graph systems like graph databases and analytics, where the number of edges cannot be controlled by
+the system, the graph vector index can configure different
+numbers of edges per vector, providing control over the space
+used by the graph. Specifically, we can adjust the k in the
+KNN algorithm used to build the graph (see §2.2) to control
+the number of edges per vector.
+
+The model clearly shows that when we increase the number
+of edges of graph indexes, the number of hops required for
+traversal decreases, so the throughput increases.
+The upper half of Figure 4 (a) shows the empirical vector
+search performance respective to the index size (measured
+with size amplification) for all datasets. Take SPACEV dataset
+as an example, other datasets share a similar result. When
+the index size increases from 1.7–5.9 ×, the throughput increases from 1.9–15.2 Kreqs/sec, and the peak throughput is
+1.9× faster than the DiskANN’s default setup (#Edges/vector=32). The performance improvement is due to the reduced
+number of hops required for traversal (see Figure 4 (b)): the
+number of I/O per query decreased significantly from 350
+to 37. Even though each I/O reads more data from the SSD,
+which increases from 164–580 B for the index when sizes
+grow from 1.7–5.9 × of the size of SPACEV, the performance
+still dramatically improves. This is because the IOPS remains
+steady (see Figure 4 (d)), since such payloads are still far
+from saturating the SSD bandwidth.
+
+Characterizing the problem. Ideally, we should minimize
+the space amplification caused by edges. Unfortunately, the
+fewer the edges, the longer the path a query vector must
+traverse to find its approximate top-k. Since an SSD access
+is orders of magnitude slower than computing the distance
+between two vectors (e.g., 70 µs vs. 1 ns on our platform),
+such extra hops significantly slow down the search in graph
+5
+
+3.2
+
+Case study: cluster index
+
+The bottom of Figure 4 (a) shows the performance–index
+size graph of cluster index. For BIGANN and SPACEV
+datasets, the throughput increase 12 × and 16 × when we
+increase the index size by 7.3 × and 7.2 ×, respectively. For
+DEEP, the throughput increase 4 × when increasing the index size by 6.7 ×. All datasets achieve their peak throughput
+when configured with a replication factor of 8, the maximum
+supported by SPFresh. The performance improvement is due
+to fewer clusters being searched (Figure 4 (c)). For instance,
+in BIGANN, it only requires searching 20 clusters to achieve
+90% accuracy with a replication factor of 8. In comparison,
+with a replication factor 1, it has to search 240 clusters. Such
+a reduction in the number of clusters searched offsets the
+reduced IOPS caused by the increased payload per cluster
+(see the bottom of Figure 4 (d)).
+
+Sources contribute to the index size. Unlike a graph index,
+cluster index should ideally have negligible index size. This
+is because (1) the index data used for recording clusters are
+orders of magnitude smaller than the total datasets (one cluster
+for every tens or hundreds of vectors) and (2) clusters stored
+on the SSD are more resilient to cross block accesses (since
+each cluster may cross block due to its large size) so no
+padding is necessary. Unfortunately, state-of-the-art cluster
+indexes [7, 56] extensively replicate a single vector across
+multiple clusters to address the lose of accuracy caused by
+the boundary issue (see Figure 5 (b)). In this example, the
+top-k of the query vector spans the boundaries of cluster 0
+and 1. If the top-c centroids only contain cluster 0, then the
+red vectors from cluster 1 will be missed from the final top-k,
+causing reduced accuracy.
+Replicating the boundary vectors to both clusters addresses
+the issue, at the cost of additional storage used for the index.
+In general, the higher the replication factor, the better the accuracy. Unfortunately, the number of replications that can be
+achieved is limited because the replication is applied globally
+to all vectors in the dataset. For example, SPFresh [56] set
+a maximum replication factor of 8, which in the worst case
+would amplify the space by 8×5 .
+
+3.3
+
+Root cause: workloads mismatch SSD requirements
+
+We attribute the dilemma to a mismatch between the I/O
+requirements for high-performance SSD access and I/O workloads issued by vector indexes with small index amplification.
+Graph index requires fine-grained storage reads for practical index sizes. For a practical graph index with minimal
+index size, we must construct it with a small number of edges
+per node. From an algorithmic perspective, this means that
+graph traversal must use random I/Os with small payloads
+to read these edges. However, this fundamentally conflicts
+with the requirement of using a sufficiently large I/O payload
+(4 KB) to efficiently utilize traditional storage devices like
+SSD.
+
+Characterizing the problem. To avoid excessive replication, another solution is to increase the number of clusters
+searched for each query. For instance, if we search both cluster 0 and 1 as shown in Figure 5 (b), we can achieve the same
+accuracy without replication. Unfortunately, additional cluster searches obviously degrade the vectors searched due to
+the extra vectors read.
+Similar to the graph index, I/O dominates the throughput
+of cluster vector search (the bottom of Figure 4 (b)), which
+can be characterized as:
+
+Cluster index requires irregular I/O for deduplication. For
+cluster indexes, we can deduplicate vectors through indirection. Specifically, instead of storing replicated vector data in
+other clusters, we store an address pointing to the original
+cluster. As the vector address (8 B) is significantly smaller
+than the data (128–384 B), this approach minimizes index
+size. However, it implies that each replicated vector requires a
+separate small random read (100–384 B) to fetch the original
+vector. Such an I/O pattern is irregular to the SSD: 50% can
+cause 43% performance drop.
+
+Throughputsearch = Band. / (#Clusters × Sizecluster ) (3)
+Band. is the bandwidth of the device, and #Clusters is the
+configured number of searched clusters per query.
+Unlike the graph index, the cluster size can exceed the SSD
+payload threshold (4 KB), so we cannot simply use the IOPS
+to characterize the search throughput. When considering the
+request payloads, the relationship between the index size
+and the throughput is more complex to analyze. As shown
+in Equation 3, increasing the index size would increase the
+average cluster size as well as reduce the number of clusters
+searched. Nevertheless, empirically we found the number of
+clusters required to search (#Clusters) decreases more than
+the increase in the average cluster size, so increasing the index
+size can still improve the throughput.
+
+4
+
+The Power of Second-tier Memory in Vector
+Search
+
+We now explain our rationale for using second-tier memory
+for vector indexes, whose access features perfectly match the
+I/O patterns of vector indexes.
+1. Fine-grained block sizes6 : Compared to traditional storage like SSD, second-tier memory has a more fine-grained
+block size (from 64–256 B). Such a pattern matches
+the requirements of vector indexes, e.g., graph reads
+228–512 B for each traversal, which means that vector
+
+5 Existing indexes prune replicated vectors to reduce index size [7, 56]. How-
+
+ever, pruning does not fundamentally change the amplification factor caused
+by replication, e.g., only reduces the amplification from 7 to 5.7–6.3 in the
+datasets.
+
+6We use block size to denote the smallest access granularity of second-tier
+
+memory, without losing generality.
+
+6
+
+5KB 7.7KB 21KB
+
+512
+256
+228
+SSD
+0 8 128 256 4K 6K 8K 32K
+2
+
+20
+512 5KB 7.7KB 21KB
+256
+228
+RDMA
+0 8 128 256 4K 6K 8K 32K
+
+10
+
+IO (Graph) IO (Cluster)
+(S,B,D) (S, B,
+D)
+
+40
+30
+20
+
+512 5KB 7.7KB 21KB
+256
+10
+228
+CXL
+0 8 128 256 4K 6K 8K 32K
+
+Bandwidth (GB/s)
+
+4
+
+Limit
+Rand. Perf.
+
+IO (Graph) IO (Cluster)
+(S,B,D) (S, B,
+D)
+
+30
+
+Bandwidth (GB/s)
+
+6
+
+Bandwidth (GB/s)
+
+Bandwidth (GB/s)
+
+IO (Graph) IO (Cluster)
+(S,B,D) (S, B,
+D)
+
+IO (Graph) IO (Cluster)
+(S,B,D) (S, B,
+D)
+60
+40
+
+512 5KB 7.7KB 21KB
+256
+228
+NVM
+0 8 128 256 4K 6K 8K 32K
+
+20
+
+0.0
+
+SSD
+128 256 512 1K 4K 8K 32K
+
+Payload Size (Bytes)
+
+0.5
+0.0
+
+RDMA
+128 256 512 1K 4K 8K 32K
+
+Payload Size (Bytes)
+
+1.0
+0.5
+0.0
+
+CXL
+128 256 512 1K 4K 8K 32K
+
+Payload Size (Bytes)
+
+Bandwidth (Norm.)
+
+0.5
+
+1.0
+
+Bandwidth (Norm.)
+
+1.0
+
+Bandwidth (Norm.)
+
+100% Payload
+10% 128B
+50% 128B
+90% 128B
+
+Bandwidth (Norm.)
+
+Payload Size (Bytes)
+Payload Size (Bytes)
+Payload Size (Bytes)
+Payload Size (Bytes)
+Figure 6: A comparison of peak random read performance using various read payloads for SSD and different second-tier memory hardware.
+Note that the x-axis is non-linear. For reference, we also mark the typical read payload of the graph (red lines) and cluster (blue lines) index for
+SPACEV (S), BIGANN (B), and DEEP (D) datasets.
+1.0
+0.5
+0.0
+
+NVM
+128 256 512 1K 4K 8K 32K
+
+Payload Size (Bytes)
+
+Figure 7: An analysis of the slowdown introduced by random 128 B reads for various devices.
+Table 3: Measurement machines with second-tier memory.
+Platform
+
+Host CPU configuration
+
+Second-tier Memory
+
+RDMA
+
+Intel(R) Xeon(R) Gold 6430 (32
+cores, 3.4 GHz)
+
+BlueField-3 200 Gbps (up
+to 25 GB/s)
+
+CXL
+
+Intel(R) Xeon(R) Platinum 8468V
+(48 cores, 3.8GHz)
+
+MXC CXL Memory eXpander (CXL 2.0), PCIe
+5.0 x8 (up to 32 GB/s)
+
+NVM
+
+Intel(R) Xeon(R) Gold 6330 CPU
+(28 cores, 2.0GHz)
+
+8 × Optane 200 Series
+(up to 60 GB/s)
+
+We use two microbenchmarks: the first measures the random access performance of various devices, while the second
+evaluates the performance when a portion of the workload
+is replaced with irregular payloads, i.e., small 128 B random
+access. We chose 128 B because it represents the common payload (a single vector) used in both vector indexes (see Table 2).
+For each device, we have carefully tuned the performance to
+avoid inference from underutilized hardware. For SSD, we
+use SPDK to implement both benchmarks. For RDMA, we
+built index on a state-of-the-art RDMA framework [52] with
+all known RDMA-aware optimizations [12, 27, 52]. For CXL
+and NVM, we utilize devdax for direct device access and
+apply all guidelines summarized in existing studies [57, 54].
+
+index can utilize the device bandwidth more efficiently.
+2. Robust to irregular I/Os: The measured performance is
+robust against large payloads unaligned with the device’s
+access granularity, and random reads with not-so-small
+payloads (e.g., a single vector that is 128 B), which is common for vector indexes with small sizes. Vector indexes
+don’t issue other patterns of irregular payloads (e.g., 8 B
+random reads).
+
+Fine-grained access granularity that matches vector index searches. Figure 6 shows the bandwidth achieved on
+different devices using various payloads. First, SSD requires
+a sufficiently large payload (multiple of 4 KB) to approach
+its bandwidth limit, which is not aligned with the typical
+vector index payloads. For instance, the graph index, when
+configured with 32 edges per node for small amplification
+by default, issues reads in 228–512 B payloads for various
+datasets. In contrast, all second-tier memory devices can saturate the bandwidth with relatively small payloads: RDMA,
+CXL, and NVM can achieve close to bandwidth limit with
+payloads of 4 KB, 128 B, and 256 B, respectively.
+The differences lie in the underlying hardware design. Compared to RDMA, CXL, and NVM, which have block size of
+64 B, 64 B and 256 B respectively, SSD has a larger block
+size of 512 B. Additionally, issuing random access with SSD
+block size is insufficient to saturate the bandwidth, as SSDs
+have multiple flash dies that process 512 reads sequentially.
+Therefore, a large read payload (i.e., 4 KB) enables the SSD
+to distribute reads more evenly across the dies, thereby improving performance with reduced die collisions [26].
+
+The aforementioned advantages give us opportunities to break
+the space—performance dilemma in existing index designs
+systematically. First, the fine-grained I/O access granularity
+of second-tier memory matches the graph index requirements–
+—small random reads for low space amplification. Second,
+we can utilize the robustness of irregular IO to replace (some)
+sequential accesses with random accesses. Therefore, we can
+effectively deduplicate the cluster index storage to achieve
+minimal index size.
+Characterized second-tier memory and experiment setup.
+To show that our results generalize to various second-tier
+memory hardware, we use three machines, each with a different memory technique7 , (Table 3) through all experiments.
+The machines are named after the memory technique.
+7 One machine cannot be equipped with all three techniques due to the
+
+Robust to irregular IO. SSDs are not robust to irregular
+
+specialized motherboard required for CXL and NVM.
+
+7
+
+0
+
+2
+
+2
+
+Size amplified
+
+4
+
+4
+2
+0
+
+0
+
+2
+
+Size amplified
+
+0
+
++Pipeline & CSR
+
+SPACEV (RDMA)
+3
+
+1
+
+2
+
+1
+0
+
+50
+
+100
+
+#Edges/vector
+
+Size amplified
+
+Wasted space
+BIGANN (CXL)
+
+DEEP (NVM)
+
+Size amplified
+
+4
+
+0
+0
+
++Pipeline
+
+Size amplified
+
+2
+
++CSR
+
+DEEP (NVM)
+
+Norm. perf.
+
+4
+
+Norm. perf.
+
+Norm. perf.
+
+BIGANN(CXL)
+
+Size amplified
+
+DiskANN (S-memory)
+SPACEV (RDMA)
+
+2.5
+2.0
+1.5
+1.0
+0
+
+50
+
+100
+
+#Edges/vector
+
+2.0
+1.5
+1.0
+0
+
+100
+
+#Edges/vector
+
+Figure 8: Effects of software pipeline (a)–(c) and CSR (d)–(f) on graph index. Due to space limitation, we only list a subset of the overall
+results. The trends for the others are similar.
+
+payloads including: (1) large payloads not aligned with the
+device’s block size (e.g., graph traversal in graph index), and
+(2) payloads smaller than the block size (e.g., graph traversal
+and reading a vector). As shown in Figure 6, SSD performance drops when using 5 KB, 7.7 KB, and 21 KB, which
+are extensively used by the graph index under different workloads. Figure 7 further shows that when the ratio of 128 B
+random read increases from 10–90% in the workloads, the
+SSD experiences 4.6–83.3% slowdowns.
+In comparison, second-tier memory has small or no slowdown under similar scenarios. For (1), they experience no
+slowdown (see Figure 6). For (2), as shown in Figure 7,
+RDMA and NVM experience a maximum slowdown of 48.8%
+and 37.5% under an extreme setup where the workloads are
+50% and 90% workloads are 128 B random reads. Second-tier
+memory is more robust due to its fine-grained block size, i.e.,
+the bandwidth wasted is minimal. For example, for 228 B
+reads required by the graph, the worst waste is at 11% on
+NVM, while it is 55% on SSD, even without considering
+die collisions. Finally, RDMA is less robust when handling
+small random access due to the increased network protocol
+overhead for each request [18]. This suggests that reducing
+irregular access to second-tier memory remains necessary.
+
+5
+
+block access. The overhead space is trivial for graphs
+with large amplification, but it is significant when using a
+small-sized index on second-tier memory. Observing that
+second-tier memory is robust against irregular I/Os with
+unaligned access payloads (§4), we use a compact storage
+layout when storing graph indexes on it.
+Software pipeline. The latency of second-tier memory is on
+the order of 300–3000 ns, which is much higher than that of
+first-tier DRAM (100 ns). This causes significant idle time if
+the CPU processes the I/O synchronously, as in the existing
+design: it busy waits for the I/O to complete before doing the
+computation—compare the distances of candidates with the
+vector node read back.
+To this end, we interleave memory access and vector distance computation from multiple queries to hide the secondtier memory access latency8 . Specifically, we schedule multiple queries execution in a per-hop way for inter-query parallelism: after issuing a second-tier memory request, we will
+schedule the execution of next unfinished query, thereby processing different queries in a pipelined way in software. Note
+that our software pipeline is different from batching because
+we won’t wait for a batching window before processing a
+query: the query is processed as soon as possible. For RDMA,
+we leverage coroutines [28] to implement such a feature. For
+CXL and NVM, since their memory accesses are implicitly issued via CPU load instructions, we will reorganize the
+instruction orders in the search to conduct a batch of loads
+before executing computation, as well as use mm_prefetch
+to realize the feature.
+Figure 8 shows the performance improvement of the software pipeline. For RDMA, the software pipeline improves the
+performance by 1.2–1.6 ×. On CXL and NVM, the pipeline
+can also improve the performance by up to 1.2 ×. The improvements of the pipeline are more obvious in RDMA since
+it has the highest latency.
+
+Improved Graph Index Design
+
+Putting graph indexes on the second-tier memory can
+dramatically improve the index performance thanks to its
+features. However, existing system designs for graph indexes
+do not match or fully utilize the increased I/O capability of
+second-tier memory, causing performance under-utilization
+as well as storage waste. To this end, we propose two designs
+for graph index on the second-tier memory:
+1. Software pipeline. With improved I/O performance, the
+computing capability becomes the performance bottleneck.
+Existing synchronous search design fails to fully utilize
+computational power, so we still need a large index to
+amortize the second-tier memory access latency. We
+propose a software pipeline mechanism to asynchronously
+process I/O with computation, thereby maximizing the use
+of computational power.
+
+Compressed layout. One significant design choice in
+DiskANN is to use padding for storage: without it, DiskANN
+suffers a 48–58% performance loss on SSD. Such a padded
+design might waste 4–44% index spaces, as shown in Figure 8
+(d)–(f). It is unnecessary on the second-tier memory thanks
+to its robustness to irregular I/O that cross-block size. There-
+
+2. Compressed graph layout. The existing graph index
+suffers from internal fragmentation to avoid cross-SSD
+
+8 Interleaving does not help SSDs since the I/O is the bottleneck.
+
+8
+
+Compute
+Bound
+
+1
+
+SSD
+Bound
+
+Dataset: BIGANN
+16
+15
+
+SSD
+
+RDMA
+
+S-memory
+Bound
+Compute
+Bound
+
+1
+
+SSD
+Bound
+
+0
+
+CXL
+
+S-memory
+Bound
+Compute
+Bound
+
+1
+
+SSD
+Bound
+
+Dataset: BIGANN
+17
+16
+
+SSD
+
+CXL
+
+S-memory
+Bound
+Compute
+Bound
+
+1
+
+SSD
+Bound
+
+0
+SSD
+
+Dataset: DEEP
+
+RDMA
+
+S-memory
+Bound
+
+10
+3
+
+1
+
+Compute
+Bound
+SSD
+Bound
+
+Norm. perf.
+
+Dataset: DEEP
+
+Norm. perf.
+
+SSD
+
+0
+
+Norm. perf.
+
+Norm. perf.
+
+0
+
+Dataset: SPACEV
+18
+17
+
+0
+
+SSD
+
+CXL
+
+S-memory
+Bound
+
+12
+3
+
+1
+
+Compute
+Bound
+SSD
+Bound
+
+0
+1
+
+2
+
+3
+
+Size amplified
+
+4
+
+5
+
+Norm. perf.
+
+S-memory
+Bound
+
+Dataset: SPACEV
+80
+75
+
+SSD
+
+NVM
+
+S-memory
+Bound
+Compute
+Bound
+SSD
+Bound
+
+0
+
+Norm. perf.
+
+RDMA
+
+Dataset: BIGANN
+80
+75
+
+SSD
+
+NVM
+
+S-memory
+Bound
+Compute
+Bound
+SSD
+Bound
+
+0
+
+Norm. perf.
+
+SSD
+
+Norm. perf.
+
+Norm. perf.
+
+Dataset: SPACEV
+18
+17
+
+Dataset: DEEP
+46
+44
+
+SSD
+
+NVM
+
+S-memory
+Bound
+
+3
+
+Compute
+Bound
+SSD
+Bound
+
+0
+1
+
+2
+
+3
+
+Size amplified
+
+4
+
+5
+
+1
+
+2
+
+3
+
+Size amplified
+
+4
+
+5
+
+Figure 9: End-to-end graph index performance. S-memory states for second-tier memory used.
+
+6.1
+
+fore, we simply choose a Compressed Sparse Row (CSR)
+layout [43] for storing the graph index on the second-tier
+memory. As also shown in Figure 8, CSR reduces space without compromising performance.
+
+To resolve the dilemma of high-performance and low cluster
+index size, we deduplicate the cluster index with a decoupled
+layout. As shown in Figure 11, unlike the existing cluster index that directly stores the (replicated) vectors in each cluster
+(a), we store vectors separately with the cluster data, and only
+store the addresses of vectors in each cluster (b). As a result,
+for replicated vectors, we only replicate the address. Since
+the address size is orders of magnitude smaller than a vector
+(8 B vs. 100–384 B vectors), replicating addresses has trivial
+storage overhead to the index (see (d)–(f) in Figure 10).
+The execution flow of the index search is the same as with
+the decoupled layout. The only difference is that when reading
+a cluster, we will first read the vector addresses belonging to
+the cluster, and then issue separate reads to fetch the vectors.
+Those reads are small random reads with 100–384 B payloads,
+which is not efficient for traditional storage like SSD but is
+much more efficient on the second-tier memory.
+
+Overall performance. Figure 9 shows the end-to-end performance of the graph index on RDMA, CXL, and NVM with
+all the above optimizations enabled9 . We calculate the computation bound by performing all calculations when storing
+the graph in DRAM and bandwidth bound by with the peek
+bandwidth measured in Figure 6. On second-tier memory, we
+can see that fine-grained random reads won’t cause significant
+bandwidth waste, so graph index can reach the CPU’s computation bound with a small index size amplification (1.7–4.1 ×)
+compared with SSD (4.3–4.9 × to achieve optimal performance). Moreover, its performance is 2.3–4.1 × higher than
+SSD.
+
+6
+
+Basic design: Decoupled layout
+
+Improved Cluster Index Design
+
+Problem: too many irregular I/Os. Though the decoupled layout can reduce the index size, it also decouples the
+original 0.1–2.2 MB I/O in to 60–68 × small random I/Os
+(100–384 B). More specifically, 98% of the I/Os in the workloads are small random I/Os, which are also inefficient on the
+second-tier memory (see Figure 7). As a result, we observe
+a 27–39% performance drop on all the workloads when increasing the replication factor (see Figure 10 (a)–(c)). Note
+that improving the replication factor is still important for an
+optimal index size.
+
+To break the trade-off between index space and performance,
+we propose two system designs for placing the cluster index
+efficiently on the second-tier memory:
+1. Decoupled index layout (§6.1). We store the vectors and
+clusters separately on the second-tier memory. Thus, the
+index build algorithm can replicate vectors (with high
+factors) in clusters with negligible index size amplification.
+2. Cluster-aware grouping (§6.2). Decoupled layout inevitably introduces irregular I/Os on the second-tier memory, which can degrade performance if there are too many.
+Therefore, we propose a cluster-aware grouping algorithm
+to reorganize the vector layout post-index build to reduce
+such I/Os.
+
+6.2
+
+Cluster-aware grouping
+
+To reduce the number of small I/Os in the workloads, we
+propose vector grouping atop of the decoupled design to
+minimize the number of small random I/Os. By grouping the
+vectors belonging to the same cluster together and storing
+them in adjacent storage, we can use one large I/O to read all
+
+9 Due to limited memory on our platform, we only report performance of
+
+100M datasets for CXL and DEEP100M for NVM.
+
+9
+
+0
+
+1
+0
+
+0
+
+2
+
+4
+
+Size amplified
+
+Wasted space
+
+2
+1
+
+BIGANN-CXL
+
+4
+2
+
+DEEP-NVM
+
+Norm. size
+
+2
+
+2
+
++Decouple & Group
+SPACEV-RDMA
+6
+
+Norm. size
+
+4
+
++Decouple
+
+DEEP-NVM
+
+Norm. perf.
+
+Norm. perf.
+
+Norm. perf.
+
+BIGANN-CXL
+
+Norm. size
+
+SPFresh (S-memory)
+SPACEV-RDMA
+6
+
+6
+4
+2
+
+6
+4
+2
+
+0
+0
+
+2
+
+4
+
+6
+
+0
+
+Size amplified
+
+2
+
+4
+
+6
+
+0
+
+Size amplified
+
+2
+
+4
+
+#Replica/vector
+
+0
+
+2
+
+4
+
+6
+
+0
+
+#Replica/vector
+
+2
+
+4
+
+6
+
+#Replica/vector
+
+Figure 10: Effects of cluster-aware grouping (a)–(c) and decoupled layout (d)–(f) on graph index. Due to space limitation, we only list a
+subset of the overall results. The trends for the others are similar.
+
+Cluster data
+
+Replication Cluster data
+0xa. 0xf.
+
+1 [0.2, 0.3, …]… [0.6, 0.7, …]
+
+0xe 0xf.
+
+…
+
+Vector
+
+(a) Coupled cluster layout
+
+Pointer
+
+Replication
+
+0 [0.1, 0.2, …] … [0.6, 0.7, …]
+
+Vector data
+[0.1, 0.2, …]
+[0.2, 0.3, …]
+…
+[0.6, 0.7, …]
+
+(b) Decoupled layout
+
+will omit it in this paper.
+Putting it all together, we formulate the problem as follows:
+
+Cluster data Vector data
+0xa.-0xc.
+0xe. 0xc.
+Pointer
+
+[0.1, 0.2, …]
+[0.2, 0.3, …]
+[0.6, 0.7, …]
+… Group
+
+minimize
+
+|C|
+X
+j
+
+(c) Decoupled + Group
+
+subject to
+
+Figure 11: An overview of how we improve the layout of the vector
+index on the second-tier memory, from the traditional coupled design
+(a), to a decoupled design (b), and to a design with grouping (c).
+
+hj · (1 +
+
+|V |
+X
+
+Pij )
+
+i
+
+(4)
+
+Cluster constraints
+Group constraints
+
+Cluster constraints. According to the cluster index design,
+a vector must be assigned to one cluster, while being replicated to multiple adjacent clusters of the assigned cluster. We
+formulate
+the constraints as follows:
+0 ≤ Ai,j ≤ 1, i ∈ [0, |V |), j ∈ [0, |C|)
+
+
+
+|C|
+X
+
+Ai,j ≥ 1, i ∈ [0, |V |)
+
+
+
+Table 4: Variables used in the vector group algorithms. The optimization variable is determined by the algorithm, and constant
+variables come from the index build.
+
+Constant variables:
+Ai,j If Ai,j is 1, it means that the ith vector is partitioned or replicated to the jth cluster’s.
+hi
+The access frequency of the ith ’s cluster.
+
+j
+
+Optimization variable:
+If Pi,j is 1, it means that the ith vector belongs
+Pi,j
+to the jth cluster’s group.
+
+Group constraints. The group algorithm must assign a vector to exactly one cluster’s group:
+
+0 ≤ Pi,j ≤ 1, i ∈ [0, |V |), j ∈ [0, |C|)
+
+
+
+|C|
+X
+
+Pi,j = 1, i ∈ [0, |V |)
+
+
+
+vectors in the group (see Figure 11 (c)). The group is done
+post the index build.
+Since we don’t replicate vectors, there must exist clusters
+that we cannot use one I/O to read all its vectors, e.g., when
+searching the cluster 1, we still need to use a separate small
+I/O to read the vector data belonging to address 0xc. Therefore, the performance of grouping heavily depends on how the
+vectors are grouped. The vector group problem aims to determine which vectors should be grouped together to minimize
+small IOs in a given workload. It is equivalent to the problem
+of assigning vectors to specific cluster groups. Assume we
+have a vector database with a set of vectors V and a set of
+clusters C. We use Pi,j to denote whether ith vector has been
+assigned to a group.
+We employ an integer linear program (ILP) to find the best
+group of Pi,j . The objective is to minimize the IO requests
+sent to the MN. Since the number of IOs depends on the access frequency of each cluster, we use hj to denote the access
+frequencies of clusters. The frequencies can be obtained by
+monitoring the workload in the background, and we can dynamically change the layout according to frequency changes.
+Since dynamic adjustment is not the focus of our work, we
+
+j
+
+Solve the algorithm at billion-scale. One simple way to
+solve the problem is to use an off-the-shelf solve [24]. However, for billion-scale vectors, it takes non-trivial time to solve
+the problem (at least polynomial complexity). Observing the
+simple structure of the problem, we can use a simple greedy
+algorithm to find the optimal solution. Specifically, for a vector that has been replicated to multiple clusters, assigning it
+to the cluster with the highest access frequency is the optimal choice. This is because, informally, assigning it to a less
+frequently accessed cluster will increase the number of I/Os.
+Due to space limitation, we omit the detailed proof. As a result, we can quickly solve the problem even for billion-scale
+vectors in <90 minutes.
+6.3
+
+Overall Performance
+
+Effects of grouping. Figure 10 shows the effects of clusteraware grouping. Specifically, grouping improves the performance on various datasets by 1.3–1.7 ×, and can achieve close
+or even higher performance than the replicated performance.
+10
+
+Norm. perf.
+
+Compute
+Bound
+S-memory
+Bound
+SSD
+Bound
+
+1
+
+2
+
+3
+
+4
+
+5
+
+Size amplified
+
+6
+
+7
+
+8
+
+Norm. perf.
+
+Norm. perf.
+
+Compute
+Bound
+S-memory
+Bound
+SSD
+Bound
+
+25
+
+0
+
+Compute
+Bound
+
+0.4
+
+SSD
+Bound
+
+0
+Dataset: BIGANN (CXL)
+
+0
+Dataset: DEEP (RDMA)
+28
+
+0
+
+1
+
+Compute
+Bound
+S-memory
+Bound
+SSD
+Bound
+
+0
+Dataset: DEEP (CXL)
+40
+38
+
+0
+
+1
+
+2
+
+3
+
+Compute
+Bound
+S-memory
+Bound
+SSD
+Bound
+
+4
+
+1
+
+Compute&
+SSD
+Bound
+
+0.4
+
+0
+Dataset: BIGANN (NVM)
+
+85
+80
+
+0
+
+Norm. perf.
+
+SSD
+Bound
+
+SSD
+S-memory
+
+Dataset: SPACEV (NVM)
+
+5
+
+Size amplified
+
+6
+
+7
+
+8
+
+Norm. perf.
+
+0.4
+
+Norm. perf.
+
+Compute
+Bound
+
+Norm. perf.
+
+Norm. perf.
+
+1
+
+0
+Dataset: BIGANN (RDMA)
+80
+75
+
+SSD
+S-memory
+
+Dataset: SPACEV (CXL)
+
+Compute
+Bound
+
+1
+
+0.4
+
+SSD
+Bound
+
+0
+Dataset: DEEP (NVM)
+
+Norm. perf.
+
+SSD
+S-memory
+
+Dataset: SPACEV (RDMA)
+
+1
+
+Compute
+Bound
+
+0.4
+
+SSD
+Bound
+
+0
+
+0
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+Size amplified
+
+Figure 12: End-to-end cluster index performance. S-memory states for second-tier memory used. We omit the S-memory bound in experiments
+on the SPACEV dataset and NVM as it is too large (45–430 ×).
+Table 5: The computational intensity and average bytes read per
+query vary on different datasets for vector indexes.
+
+The improved performance is due to the reduced number of
+vectors transferred: it reduces 62–80% I/O requests in the
+chosen workloads.
+End-to-end performance. Figure 12 shows the index performance respective to index amplification caused by replicating vectors with all the above optimizations enabled10 . Like
+graph, we calculate the computation bound by performing all
+calculations using in-memory data and bandwidth bound by
+with the peek bandwidth measured in Figure 6. On second-tier
+memory, cluster index can achieve both high performance and
+low space utilization with our cluster-aware grouping. Specifically, it only requires 16–22% of the size of the SSD index,
+and achieves 1.4–7.1 × higher throughput. Unlike graph index, the bottleneck of the three datasets is quite different on
+cluster index. SPACEV is bottlenecked by computation in all
+settings, as it requires reading about only 0.1 MB per query,
+far less than the other two datasets (0.7 MB and 2.2 MB). This
+is because it is a skewed dataset where vectors are close. Both
+BIGANN and DEEP are bottlenecked by second-tier memory
+bandwidth, as cluster index requires reading more vectors for
+the search than graph index due to its coarse-grained index
+nature. Interestingly, on NVM, BIGANN and DEEP are still
+bottlenecked by the computation power of the CPU, because
+the equipped CPU is weak (see Table 3).
+
+7
+
+Datasets
+SPACEV
+BIGANN
+DEEP
+
+Computation intensity
+Graph
+Cluster
+22
+10
+29
+8
+19
+3
+
+KBytes Read/query
+Graph
+Cluster
+32
+139
+38
+745
+60
+2,374
+
+cluster index requires sufficient replications to achieve the
+same accuracy level, which is also observed in the paper. For
+cluster index, a common belief is that it is better in performance as its coarse-grained access pattern is suitable for the
+SSD. As a result, developers tend to choose cluster index for
+its higher performance [7, 56].
+On second-tier memory, the findings are completely
+different with our improved index design:
+1. Graph index typically has a better IO efficiency on secondtier memory.
+2. Cluster index has a small index footprint on second-tier
+memory.
+Performance comparison. Figure 13 shows the end-to-end
+performance comparison of graph and cluster index on SSD,
+RDMA, CXL, and NVM with respective to the index size.
+On BIGANN and DEEP datasets, Graph index is 2.1, 2.2,
+and 1.2× faster than cluster on RDMA, CXL, and NVM,
+respectively. The core reason is that graph reads less data than
+cluster: on these datasets, graph reads 95–97% fewer bytes
+than the cluster (see Table 5). Though it decouples such reads
+into fine-grained I/Os (512–1024 B), they are efficient on
+second-tier memory, so it is different from the common belief
+that graph index is slower than cluster. Note that without our
+software pipeline (§5), graph still cannot outperform cluster
+due to access delays when traversing the graph.
+
+An end-to-end comparison of graph and cluster index on second-tier memory
+
+An interesting question faced by developers that use vector
+search is what is the right index—graph or cluster—to choose.
+For SSD-based vector indexes, a common belief is that graph
+index is better in storage as it won’t need many edges to
+achieve a high accuracy [49]. Therefore, developers tend to
+choose graph index for its smaller index size. In comparison,
+10 Due to limited memory on our platform, we only report the performance
+
+of 100M datasets for CXL.
+
+11
+
+Cluster
+
+1
+0.4
+0
+
+SSD
+0
+
+2
+
+4
+
+Size amplified
+
+6
+
+Cluster
+
+1
+0.4
+
+RDMA
+
+0
+Dataset: DEEP
+Graph
+
+Cluster
+
+1
+0.4
+0
+
+RDMA
+0
+
+1
+
+2
+
+0.4
+
+Cluster
+
+1
+0.4
+
+CXL
+
+0
+Dataset: DEEP
+Graph
+
+Cluster
+
+1
+0.4
+0
+
+3
+
+CXL
+
+0
+Dataset: BIGANN
+Graph
+
+Size amplified
+
+CXL
+0
+
+1
+
+2
+
+Size amplified
+
+3
+
+Norm. perf.
+
+Norm. perf.
+
+RDMA
+
+0
+Dataset: BIGANN
+Graph
+
+Cluster
+
+1
+
+Norm. perf.
+
+SSD
+
+0
+Dataset: DEEP
+Graph
+
+0.4
+
+Dataset: SPACEV
+Graph
+
+Norm. perf.
+
+0.4
+
+Cluster
+
+1
+
+Norm. perf.
+
+Cluster
+
+1
+
+Dataset: SPACEV
+Graph
+
+Norm. perf.
+
+SSD
+
+0
+Dataset: BIGANN
+Graph
+
+Norm. perf.
+
+0.4
+
+Norm. perf.
+
+Cluster
+
+1
+
+Norm. perf.
+
+Norm. perf.
+Norm. perf.
+Norm. perf.
+
+Dataset: SPACEV
+Graph
+
+Dataset: SPACEV
+Graph
+
+Cluster
+
+1
+0.4
+
+NVM
+
+0
+Dataset: BIGANN
+Graph
+
+Cluster
+
+1
+0.4
+
+NVM
+
+0
+Dataset: DEEP
+Graph
+
+Cluster
+
+1
+0.4
+0
+
+NVM
+0
+
+1
+
+2
+
+3
+
+Size amplified
+
+Figure 13: End-to-end comparison of graph and cluster index performance on (a) SSD, (b) RDMA, (c) CXL, and (d) NVM.
+
+On SPACEV, cluster index is still 1.5, 1.2, and 1.7× faster
+than graph on RDMA, CXL, and NVM, respectively. This
+is because it is a dataset with clusters close in distance. As
+a result, it only needs to search a few clusters and thus has
+better performance due to the efficient grouped vector reads
+enabled by our grouping method.
+
+tor search. Pinecone[41] is a cloud-native vector database that
+simplifies the process of building applications with vector
+search capabilities. SPFresh[56] implements LIRE to support
+incremental in-place updates for billion-scale vector search.
+Elasticsearch[13] and Solr[2] can support vector search using
+algorithms like HNSW in distributed search engines. They
+are orthogonal to our work, and they use the index built by
+our study to further enhance the performance of vector search
+with small index amplifications.
+
+Space comparison. Thanks to our decoupled layout with
+group, we nearly eliminated the space amplification caused
+by the replicated vectors. As a result, on SPACEV, BIGANN,
+and DEEP datasets, cluster index can achieve optimal performance with only 0.1–0.4 × index size amplification. This
+is 56–68% smaller than the graph index. For such amplification, cluster index is a good candidate for index with small
+amplification on second-tier memory.
+
+8
+
+New hardware for vector search. Recently, with the rise of
+new computation hardware like GPUs and FPGAs, and new
+I/O hardware like NVM and CXL, many system designers
+have explored the potential of utilizing them to accelerate
+vector search [25, 62, 39, 23]. For example, faiss library has
+proposed a GPU implementation of cluster index to accelerate
+batched queries. RUMMY is a system that implements efficient compute-IO pipeline to accelerated cluster-based vector
+search. For graph-based vector search, CAGRA presents a
+new graph index design that has affinity for parallelism during index construction phase on GPU. They also achieve a
+performance improvement on CPU-based graph index. CXLANNS is a system that utilizes CXL and NDP to accelerate
+graph-based vector search.
+
+Related Work
+
+Other vector indexes. A large amount of effort in indexing
+algorithms has been dedicated to enhancing the efficiency of
+vector search. Besides the graph and cluster indexes extensively discussed in this paper, tree-based indexing organizes
+data in a hierarchical tree structure, such as KD-tree[5], Balltree[35] or R-tree[20]. Hash-based indexing[55, 21, 17] uses
+hashing functions to map similar data points to the same buckets, allowing for approximate nearest neighbor queries via
+hash table lookups. Unfortunately, these indexes cannot either
+scale to large-scale (e.g., billion-scale) datasets or provide
+sufficient accuracy [50, 51].
+
+9
+
+Conclusion
+
+Existing large-scale vector indexes on SSD face a dilemma of
+high performance versus low index amplification, which we
+attribute to a mismatch between workload requirements and
+high-performance SSD access patterns. Such a dilemma—–
+though challenging to address from an algorithm’s perspective, can be systematically addressed by a co-design with
+emerging second-tier memory. Our improved index design
+can achieve 1.5–5.6 × performance improvements with 15–
+62% less index amplification for graph, and 1.4–5.9 × performance improvements with 92–98% less index amplification
+
+Vector database. Several systems have been developed to
+handle the complexities of storing, indexing, and searching
+high-dimensional vector data. AnalyticDB-V[51], PASE[58]
+and VBASE[60] integrate vector search into traditional
+database, allowing for complex queries through SQL syntax. Milvus[48] is an open-source vector database designed to
+handle embedding vectors converted from unstructured data.
+Faiss[14] and Annoy[46] developed libraries for efficient vec12
+
+for cluster. These results show that second-tier memory is a
+promising storage medium for vector indexes.
+
+[16] G AO , P. X., NARAYAN , A., K ARANDIKAR , S., C AR REIRA , J., H AN , S., AGARWAL , R., R ATNASAMY, S., AND
+S HENKER , S. Network requirements for resource disaggregation. In 12th USENIX Symposium on Operating Systems
+Design and Implementation, OSDI 2016, Savannah, GA, USA,
+November 2-4, 2016 (2016), K. Keeton and T. Roscoe, Eds.,
+USENIX Association, pp. 249–264.
+
+References
+[1] A LGORITHMS , A. A. KGraph: A library for fast approximate
+nearest neighbor search, 2014.
+[2] A PACHE. Solr. https://solr.apache.org/, 2024.
+
+[17] G IONIS , A., I NDYK , P., AND M OTWANI , R. Similarity search
+in high dimensions via hashing. In VLDB’99, Proceedings
+of 25th International Conference on Very Large Data Bases,
+September 7-10, 1999, Edinburgh, Scotland, UK (1999), M. P.
+Atkinson, M. E. Orlowska, P. Valduriez, S. B. Zdonik, and
+M. L. Brodie, Eds., Morgan Kaufmann, pp. 518–529.
+
+[3] A RYA , S., AND M OUNT, D. M. Approximate nearest neighbor
+queries in fixed dimensions. In Proceedings of the Fourth Annual ACM/SIGACT-SIAM Symposium on Discrete Algorithms,
+25-27 January 1993, Austin, Texas, USA (1993), V. Ramachandran, Ed., ACM/SIAM, pp. 271–280.
+[4] BARROSO , L. A., D EAN , J., AND H ÖLZLE , U. Web search
+for a planet: The google cluster architecture. IEEE Micro 23,
+2 (2003), 22–28.
+
+[18] G OUK , D., L EE , S., K WON , M., AND J UNG , M. Direct access, high-performance memory disaggregation with
+directcxl. In 2022 USENIX Annual Technical Conference,
+USENIX ATC 2022, Carlsbad, CA, USA, July 11-13, 2022
+(2022), J. Schindler and N. Zilberman, Eds., USENIX Association, pp. 287–294.
+
+[5] B ENTLEY, J. L. Multidimensional binary search trees used for
+associative searching. Commun. ACM 18, 9 (1975), 509–517.
+[6] C HEN , Q., WANG , H., L I , M., R EN , G., L I , S., Z HU , J., L I ,
+J., L IU , C., Z HANG , L., AND WANG , J. SPTAG: A library
+for fast approximate nearest neighbor search, 2018.
+
+[19] G U , J., L EE , Y., Z HANG , Y., C HOWDHURY, M., AND S HIN ,
+K. G. Efficient memory disaggregation with infiniswap. In
+14th USENIX Symposium on Networked Systems Design and
+Implementation, NSDI 2017, Boston, MA, USA, March 2729, 2017 (2017), A. Akella and J. Howell, Eds., USENIX
+Association, pp. 649–667.
+
+[7] C HEN , Q., Z HAO , B., WANG , H., L I , M., L IU , C., L I ,
+Z., YANG , M., AND WANG , J. SPANN: highly-efficient
+billion-scale approximate nearest neighborhood search. In
+Advances in Neural Information Processing Systems 34: Annual Conference on Neural Information Processing Systems
+2021, NeurIPS 2021, December 6-14, 2021, virtual (2021),
+M. Ranzato, A. Beygelzimer, Y. N. Dauphin, P. Liang, and
+J. W. Vaughan, Eds., pp. 5199–5212.
+
+[20] G UTTMAN , A. R-trees: A dynamic index structure for spatial
+searching. In SIGMOD’84, Proceedings of Annual Meeting,
+Boston, Massachusetts, USA, June 18-21, 1984 (1984), B. Yormark, Ed., ACM Press, pp. 47–57.
+
+[8] C LARKSON , K. L. An algorithm for approximate closest-point
+queries. In Proceedings of the Tenth Annual Symposium on
+Computational Geometry, Stony Brook, New York, USA, June
+6-8, 1994 (1994), K. Mehlhorn, Ed., ACM, pp. 160–164.
+
+[21] H UANG , Q., F ENG , J., Z HANG , Y., FANG , Q., AND N G ,
+W. Query-aware locality-sensitive hashing for approximate
+nearest neighbor search. Proc. VLDB Endow. 9, 1 (2015),
+1–12.
+
+[9] CLOUD , G.
+Find anything blazingly fast with
+google’s vector search technology.
+https://
+cloud.google.com/blog/topics/developerspractitioners/find-anything-blazinglyfast-googles-vector-search-technology,
+2024.
+
+[22] I ZRAELEVITZ , J., YANG , J., Z HANG , L., K IM , J., L IU , X.,
+M EMARIPOUR , A. S., S OH , Y. J., WANG , Z., X U , Y., D UL LOOR , S. R., Z HAO , J., AND S WANSON , S. Basic performance measurements of the intel optane DC persistent memory
+module. CoRR abs/1903.05714 (2019).
+[23] JANG , J., C HOI , H., BAE , H., L EE , S., K WON , M., AND
+J UNG , M. CXL-ANNS: software-hardware collaborative memory disaggregation and computation for billion-scale approximate nearest neighbor search. In 2023 USENIX Annual Technical Conference, USENIX ATC 2023, Boston, MA, USA, July
+10-12, 2023 (2023), J. Lawall and D. Williams, Eds., USENIX
+Association, pp. 585–600.
+
+[10] C ONSORTIUM , C.
+Cxl specification.
+https:
+//www.computeexpresslink.org/downloadthe-specification, 2024.
+[11] D EAN , J., AND BARROSO , L. A. The tail at scale. Commun.
+ACM 56, 2 (2013), 74–80.
+[12] D RAGOJEVIC , A., NARAYANAN , D., C ASTRO , M., AND
+H ODSON , O. Farm: Fast remote memory. In Proceedings
+of the 11th USENIX Symposium on Networked Systems Design and Implementation, NSDI 2014, Seattle, WA, USA, April
+2-4, 2014 (2014), R. Mahajan and I. Stoica, Eds., USENIX
+Association, pp. 401–414.
+
+[24] J OHN F ORREST, R. L.-H. Cbc user guide. https://www.
+coin-or.org/Cbc/cbcuserguide.html, 2024.
+[25] J OHNSON , J., D OUZE , M., AND J ÉGOU , H. Billion-scale
+similarity search with gpus. IEEE Trans. Big Data 7, 3 (2021),
+535–547.
+
+[13] E LASTIC. Elasticsearch. https://www.elastic.co,
+2024.
+
+[26] J UN , Y., PARK , S., K ANG , J., K IM , S., AND S EO , E. We
+ain’t afraid of no file fragmentation: Causes and prevention
+of its performance impact on modern flash ssds. In 22nd
+USENIX Conference on File and Storage Technologies, FAST
+2024, Santa Clara, CA, USA, February 27-29, 2024 (2024),
+X. Ma and Y. Won, Eds., USENIX Association, pp. 193–208.
+
+[14] FACEBOOK.
+Faiss.
+https://github.com/
+facebookresearch/faiss, 2023.
+[15] F U , C., X IANG , C., WANG , C., AND C AI , D. Fast approximate nearest neighbor search with the navigating spreading-out
+graph. Proc. VLDB Endow. 12, 5 (jan 2019), 461–474.
+
+13
+
+[37] M ARUF, H. A., WANG , H., D HANOTIA , A., W EINER ,
+J., AGARWAL , N., B HATTACHARYA , P., P ETERSEN , C.,
+C HOWDHURY, M., K ANAUJIA , S. O., AND C HAUHAN ,
+P. TPP: transparent page placement for cxl-enabled tieredmemory. In Proceedings of the 28th ACM International Conference on Architectural Support for Programming Languages
+and Operating Systems, Volume 3, ASPLOS 2023, Vancouver, BC, Canada, March 25-29, 2023 (2023), T. M. Aamodt,
+N. D. E. Jerger, and M. M. Swift, Eds., ACM, pp. 742–755.
+
+[27] K ALIA , A., K AMINSKY, M., AND A NDERSEN , D. G. Design
+guidelines for high performance RDMA systems. login Usenix
+Mag. 41, 3 (2016).
+[28] K ALIA , A., K AMINSKY, M., AND A NDERSEN , D. G. Fasst:
+Fast, scalable and simple distributed transactions with twosided (RDMA) datagram rpcs. In 12th USENIX Symposium on
+Operating Systems Design and Implementation, OSDI 2016,
+Savannah, GA, USA, November 2-4, 2016 (2016), K. Keeton
+and T. Roscoe, Eds., USENIX Association, pp. 185–201.
+
+[38] M IKOLOV, T., C HEN , K., C ORRADO , G., AND D EAN , J. Efficient estimation of word representations in vector space. In 1st
+International Conference on Learning Representations, ICLR
+2013, Scottsdale, Arizona, USA, May 2-4, 2013, Workshop
+Track Proceedings (2013), Y. Bengio and Y. LeCun, Eds.
+
+[29] L ANDRUM , B. Ivf2 index: Fusing classic and spatial
+inverted indices for fast filtered anns. https://bigann-benchmarks.com/neurips23_slides/IVF_
+2_filter_Ben.pdf, 2024.
+[30] L EWIS , P. S. H., P EREZ , E., P IKTUS , A., P ETRONI , F.,
+K ARPUKHIN , V., G OYAL , N., K ÜTTLER , H., L EWIS , M.,
+Y IH , W., ROCKTÄSCHEL , T., R IEDEL , S., AND K IELA , D.
+Retrieval-augmented generation for knowledge-intensive NLP
+tasks. In Advances in Neural Information Processing Systems 33: Annual Conference on Neural Information Processing
+Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual
+(2020), H. Larochelle, M. Ranzato, R. Hadsell, M. Balcan, and
+H. Lin, Eds.
+
+[39] O OTOMO , H., NARUSE , A., N OLET, C., WANG , R., F EHER ,
+T., AND WANG , Y. CAGRA: highly parallel graph construction and approximate nearest neighbor search for gpus. CoRR
+abs/2308.15136 (2023).
+[40] P ENNINGTON , J., S OCHER , R., AND M ANNING , C. D.
+Glove: Global vectors for word representation. In Proceedings
+of the 2014 Conference on Empirical Methods in Natural Language Processing, EMNLP 2014, October 25-29, 2014, Doha,
+Qatar, A meeting of SIGDAT, a Special Interest Group of the
+ACL (2014), A. Moschitti, B. Pang, and W. Daelemans, Eds.,
+ACL, pp. 1532–1543.
+
+[31] L I , H., B ERGER , D. S., H SU , L., E RNST, D., Z ARDOSHTI ,
+P., N OVAKOVIC , S., S HAH , M., R AJADNYA , S., L EE , S.,
+AGARWAL , I., H ILL , M. D., F ONTOURA , M., AND B IAN CHINI , R. Pond: Cxl-based memory pooling systems for cloud
+platforms. In Proceedings of the 28th ACM International Conference on Architectural Support for Programming Languages
+and Operating Systems, Volume 2, ASPLOS 2023, Vancouver, BC, Canada, March 25-29, 2023 (2023), T. M. Aamodt,
+N. D. E. Jerger, and M. M. Swift, Eds., ACM, pp. 574–587.
+
+[41] P INECONE. Pinecone. https://www.pinecone.io,
+2024.
+[42] R EN , J., Z HANG , M., AND L I , D. HM-ANN: efficient billionpoint nearest neighbor search on heterogeneous memory. In
+Advances in Neural Information Processing Systems 33: Annual Conference on Neural Information Processing Systems
+2020, NeurIPS 2020, December 6-12, 2020, virtual (2020),
+H. Larochelle, M. Ranzato, R. Hadsell, M. Balcan, and H. Lin,
+Eds.
+
+[32] L I , S., LV, F., J IN , T., L IN , G., YANG , K., Z ENG , X., W U ,
+X., AND M A , Q. Embedding-based product retrieval in taobao
+search. In KDD ’21: The 27th ACM SIGKDD Conference on
+Knowledge Discovery and Data Mining, Virtual Event, Singapore, August 14-18, 2021 (2021), F. Zhu, B. C. Ooi, and
+C. Miao, Eds., ACM, pp. 3181–3189.
+
+[43] S AAD , Y. Iterative methods for sparse linear systems. SIAM,
+2003.
+[44] S HEWALE , R. Google search statistics 2024 (no. of searches
+per day). https://www.demandsage.com/googlesearch-statistics/, 2024.
+
+[33] L I , W., Z HANG , Y., S UN , Y., WANG , W., L I , M., Z HANG ,
+W., AND L IN , X. Approximate nearest neighbor search on
+high dimensional data — experiments, analyses, and improvement. IEEE Transactions on Knowledge and Data Engineering
+32, 8 (2020), 1475–1488.
+
+[45] SPDK. Build ultra high-performance storage applications with
+the storage performance development kit. https://spdk.
+io, 2024.
+
+[34] L IU , H., H UANG , Z., C HEN , Q., L I , M., F U , Y., AND
+Z HANG , L. Fast clustering with flexible balance constraints.
+In IEEE International Conference on Big Data (IEEE BigData 2018), Seattle, WA, USA, December 10-13, 2018 (2018),
+N. Abe, H. Liu, C. Pu, X. Hu, N. K. Ahmed, M. Qiao, Y. Song,
+D. Kossmann, B. Liu, K. Lee, J. Tang, J. He, and J. S. Saltz,
+Eds., IEEE, pp. 743–750.
+
+[46] S POTIFY. Annoy. https://github.com/spotify/
+annoy, 2024.
+[47] S UBRAMANYA , S. J., D EVVRIT, K ADEKODI , R., K R ISHASWAMY, R., AND S IMHADRI , H. V. DiskANN: Fast
+Accurate Billion-Point Nearest Neighbor Search on a Single
+Node. Curran Associates Inc., Red Hook, NY, USA, 2019.
+
+[35] L IU , T., M OORE , A. W., AND G RAY, A. G. New algorithms
+for efficient high-dimensional nonparametric classification. J.
+Mach. Learn. Res. 7 (2006), 1135–1158.
+
+[48] WANG , J., Y I , X., G UO , R., J IN , H., X U , P., L I , S., WANG ,
+X., G UO , X., L I , C., X U , X., Y U , K., Y UAN , Y., Z OU , Y.,
+L ONG , J., C AI , Y., L I , Z., Z HANG , Z., M O , Y., G U , J.,
+J IANG , R., W EI , Y., AND X IE , C. Milvus: A purpose-built
+vector data management system. In Proceedings of the 2021
+International Conference on Management of Data (New York,
+NY, USA, 2021), SIGMOD ’21, Association for Computing
+Machinery, p. 2614–2627.
+
+[36] M ALKOV, Y. A., AND YASHUNIN , D. A. Efficient and robust
+approximate nearest neighbor search using hierarchical navigable small world graphs. IEEE transactions on pattern analysis
+and machine intelligence 42, 4 (2018), 824–836.
+
+14
+
+[57] YANG , J., K IM , J., H OSEINZADEH , M., I ZRAELEVITZ , J.,
+AND S WANSON , S. An empirical guide to the behavior and use
+of scalable persistent memory. In 18th USENIX Conference on
+File and Storage Technologies, FAST 2020, Santa Clara, CA,
+USA, February 24-27, 2020 (2020), S. H. Noh and B. Welch,
+Eds., USENIX Association, pp. 169–182.
+
+[49] WANG , M., X U , W., Y I , X., W U , S., P ENG , Z., K E , X.,
+G AO , Y., X U , X., G UO , R., AND X IE , C. Starling: An
+i/o-efficient disk-resident graph index framework for highdimensional vector similarity search on data segment. CoRR
+abs/2401.02116 (2024).
+[50] W EBER , R., S CHEK , H., AND B LOTT, S. A quantitative
+analysis and performance study for similarity-search methods
+in high-dimensional spaces. In VLDB’98, Proceedings of 24rd
+International Conference on Very Large Data Bases, August
+24-27, 1998, New York City, New York, USA (1998), A. Gupta,
+O. Shmueli, and J. Widom, Eds., Morgan Kaufmann, pp. 194–
+205.
+[51] W EI , C., W U , B., WANG , S., L OU , R., Z HAN , C., L I , F.,
+AND C AI , Y. Analyticdb-v: A hybrid analytical engine towards
+query fusion for structured and unstructured data. Proc. VLDB
+Endow. 13, 12 (aug 2020), 3152–3165.
+[52] W EI , X., D ONG , Z., C HEN , R., AND C HEN , H. Deconstructing RDMA-enabled distributed transactions: Hybrid is better!
+In 13th USENIX Symposium on Operating Systems Design
+and Implementation (OSDI 18) (Carlsbad, CA, Oct. 2018),
+USENIX Association, pp. 233–251.
+[53] W EI , X., X IE , X., C HEN , R., C HEN , H., AND Z ANG , B.
+Characterizing and optimizing remote persistent memory with
+RDMA and NVM. In 2021 USENIX Annual Technical Conference, USENIX ATC 2021, July 14-16, 2021 (2021), I. Calciu
+and G. Kuenning, Eds., USENIX Association, pp. 523–536.
+[54] W EI , X., X IE , X., C HEN , R., C HEN , H., AND Z ANG , B.
+Characterizing and optimizing remote persistent memory with
+RDMA and NVM. In 2021 USENIX Annual Technical Conference, USENIX ATC 2021, July 14-16, 2021 (2021), I. Calciu
+and G. Kuenning, Eds., USENIX Association, pp. 523–536.
+[55] W EISS , Y., T ORRALBA , A., AND F ERGUS , R. Spectral hashing. In Advances in Neural Information Processing Systems
+21, Proceedings of the Twenty-Second Annual Conference on
+Neural Information Processing Systems, Vancouver, British
+Columbia, Canada, December 8-11, 2008 (2008), D. Koller,
+D. Schuurmans, Y. Bengio, and L. Bottou, Eds., Curran Associates, Inc., pp. 1753–1760.
+[56] X U , Y., L IANG , H., L I , J., X U , S., C HEN , Q., Z HANG , Q.,
+L I , C., YANG , Z., YANG , F., YANG , Y., C HENG , P., AND
+YANG , M. Spfresh: Incremental in-place update for billionscale vector search. In Proceedings of the 29th Symposium on
+Operating Systems Principles, SOSP 2023, Koblenz, Germany,
+October 23-26, 2023 (2023), J. Flinn, M. I. Seltzer, P. Druschel,
+A. Kaufmann, and J. Mace, Eds., ACM, pp. 545–561.
+
+[58] YANG , W., L I , T., FANG , G., AND W EI , H. PASE: postgresql
+ultra-high-dimensional approximate nearest neighbor search
+extension. In Proceedings of the 2020 International Conference on Management of Data, SIGMOD Conference 2020,
+online conference [Portland, OR, USA], June 14-19, 2020
+(2020), D. Maier, R. Pottinger, A. Doan, W. Tan, A. Alawini,
+and H. Q. Ngo, Eds., ACM, pp. 2241–2253.
+[59] Z HANG , H., A NDERSEN , D. G., PAVLO , A., K AMINSKY,
+M., M A , L., AND S HEN , R. Reducing the storage overhead
+of main-memory OLTP databases with hybrid indexes. In Proceedings of the 2016 International Conference on Management
+of Data, SIGMOD Conference 2016, San Francisco, CA, USA,
+June 26 - July 01, 2016 (2016), F. Özcan, G. Koutrika, and
+S. Madden, Eds., ACM, pp. 1567–1581.
+[60] Z HANG , Q., X U , S., C HEN , Q., S UI , G., X IE , J., C AI ,
+Z., C HEN , Y., H E , Y., YANG , Y., YANG , F., YANG , M.,
+AND Z HOU , L. VBASE: Unifying online vector similarity
+search and relational queries via relaxed monotonicity. In 17th
+USENIX Symposium on Operating Systems Design and Implementation (OSDI 23) (Boston, MA, July 2023), USENIX
+Association, pp. 377–395.
+[61] Z HANG , Y., RUAN , C., L I , C., YANG , J., C AO , W., L I ,
+F., WANG , B., FANG , J., WANG , Y., H UO , J., AND B I , C.
+Towards cost-effective and elastic cloud database deployment
+via memory disaggregation. Proc. VLDB Endow. 14, 10 (2021),
+1900–1912.
+[62] Z HANG , Z., L IU , F., H UANG , G., L IU , X., AND J IN , X. Fast
+vector query processing for large datasets beyond GPU memory with reordered pipelining. In 21st USENIX Symposium on
+Networked Systems Design and Implementation, NSDI 2024,
+Santa Clara, CA, April 15-17, 2024 (2024), L. Vanbever and
+I. Zhang, Eds., USENIX Association, pp. 23–40.
+[63] Z UO , P., S UN , J., YANG , L., Z HANG , S., AND H UA , Y.
+One-sided rdma-conscious extendible hashing for disaggregated memory. In 2021 USENIX Annual Technical Conference
+(USENIX ATC 21) (July 2021), USENIX Association, pp. 15–
+29.
+
+15
+
+

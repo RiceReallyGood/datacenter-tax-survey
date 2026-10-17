@@ -1,0 +1,840 @@
+                                                                                                                                                                              1
+
+
+
+
+                                                   Performance Study of Serverless Workloads
+                                                        in Confidential Virtual Machines
+                                                                                Rikesh Niroula, Jianchen Shan, Xiaoning Ding
+
+
+
+
+                                           Abstract—Confidential serverless computing is rapidly emerg-        in untrusted cloud environments. It emerges as an impor-
+                                        ing as a critical paradigm for application domains requiring           tant paradigm for application domains such as healthcare,
+                                        strong confidentiality guarantees, such as healthcare, finance, and    finance, and privacy-preserving AI inference, where protecting
+                                        machine learning. To enable this paradigm in untrusted cloud
+                                        environments, Confidential Virtual Machines (CVMs) provide             sensitive data during execution is essential. In conventional
+                                                                                                               serverless deployments, containers and VMs provide isola-
+arXiv:2609.04478v1 [cs.DC] 3 Sep 2026
+
+
+
+
+                                        isolation by encrypting the entire guest memory, and thus
+                                        securing serverless workloads against host-level access and inter-     tion between workloads, but the privileged cloud host and
+                                        ference. However, the implications of CVMs for serverless systems      hypervisor may still access or inspect guest execution state
+                                        remain insufficiently understood.                                      and in-memory data. We therefore treat the cloud host and
+                                           This paper presents an empirical study of serverless work-
+                                        loads in CVMs, systematically covering memory efficiency and
+                                                                                                               hypervisor as part of the untrusted infrastructure. Confidential
+                                        runtime overhead on both warm-starts and cold-starts. Our              Virtual Machines (CVMs) address this concern by establishing
+                                        results show that CVMs incur substantial memory overhead               a hardware-protected execution boundary that prevents the
+                                        because encrypted memory disables cross-VM page deduplication          untrusted host from directly accessing private guest mem-
+                                        and reduces memory reclaimability, thereby limiting warm-              ory. In the deployment model considered in this work, each
+                                        container capacity under a fixed memory budget. Runtime
+                                        overhead in warm-starts is workload dependent. Workloads
+                                                                                                               serverless function is assigned a dedicated CVM, within which
+                                        with frequent VMEXITs, particularly idle transitions, suffer           multiple container instances of that function may execute,
+                                        substantial slowdowns. These slowdowns are further amplified           while different functions are isolated in separate CVMs.
+                                        by common serverless deployment practice that couples vCPU                CVMs rely on hardware support such as Intel TDX [4],
+                                        allocation to memory size, as higher-memory configurations             AMD SEV-SNP [5], ARM CCA [6] to provide hardware-
+                                        expose more vCPUs than some functions can use effectively. For
+                                        cold starts, the study focuses on container creation, a common
+                                                                                                               backed isolation and full guest-memory encryption. Achieving
+                                        and major contributor to startup latency. Motivated by the             end-to-end confidentiality, however, requires more than the
+                                        memory-efficiency results, we consider the deployments in which        CVM execution boundary alone. CVMs are used together with
+                                        multiple containers of the same function are consolidated within       mechanisms such as remote attestation and encrypted storage
+                                        the same CVM to improve efficiency, and show that selectively          and communication to protect data throughout its lifecycle.
+                                        relaxing certain isolation mechanisms in this setting can substan-
+                                        tially reduce startup overhead. These results clarify the main
+                                                                                                               The CVM mechanisms providing this protected execution en-
+                                        performance tradeoffs of confidential serverless computing and         vironment, however, introduce non-trivial resource inefficiency
+                                        suggest practical ways to improve efficiency and latency.              and performance overhead. In particular, memory encryption
+                                          Index Terms—Serverless Computing, Confidential Virtual Ma-
+                                                                                                               disables host-level memory optimizations such as cross-VM
+                                        chine, Intel TDX, Cloud Computing.                                     page deduplication, while enforcing the protected execution
+                                                                                                               boundary can increase the cost of events such as VMEXIT
+                                                             I. INTRODUCTION                                   handling.
+                                                                                                                  These overheads are particularly important for serverless
+                                             ERVERLESS computing, also known as Function-as-a-
+                                        S    Service (FaaS), has become a popular cloud paradigm,
+                                        adopted by platforms such as AWS Lambda [1], Microsoft
+                                                                                                               workloads, which are typically short-lived, latency-sensitive,
+                                                                                                               and dynamically scaled in response to demand. Even modest
+                                                                                                               resource inefficiency or execution slowdown can therefore
+                                        Azure Functions [2], and Google Cloud Functions [3], due               have a substantial impact on invocation latency, resource
+                                        to its scalability, fine-grained billing, and reduced operational      utilization, and operating cost. Moreover, serverless resource
+                                        overhead. It is well-suited for a broad range of applications,         provisioning can interact with CVM overheads in ways that
+                                        such as image processing, log aggregation, data transforma-            do not arise as prominently in conventional workloads. Many
+                                        tion, and backend API services. By abstracting away infras-            serverless platforms couple vCPU allocation to the configured
+                                        tructure management, serverless platforms allow developers to          function memory: additional CPU resources can improve
+                                        focus solely on application logic.                                     latency through parallelism, but can also introduce synchro-
+                                           Confidential serverless computing has recently attracted            nization and idle transitions when the available parallelism
+                                        significant attention as it allows sensitive serverless functions      is not fully utilized. Such transitions may generate frequent
+                                        to execute with hardware-backed confidentiality and isolation          VM exits, whose handling is substantially more expensive
+                                                                                                               in CVMs. Prior work has characterized fundamental CVM
+                                           Rikesh Niroula and Xiaoning Ding are with New Jersey Institute of   overheads using general-purpose workloads [7]–[9]. However,
+                                        Technology, New Jersey, USA. Email: {rn382,xiaoning.ding}@njit.edu.
+                                           Jianchen Shan is with Hofstra University, New York, USA. Email:     it remains unclear how these overheads affect key serverless
+                                        jianchen.shan@hofstra.edu.                                             requirements, such as keeping warm containers in memory,
+                                                                                                                                   2
+
+
+
+providing low-latency warm execution, and reducing cold-start
+delay.
+   To address these gaps, we systematically examine CVM-
+based serverless execution along three key dimensions: mem-
+ory efficiency, warm-start execution, and cold-start container
+initialization. For each dimension, we characterize the ob-
+served overheads, investigate their underlying causes, and
+identify practical mitigation opportunities.
+   This paper evaluates a diverse set of serverless workloads
+and compares their behavior across CVMs and regular VMs.
+Our study reveals three key findings. First, confidential deploy-
+ments incur substantial memory overhead, primarily due to
+the loss of cross-VM page deduplication and further increased
+by reduced memory reclaimability. This reduces the number
+of warm containers that can be maintained under a fixed
+memory budget and can consequently increase cold starts. Sec-       Fig. 1: Serverless functions on a Regular VM and Intel TD.
+ond, warm-start overhead depends strongly on the workload.
+Functions with frequent VM exits, particularly those involving
+idle transitions and thread synchronization, experience sub-           Despite these benefits, the feasibility of using enclaves for
+stantially higher slowdown, and this effect can be amplified by     serverless workloads is very limited due to several limitations.
+serverless resource provisioning that couples vCPU allocation       The main reason is that developers often need to significantly
+with memory size. Our analysis also shows the limits of             modify their programs to conform to enclave constraints. First,
+existing system-level mechanisms for mitigating this behavior.      any data leaving or entering the enclave must be explicitly
+Third, we characterize container creation as a major com-           managed by the program to ensure confidentiality.
+ponent of cold-start latency and identify bottlenecks arising          Second, enclaves restrict or do not support system-level
+from CPU configuration, cgroup contention, and container-           operations such as file I/O, dynamic memory allocation, and
+isolation mechanisms. We further evaluate practical mitiga-         network access. This requires developers to either avoid such
+tion strategies, including, under a restricted per-function trust   operations or delegate them to untrusted parts of the system
+model, selectively relaxing container-level isolation among         [15].
+mutually trusted instances of the same function. Overall, these
+findings clarify the main performance tradeoffs introduced by       B. Confidential Serverless Computing: System Architecture
+confidential serverless execution and point to practical ways          To enable confidentiality, chip manufacturers provide CVM
+to mitigate them.                                                   support, such as Intel TDX [16], AMD SEV-SNP [5], and
+                                                                    ARM CCA [6]. Similar to TEEs, these technologies rely
+        II. BACKGROUND AND MOTIVATION                               on transparent memory encryption, typically based on AES-
+                                                                    128 or AES-256. The encryption keys are managed by a
+A. Serverless Computing and Confidentiality Challenge               dedicated hardware root of trust and are not accessible from
+   Serverless workloads run in a container or a light VM on the     the hypervisor or any software outside the CVM. Unlike tradi-
+cloud provider’s infrastructure. These workloads in the cloud       tional TEEs, CVMs extend protection to the entire VM. Thus,
+can suffer from side channel attacks, Denial-of-Wallet (DoW)        unmodified applications can gain confidentiality, provided that
+attacks, and data being stolen by an untrusted host or hyper-       they execute inside a CVM. This makes CVMs particularly
+visor [10], [11]. Although containers or light VMs provide          well-suited for serverless workloads.
+a level of isolation between different multi-tenant workloads,         The mechanisms used to provide memory encryption and
+the hypervisor can still see the underlying memory, making          isolation differ across processor architectures. For example,
+users skeptical about running sensitive serverless applications     Intel processors rely on a trusted software component, known
+inside the cloud VMs.                                               as the TDX Module, which runs in a CPU-protected envi-
+   One promising approach to ensure confidentiality is to run       ronment and works together with hardware mechanisms to
+serverless functions inside Trusted Execution Environments          enforce protection. In contrast, AMD SEV-SNP integrates
+(TEEs), such as Intel SGX enclaves [12]. These TEEs offer           similar functionality directly within the processor, eliminating
+isolation and confidentiality guarantees by creating protected      the need for a separate intermediary enforcement module.
+memory regions, called enclaves, that are isolated from the            Figure 1 compares the architectures of regular serverless
+rest of the system; even privileged software like the Operating     computing (left) and confidential serverless computing (right),
+System or hypervisor cannot access them. This protection is         using Intel TDX as an example. In the confidential configura-
+mainly achieved through memory encryption and strict access         tion, the TDX Module cooperates with hardware mechanisms
+control enforced by the CPU. Systems such as SCONE [13]             to establish the VM as a protected trust domain. Inside the
+and Graphene-SGX [14] demonstrate how serverless functions          CVM, a TDX-aware guest OS supports confidential execution,
+can be executed within enclaves to enhance data security and        while a serverless platform such as OpenFaaS [17] man-
+confidentiality in untrusted cloud environments.                    ages functions running in containers. This allows serverless
+                                                                                                                                    3
+
+
+
+functions to execute without application modification while         to guest-memory encryption. Because each CVM uses unique
+preventing the underlying host from directly accessing private      hardware-managed encryption keys, identical plaintext pages,
+guest memory. This protection also changes the conventional         such as shared language libraries or machine learning model
+cloud trust assumption. In a regular serverless deployment,         parameters, result in different ciphertext values, preventing the
+the cloud provider’s privileged host software and hypervisor        hypervisor from identifying them for merging.
+are trusted and may access the memory and execution state              CVMs can further reduce memory efficiency by limiting
+of guest VMs. In confidential computing, the host, hyper-           host-side reclamation. In regular VMs, pages that are unused
+visor, and other infrastructure outside the CVM are instead         or reclaimable inside the guest (e.g., file-backed pages) may
+considered untrusted, while the CVM hardware and software           still be leveraged to reduce host-observed memory footprint.
+executing within the protected guest are trusted.                   However, CVMs limit this viability.
+   This hardware-protected execution boundary, however, is             The absence of cross-VM deduplication and memory re-
+only one component of end-to-end confidential execution.            claimability leads to substantial memory overhead. This effect
+Additional mechanisms are required to protect data outside          is particularly pronounced in large-scale deployments and
+CVM memory. Remote attestation allows a tenant to verify            memory-intensive workloads, such as AI/ML inference. Under
+that a VM is authentic and is executing on genuine and trusted      a fixed memory budget, the reduced memory efficiency limits
+hardware before any keys are exchanged or any code and              the number of warm containers that can be maintained and
+data are deployed. This is achieved through cryptographic           increases the frequency of costly cold starts.
+measurements of the VM, typically signed by a hardware-                2) Runtime Overhead: While encryption reduces resource
+protected key for verification. Encrypted I/O protects data         density, the mechanisms required to preserve the trust domain
+transferred to and from the CVM, while encrypted storage            also introduce runtime overhead during function execution.
+protects data persisted outside the CVM.                            This overhead may be negligible for compute-intensive server-
+                                                                    less workloads, but it can become significant for workloads
+                                                                    that frequently perform system-level operations. The main
+C. Confidential Serverless Computing: Overhead Challenges
+                                                                    source of this overhead is the increased complexity of exit
+   While the CVM architecture above provides necessary              handling needed to maintain isolation.
+hardware-backed isolation and memory encryption to secure              In a regular VM, execution of a privileged instruction causes
+sensitive workloads, these protections introduce non-trivial        a VMEXIT, transferring control directly to the host VMM.
+inefficiency and performance trade-offs: the mechanisms en-         The VMM can inspect the guest’s register state, service the
+suring secure trust domains encrypt guest memory also disable       event, and resume execution with VMRESUME. In Intel TDX,
+traditional optimization techniques; the system-level mecha-        a similar event inside a trust domain triggers a TD exit
+nisms required for isolation add complexity to management           rather than a conventional VMEXIT. Instead of exposing the
+operations. Serverless functions are inherently short-lived and     guest state to the VMM, the processor first transitions into
+highly latency-sensitive. They are particularly vulnerable to       the SEAM mode, where the Intel TDX Module executes.
+even modest degradations. Particularly for the CVM archi-           The TDX Module saves and filters the TD’s architectural
+tecture, they face performance challenges from two primary          state, ensures that private memory remains protected, and only
+sources of overhead.                                                then forwards a sanitized exit reason to the VMM. After the
+   1) Memory Efficiency in Serverless Deployments: The ef-          VMM completes the required handling, control returns through
+ficiency of serverless computing relies on achieving both           the TDX Module using TD-specific entry instructions (e.g.,
+high workload density and low latency. A major challenge            TDRESUME), which restores the protected TD context. This
+is the cold start, which occurs when a function is invoked          additional transition path (TD → TDX Module → VMM →
+but no execution environment is immediately available, and          TDX Module → TD) introduces extra context management
+thus requires the platform to create or initialize one before the   and isolation steps compared to regular VMEXIT handling.
+function can run. This additional setup delay could be even         AMD SEV-SNP integrates memory protection mechanisms
+much longer than the serverless function execution itself.          more tightly into the CPU firmware and does not introduce
+   To reduce cold-start overhead, serverless platforms often        an intermediary enforcement module; Intel TDX explicitly
+keep execution environments available for reuse. An environ-        separates enforcement responsibilities into the TDX Module.
+ment may be created before invocation (prewarming) or re-
+tained after a function finishes (caching), so that a subsequent                       III. METHODOLOGY
+invocation can reuse it with much lower latency, i.e., as a warm
+                                                                       We evaluate the impact of CVMs on serverless computing
+start. As a result, memory efficiency becomes critical, because
+                                                                    in terms of memory efficiency and runtime performance by
+it determines how many warm containers a cloud provider can
+                                                                    conducting experiments on real systems using a diverse set of
+sustain within a given memory budget while still delivering
+                                                                    workloads.
+low-latency service.
+   In traditional virtualized environments, memory usage is
+often optimized through host-side deduplication mechanisms          A. Experiment Design
+such as Kernel Same-page Merging (KSM) [18], which identi-             To isolate the cost of confidentiality itself, we compare the
+fies and merges identical memory pages across different VMs.        serverless deployments in confidential and regular VMs on
+However, CVMs fundamentally break this optimization due             both cloud platforms and a local testbed. The cloud platforms
+                                                                                                                                     4
+
+
+
+provide diversity in hardware architectures and configurations,
+including Intel TDX and AMD SEV-SNP. This helps avoid
+conclusions from a single confidential computing implemen-
+tation. The local testbed enables finer-grained profiling and
+root-cause analysis that is difficult to perform in public clouds.
+   We run a diverse set of serverless functions for broad
+workload coverage. To ensure reliable and consistent measure-
+                                                                              Fig. 2: Execution of a Serverless Function.
+ments, we minimize sources of runtime variability and keep
+the experimental environment stable. Specifically, we main-
+tain a consistent software stack across all configurations. We       by up to 231% for AMD SEV-SNP and up to 394% for Intel
+also reduce variability from function scheduling and network         TDX CVMs compared to regular VMs.
+behavior. To this end, we directly operate functions using pre-      • Remote Attestation phase verifies that the VM is authentic
+built containers. Container images and function artifacts, such      and running on trusted hardware before provisioning secrets
+as models and input files, are provided locally so that results      or sensitive data. Its overhead has also been quantified in prior
+are not affected by external network bandwidth fluctuations.         work and is reported to be marginal, typically under 10 ms [7].
+Experiment setup and workload details are in Section IV.             • Initialization phase prepares the execution environment
+                                                                     for a function, including container creation, runtime loading,
+B. Memory-Efficiency Evaluation                                      and dependency setup (libraries, key datasets, etc). It is the
+                                                                     main source of cold-start overhead when a warm execution
+   To quantify the memory cost, we compare the host-observed
+                                                                     environment is not already available.
+memory usage of serverless deployments under three config-
+                                                                     • Execution phase covers the actual execution of the function
+urations: regular VMs with KSM enabled, regular VMs with
+                                                                     once the execution environment has been prepared (i.e., warm
+KSM disabled, and CVMs. The comparison between KSM-
+                                                                     starts). The time is determined by the function logic and
+enabled and KSM-disabled regular VMs measures the memory
+                                                                     affected by CVM runtime overhead.
+cost caused by the loss of cross-VM deduplication over
+                                                                        Not every phase needs to be examined in equal detail in
+actively used identical pages. The comparison between KSM-
+                                                                     this work. VM startup and remote attestation have already
+disabled regular VMs and CVMs identifies additional memory
+                                                                     been measured in prior studies and are incurred only in
+inefficiency introduced by reduced memory reclaimability.
+                                                                     selected scenarios. In contrast, initialization and execution
+   Because this overhead may vary with deployment scale, we
+                                                                     more directly affect the latencies observed by users in warm-
+study two scaling dimensions: the number of VMs and the
+                                                                     start and cold-start scenarios. The overhead incurred in these
+number of container instances per VM. As more functions are
+                                                                     phases has not been studied. Therefore, our evaluation focuses
+deployed and more memory resources are required to support
+                                                                     on these phases when comparing regular VMs and CVMs.
+them, the memory overhead can be in turn amplified.
+   We focus on the memory consumed by cached execution
+environments, namely warm containers and the associated              D. Root-Cause Analysis Strategy
+runtimes, rather than the transient memory used during func-             When slowdowns under confidential execution are iden-
+tion execution. There are a few reasons: 1) execution-time           tified, we perform a root-cause analysis to determine the
+memory usage is highly dynamic and varies over time. This            root cause. This analysis is conducted on the local testbed
+leads to unstable measurements; 2) due to its transient na-          with controlled experiments. We first profiled the system and
+ture, execution-time memory is rarely deduplicated in current        hardware counters for both CVM and regular VM executions
+practice; systems also typically reserve sufficient memory for       to identify possible contributing factors. We then control the
+execution; 3) cached environments typically account for the          experimental setting to identify the underlying cause of the
+dominant share of memory consumption [19].                           contributing factor.
+
+C. Runtime-Overhead Evaluation                                                      IV. EXPERIMENTAL SETUP
+   While a systematic evaluation of runtime overhead should          A. Evaluation Platform
+cover the entire serverless lifecycle, it is neither meaningful         We evaluate our system on Google Cloud Platform (GCP)
+to treat the whole lifecycle as a single end-to-end quantity nor     using Intel Sapphire Rapids servers with TDX support and
+necessary to examine every stage in equal depth. To maintain         AMD Milan servers with SEV-SNP support. On the Intel plat-
+a systematic view while focusing on the most meaningful              form, we use c3-standard-22 instances with 22 vCPUs
+overheads, we divide the serverless function lifecycle into four     and 88 GB of memory, and c3-standard-4 instances with 4
+phases (Figure 2) and consider them separately. For the phases       vCPUs and 16 GB of memory. On the AMD platform, we use
+most relevant to user-perceived serverless performance, we           n2d-standard-4 instances, which match the smaller Intel
+further compare their behavior on regular VMs and CVMs.              configuration with 4 vCPUs and 16 GB of memory. For each
+• VM/TD Startup phase launches the VM or trust domain                instance type, we evaluate both confidential VMs (CVMs) and
+(TD) that will host the serverless functions. Prior work [7] has     non-confidential VMs (NVMs). All cloud instances use GCP
+studied this phase and reports that VM boot latency increases        standard persistent disks with Google-managed encryption. We
+                                                                                                                                              5
+
+
+
+TABLE I: System configurations of Intel and AMD Machines                   TABLE II: List of different benchmarks used
+   SN   Processor        CVM   Machine Type     # vCPU    Mem.                 Note:FB—FunctionBench, FP—FaaSProfiler
+                                                (Core)    (GB)
+                                                                    SN   Benchmarks              Source   Task
+   1    Intel Sapphire   Yes   c3-standard-4    4 (2)     16
+                                                                    1    Chameleon               FB       Evaluates template rendering cost
+   2    Intel Sapphire   No    c3-standard-4    4 (2)     16
+                                                                    2    Matrix Multiplication   FB       Multiplication of 2 nxn matrices
+   3    Intel Sapphire   Yes   c3-standard-22   22 (11)   88
+                                                                    3    Compression             SeBS     Compresses files in a directory
+   4    Intel Sapphire   No    c3-standard-22   22 (11)   88
+                                                                    4    Video Processing        SeBS     GIF generation & watermark in-
+   5    Intel Xeon       Yes   Local machine    32 (32)   16                                              sertion
+   6    Intel Xeon       No    Local machine    32 (32)   16        5    Image Recognition       SeBS     Inference on an image
+   7    AMD Milan        Yes   n2d-standard-4   4 (2)     16        6    Pyaes                   FB       Performs AES encryption
+   8    AMD Milan        No    n2d-standard-4   4 (2)     16        7    Video Face Detection    FB       Face detection frame by frame
+                                                                    8    Map Reduce              FB       MapReduce pipeline
+also conduct selected experiments on a local HPE ProLiant           9    Crud API                SeBS     Create-Read-Update-Delete
+DL380 Gen11 server with dual-socket Intel Xeon Gold 6554S           10   Random Disk IO          FB       Random reads writes to disk
+CPUs (144 logical cores in total). All VMs and the local host       11   RNN Generate Char-      FB       Generate names
+                                                                         acter Level
+run Ubuntu Linux with kernel version 6.8.0. Additional system       12   CNN Image Classifi-     FB       Identifies an image
+details are summarized in Table I.                                       cation
+                                                                    13   Logistic Regression     FB       Training a model
+                                                                    14   Graph BFS               SeBS     Breadth first search on a graph
+B. Serverless Platform and Deployment Model                         15   Sentiments              FP       Parsed and analyzed text
+   We use OpenFaaS [17] as the serverless computing frame-
+work in our setup, deploying it as a single-node instance.
+                                                                   consistent across all deployments to ensure fair comparison
+OpenFaaS is orchestrated using Kubernetes, which handles
+                                                                   across regular VM and CVM configurations.
+the scheduling and management of all associated pods. All
+serverless function pods, including system-level pods such as
+the OpenFaaS gateway, queue worker, and Prometheus, are                       V. EXPERIMENTS AND FINDINGS
+deployed on the same machine to minimize network variability          This section first evaluates how CVM affects memory
+and focus on the underlying VM and hardware impacts.               efficiency (Section V-A), since the loss of cross-VM page
+   This setup ensures that function scheduling, execution, and     deduplication and memory reclaimability directly impacts re-
+metrics collection are localized, allowing for fine-grained mea-   source provisioning and deployment density. We then analyze
+surement of performance differences between configurations.        the execution overhead of these benchmarks under warm-
+We ensure the function containers are prebuilt and ready to be     start conditions (Section V-B), followed by cold-start behavior
+instantiated for warm start, isolating function runtime behavior   (Section V-C).
+from image pulling or container setup delays. For cold starts,
+we ran the containers from the start.
+                                                                   A. Memory Efficiency
+                                                                      Unlike prior CVM studies that mainly emphasize execution
+C. Workloads and Benchmarks                                        overhead on general-purpose workloads, our analysis explicitly
+   We selected a diverse set of serverless functions from          quantifies how confidentiality changes memory scaling behav-
+SeBS [20], FunctionBench [21], and FaaSProfiler [22] bench-        ior in serverless systems, where warm-container capacity is
+mark suites to cover a range of application domains and work-      a first-order performance concern. Our study aims to clarify
+load characteristics (e.g., compute-intensive and I/O-intensive)   three questions: (i) Does confidentiality introduce memory
+functions. Table II summarizes the benchmarks, which can be        cost primarily because it disables cross-VM deduplication? (ii)
+grouped into four categories:                                      How is this cost affected by factors such as deployment scale
+• Compute-Intensive: arithmetic-heavy and CPU-bound                and workloads? (iii) What does that imply for warm-container
+functions, including Matrix Multiplication, Map Reduce, Video      capacity in serverless systems?
+Processing, and Graph BFS.                                            To answer these questions, we compare three configurations:
+• I/O-Intensive: functions involving significant disk or file      regular VMs with KSM enabled, regular VMs with KSM
+operations, including Compression, and Random Disk I/O.            disabled, and CVM. The comparison between KSM-enabled
+• ML & Inference Workloads: machine learning inference             and KSM-disabled regular VMs isolates the cost of losing
+functions or analysis tasks, including Image Recognition (IR),     cross-VM deduplication, while the comparison between KSM-
+Video Face Detection, Logistic Regression, RNN Generate            disabled VMs and CVMs identifies the additional inefficiency
+Character Level, CNN Image Classification, and Sentiments.         caused by reduced memory reclaimability. To ensure realistic
+• Web, Encryption, API, and Backend Logic: application-            measurements, we provision each VM with the minimum
+oriented serverless functions, including Chameleon, CRUD           memory required for correct and stable function execution.
+API, and Pyaes.                                                    This avoids attributing excess unused memory to the system
+   Some of the functions listed above may fall under multiple      footprint, which would otherwise inflate the measured memory
+categories. For clarity, however, each function is assigned to     consumption and overstate the resulting overhead. Although
+only one category in the analysis. All functions are deployed      some degree of memory overprovisioning is common in cloud
+using OpenFaaS templates and invoked through HTTP re-              practice, there is no fixed standard for how much extra
+quests. We keep resource limits and environment variables          capacity should be reserved. Using a tight memory bound,
+                                                                                                                                 6
+
+
+
+
+Fig. 3: Memory usage across different numbers of VMs for functions (a) hello-world, (b) IR (ResNet-50), and (c) IR (ResNet-
+152); (d) Memory inefficiency caused by disabling page deduplication across serverless workloads; (e) Total memory usage
+when running different functions
+
+
+therefore, provides a more controlled and interpretable basis     space is reserved for their execution. As a result, the absence
+for comparison.                                                   of memory deduplication and reclamation leads to higher
+   1) VM instances for same functions: We first examine           overhead for memory-intensive workloads.
+the VMs created for hosting the same function, one instance          2) VM instances for different functions: To show that
+in each VM. Figures 3(a)–(c) show total memory usage as the       the cost of confidentiality is not limited to homogeneous
+number of VMs increases for three representative functions        deployments with repeated copies of the same workload, we
+with memory demands ranging from lightweight (hello-world)        create three VMs hosting three different workloads (hello-
+to memory-intensive (IR (ResNet 152) — Image recognition          world, ResNet-50, and ResNet-152), and measure their total
+using ResNet 152). Across all workloads, memory usage in          memory consumption under the above three configurations.
+both the KSM-disabled and CVM configurations grows much           Figure 3(e) shows that memory inefficiency persists even
+faster than in KSM-enabled executions.                            when the VMs host different functions. Under KSM-enabled
+      a) Scaling with Number of VMs: For lightweight work-        execution, substantial memory savings are still possible be-
+loads such as hello-world (Figure 3(a)), total memory increases   cause VMs share system-level pages such as OS components,
+from about 1 GB to 2.3 GB across 1–4 VMs with KSM,                runtime environments, and common libraries. Prior work [23]
+compared with 4.4 GB and 5.2 GB for KSM-disabled and              also confirms this claim by stating that runtime and libraries
+CVM configurations, respectively.                                 that are common across the functions determine the extent of
+   Similar trends are also observed for IR. With ResNet-50        redundancy different functions’ sandboxes have. Under CVMs,
+(Figure 3(b)), memory usage under KSM-enabled execution           these optimizations are not available, and memory usage again
+increases from roughly 1.5 GB to 3.4 GB, whereas KSM-             closely follows the KSM-disabled configuration. Thus, the loss
+disabled and CVM configurations reach approximately 7.1 GB        of deduplication under CVMs is a platform-wide scaling issue,
+and 8 GB at 4 VMs. With ResNet-152 (Figure 3(c)), the gap         not merely an artifact of identical-function replication.
+is even larger: KSM-enabled memory grows from about 2 GB
+to 4 GB, while KSM-disabled and CVM configurations reach             3) Implications for Warm-Container Capacity: The results
+nearly 9.2 GB and 10 GB, respectively.                            suggest that the dominant memory penalty in CVM-based
+   These results show that, without deduplication, each VM        serverless deployment is from the loss of cross-VM page dedu-
+contributes nearly the full memory footprint of the work-         plication. In regular VM deployments, consolidating identical
+load, while KSM-enabled execution benefits from cross-VM          pages across VMs effectively increases usable memory capac-
+page sharing. The close alignment between CVM and KSM-            ity under a fixed memory budget. Confidential deployments
+disabled curves confirms that the loss of deduplication is the    do not benefit from this effect.
+dominant source of memory inefficiency in CVMs.                      This difference directly affects the capacity of caching warm
+      b) Impact of Workload Size: Figure 3(d) shows how the       containers. In regular deployments, reclaimed memory can be
+memory overhead varies with workload size. Even for a single      used to maintain a larger warm container pool. This helps
+VM, the absence of deduplication introduces 9–20% overhead,       reduce cold starts. In CVM-based deployments, the same
+which increases significantly with scale. At four VMs, the        memory budget supports fewer resident warm instances, which
+overhead reaches approximately 88% for hello-world, 104%          can lead to increased cold starts.
+for ResNet-50, and 128% for ResNet-152 under KSM-disabled            This then motivates a targeted question: although confiden-
+execution. For CVMs, the overhead is even higher, reaching        tiality prevents cross-VM deduplication, can memory-sharing
+approximately 120–147% for the largest configurations.            opportunities be exploited within a single VM to recover the
+   These results show that memory inefficiency grows with         lost efficiency through intra-VM memory deduplication? To
+workload size. Larger models contain more identical memory        answer this question, we compare two deployments with the
+pages (e.g., model weights, runtime components, and shared        same total number of container instances: 4VM-1Instance,
+libraries), which would otherwise be consolidated in KSM-         in which four VMs each host one container instance, and
+enabled environments. At the same time, a larger memory           1VM–4Instances, in which one VM hosts four container
+                                                                                                                                7
+
+
+
+
+                                                                   Fig. 5: Frequency of VMEXITs for different serverless func-
+                                                                   tions based on the slowdown they suffered
+
+Fig. 4: Latency per invocation across different serverless
+workloads on Intel TDX machines.                                   inference benchmarks—including Image Recognition, RNN
+                                                                   Character Generation, and CNN Image Classification—exhibit
+                                                                   noticeable slowdowns under CVMs, with Image Recognition
+instances. The results confirm that consolidating four container   showing the largest degradation among all workloads. Overall,
+instances within a single VM substantially reduces total mem-      these findings indicate that warm-start overhead in CVMs
+ory usage compared with distributing the same four instances       is concentrated in specific workload behaviors rather than
+across four separate VMs. For the hello-world workload,            uniformly distributed across workloads. We next analyze the
+memory usage decreases from 4.3 GB (KSM disabled) and              underlying causes of these slowdowns.
+2.3 GB (KSM enabled) in the 4VM setup to 1.1 GB when                  1) VMEXIT-Induced Serverless Execution Overheads:
+all instances are colocated in a single VM. Similarly, for IR      Prior work [7] has identified VMEXITs as a major source
+(ResNet-50), memory reduces from 6.9 GB / 3.4 GB to 2.2            of overhead for general-purpose workloads in CVMs. To
+GB, and for IR (ResNet-152), from 9.0 GB / 4.0 GB to 2.9           investigate the source of warm-start slowdowns for serverless
+GB.                                                                functions, we first examine the relationship between execution
+   From a systems perspective, these results suggest that          slowdown and VMEXIT activity across the workloads. Fig-
+hosting multiple instances of the same function within a           ure 5 shows that workloads with larger slowdowns generally
+single CVM can mitigate the memory inefficiency of con-            exhibit higher VMEXIT rates. For example, Image Recog-
+fidential deployment and improve warm-container capacity.          nition (IR) shows the largest slowdown; it also shows the
+This opportunity is particularly relevant because serverless       largest (very high) VMEXIT rate, more than 300 thousand per
+platforms frequently experience concurrent requests to the         second (shown by the blue arrow in Figure 5). CNN Image
+same function, requiring multiple instances of that function       Classification generates fewer VMEXITs than IR (around 130
+to coexist [24].                                                   thousand per second, shown by the red arrow in Figure 5) and
+                                                                   exhibits a lower slowdown. Chameleon generates only a few
+B. Overheads Analysis in Warm Starts                               thousand VMEXITs each second (shown by the green arrow
+   This subsection focuses on performance overhead under           in Figure 5) and thus experiences minimal degradation.
+the most common operating condition—warm starts. We first             VMEXIT frequency alone does not fully explain perfor-
+evaluate warm-start execution latency of benchmark functions       mance degradation. Some benchmarks, such as Video Face
+on CVMs and then analyze the root causes of the largest            Detection and Logistic Regression, exhibit relatively high
+slowdowns.                                                         VMEXIT frequency but do not experience significant slow-
+   We evaluate the warm-start latencies for the benchmarks         down. This is because a large fraction of their VMEXITs are
+listed in Section IV-C on both regular VMs and CVMs.               low-cost types, such as EXT_INTERRUPT and MSR_WRITE.
+Figure 4 presents the latency overhead we find in CVM.             In contrast, workloads that generate a higher proportion of
+The results show that the performance impact of confidential       expensive VMEXITs—particularly HLT, which is associated
+execution is strongly workload dependent. Several compute-         with idle transitions—experience significantly higher slow-
+intensive and I/O-oriented workloads exhibit only minor slow-      down. This aligns with prior findings [7], which identify that
+downs under CVMs, typically within a single-digit percentage       vCPU-sleep (HLT) overhead of the CVM (may be incurred
+range. This indicates that workloads dominated by straight-        by frequently repeating sleep and wake-up events) can cause
+forward CPU computation or disk operations remain largely          a significant performance drop and suggests that enforcing
+unaffected by confidential execution.                              guest-side polling can help mitigate this issue.
+   In contrast, certain workloads experience substantial per-         2) Impact of Parallelism on Execution Overheads: To un-
+formance degradation. In particular, several machine learning      derstand how this known CVM overhead manifests in server-
+                                                                                                                                              8
+
+
+
+                                                                  perform a controlled ablation by changing only the guest idling
+                                                                  policy from the default HLT policy to POLL1 . Table III shows
+                                                                  both inference latency and VMEXIT activity. Under HLT,
+                                                                  the regular VM and CVM incur average latencies of 201.4
+                                                                  ms and 347.8 ms, respectively, together with substantially
+                                                                  higher VMEXIT counts. Switching to POLL reduces the
+                                                                  corresponding average latencies to 30.8 ms and 31.8 ms,
+                                                                  while total VMEXIT counts decrease from 3.6 millions to 536
+                                                                  thousands for the regular VM and from 4.5 millions to 679
+                                                                  thousands for the CVM. Notably, under the HLT policy in the
+                                                                  regular VM, HLT accounts for 29% of the total VMEXITs,
+                                                                  but contributes approximately 99% of the cumulative time
+Fig. 6: Inference time for Image Recognition when using           attributed to VMEXIT handling. Under POLL, HLT exits
+different PyTorch threads on a 2-core Intel TDX Machine.          are eliminated entirely. Thus, suppressing idle transitions
+                                                                  substantially reduces both VMEXIT activity and execution
+TABLE III: IR inference latency and VMEXIT activity under         latency under otherwise unchanged execution conditions. This
+different guest idling policies.                                  controlled result provides stronger evidence that idle-transition
+                                                                  VMEXITs are a major contributor to the observed slowdown.
+    VM Type    Idling Policy   Avg. Latency (ms)   # VMEXITs
+     Regular        HLT              201.4            3.6M
+                                                                     3) Existing system-level mitigations and their limitations:
+      CVM           HLT              347.8            4.5M        A straightforward way to reduce costly idle transitions is to
+     Regular       POLL               30.8            536K        keep vCPUs spinning rather than allowing them to enter an
+      CVM          POLL               31.8            679K        idle state, as demonstrated by our POLL experiment above.
+                                                                  However, spinning introduces its own cost by consuming CPU
+                                                                  cycles while no useful work is being performed. This creates
+less warm starts, particularly its interaction with serverless    a fundamental trade-off: a short spinning period may fail to
+deployment practice, we examine the role of runtime-managed       avoid costly idle transitions, whereas a long spinning period
+multithreading. In many serverless platforms, assigning more      can waste CPU resources and interfere with co-located work-
+memory to a function is commonly associated with allocating       loads. Existing system-level mechanisms therefore attempt to
+more vCPUs. Runtime frameworks (such as PyTorch, Intel            balance these two costs by dynamically adjusting the duration
+TBB) often respond by spawning worker threads based on the        of spinning. Prior work has also explored more fundamental
+number of vCPUs. For workloads with frequent synchroniza-         ways to reduce spinning overhead, such as consolidating fine-
+tion, using an extra number of threads creates more idle–active   grained tasks onto fewer vCPUs to shorten idle periods [25]
+transitions in vCPUs and therefore more HLT-triggered exits       and shifting waiting activity to SMT sibling cores [26]. Nev-
+and amplified CVM overhead.                                       ertheless, these approaches do not eliminate the underlying
+   To quantify this effect, we control the number of vCPUs and    trade-off, since their effectiveness still depends on adapting
+run the IR benchmark. PyTorch used by the IR benchmark            to the workload’s idle behavior while balancing idle-transition
+automatically adjusts the number of threads based on the          overhead against unnecessary CPU consumption.
+number of vCPUs. As shown in Figure 6, overall, single-thread        Host-level spinning provides one way to reduce idle-
+latencies are similar between CVMs and regular VMs, whereas       transition overhead. Linux/KVM implements adaptive halt
+multi-thread latencies are substantially higher on CVMs. On       polling (halt_polling), in which a vCPU briefly polls
+a regular VM, increasing the thread count generally reduces       at the host before being descheduled. This mechanism is
+latency. In contrast, on a CVM, single-threaded execution out-    enabled by default for both regular VMs and CVMs. However,
+performs multi-threaded execution. This behavior is consistent    substantial slowdown remains for the serverless workloads
+with additional synchronization and idle transitions generated    we evaluate. The ineffectiveness may be partially explained
+during multithreaded execution, whose associated VMEXIT           by serverless functions being short-lived and their execution
+costs are amplified under CVMs.                                   phases changing too quickly for halt polling to adapt. Also,
+   The overhead associated with idle-transition VMEXITs is        host-level spinning mechanisms cannot eliminate VMEXITs
+not unique to confidential execution and has also been ob-        associated with guest-level idle transitions.
+served in regular VMs [25]. However, the effect is consid-           Guest-level polling avoids these HLT-triggered exits, as
+erably more severe in CVMs. For example, at eight threads,        shown in our previous experiment, but continuously spinning
+both environments suffer from synchronization overhead, but       vCPUs can waste CPU resources and interfere with co-
+the slowdown is much larger in the CVM, reaching nearly
+                                                                     1 An operating system can employ different idling policies to determine how
+200% (Figure 6). To further highlight this effect, we repeat
+                                                                  a CPU behaves when it becomes idle. Under the HLT (halt) policy, a CPU
+the experiment on larger VMs with 22 vCPUs. The slowdown          calls the HLT instruction to put itself into a low-power mode. In the case
+increases to 3.5× for executions on CVM, while the executions     of VMs, a vCPU calling the HLT instruction will cause a VMEXIT, which
+on the regular VM can still show a small latency improvement      returns control to the hypervisor and may in turn trigger a context switch to
+                                                                  another vCPU or task on the host. In contrast, the POLL policy keeps the
+over the single-thread execution.                                 vCPU active by having the vCPU call the PAUSE instruction in a loop (i.e.,
+   To isolate the contribution of idle-transition VMEXITs, we     PAUSE-loop), thereby removing the VMEXIT caused by HLT instructions.
+                                                                                                                                   9
+
+
+
+                                                                    count) for each function, reducing unnecessary synchroniza-
+                                                                    tion and idle-active transitions in the first place.
+                                                                       4) Other System-Level Effects: While the previous analysis
+                                                                    explains how VMEXIT frequency, thread-level parallelism,
+                                                                    and idling behavior contribute to performance degradation
+                                                                    for serverless functions, in this section, we first establish
+                                                                    generality, then analyze some other system-level mechanisms
+                                                                    that we observed.
+                                                                         a) Cross-Platform Validation (AMD SEV-SNP): To de-
+                                                                    termine whether the observed slowdown is specific to Intel
+                                                                    TDX or characteristic of CVMs more broadly, we repeated the
+Fig. 7: Latency of serverless and memtier benchmarks, en-           IR benchmark on two-core AMD SEV-SNP instances (config-
+abling and disabling the PLE.                                       urations 7 and 8 from Table I). Similar to the Intel platform,
+                                                                    the serverless benchmark on AMD SEV-SNP also faces a
+                                                                    performance slowdown of around 10% as compared to a non-
+located workloads. In regular VMs, this overhead can be con-        confidential regular AMD VM. Although the degradation on
+trolled using the PAUSE-Loop Exit (PLE): when a guest               AMD is less severe than on Intel TDX, the presence of com-
+repeatedly executes the PAUSE_INSTRUCTION instruction,              parable behavior indicates that this slowdown is not unique
+the hypervisor can detect the spin loop and preempt the             to Intel TDX and can also appear on another confidential
+vCPU, improving scheduling fairness and reducing wasted             computing implementation.
+CPU cycles [27]. CVMs, such as Intel TDX, however, do                    b) Hardware Placement Effects: While the slowdown be-
+not expose the same hardware-assisted PLE mechanism and             havior is consistent across confidential computing implemen-
+instead rely on approaches such as paravirtualized spinlocks,       tations, the unexpected performance improvement observed
+which require hypervisor cooperation and may be undesirable         for matrix multiplication requires separate investigation. To
+when the hypervisor is untrusted. This makes efficient control      investigate whether this behavior arises from hardware place-
+of guest-side spinning more difficult in CVMs.                      ment effects rather than inherent advantages of CVMs, we
+   For CVM, thus the best possible system-level approach            replicated the experiment on our local testbed under controlled
+would be consolidating threads onto vCPUs to reduce idle            conditions. Under identical configurations, we did not observe
+periods and then using short polling to reduce resource waste,      any performance benefit for CVMs, suggesting that the im-
+a similar approach as Gleaner [25]. However, this can signifi-      provement in the cloud may be influenced by hardware-level
+cantly increase latencies, and thus cannot be used for serverless   factors such as NUMA locality or shared cache contention.
+computing.                                                             To examine NUMA effects, we pinned CPU and memory
+   To evaluate this trade-off, we run two regular VMs (config-      to different NUMA nodes on our local server (configurations
+uration 6 in Table I) pinned to the same physical CPU cores.        5 and 6 in Table I). This configuration resulted in an average
+One VM executes five concurrent Image Recognition instances         slowdown of 2.4%, indicating the impact of cross-node mem-
+to reduce idle periods, while the second runs the memtier           ory access. We then evaluated the effect of Last-Level Cache
+benchmark [28]. We evaluated two configurations: (i) PLE            (LLC) contention by colocating two VMs on the same socket-
+enabled: The default configuration, allowing the hypervisor to      one executed matrix multiplication and the other ran a cache-
+preempt spinning VMs via the PAUSE_INSTRUCTION, and                 intensive workload. Under this setup, matrix multiplication
+(ii) PLE disabled: This configuration emulates CVM behavior,        performance degraded by approximately 20%, confirming the
+where the PLE is not observed. We use two regular VMs rather        sensitivity of the workload to shared cache interference.
+than a regular VM and a CVM to isolate the effect of PLE               These observations suggest that variations in NUMA place-
+from other CVM-specific performance differences.                    ment and LLC contention in multitenant cloud environments
+   Figure 7 shows that the latencies remain higher than those       can influence performance. In practice, the lower adoption
+observed without workload consolidation. To further clarify,        of CVMs may reduce resource contention, allowing certain
+the latency increase was not due to aggressive consolidation.       workloads to experience better cache availability or locality.
+Although five concurrent IR instances keep the vCPUs busier,           Taken together, the factors discussed in this section primar-
+short idle intervals still occur between computation phases.        ily affect steady-state execution latency after a container has
+Under guest-side polling, these remaining idle intervals cause      already been initialized. However, serverless responsiveness is
+vCPUs to spin, which can interfere with co-located workloads.       also influenced by startup latency when new containers are
+To quantify the importance of controlling this spinning, we         instantiated. We therefore shift our focus from steady-state
+compare PLE-enabled and PLE-disabled configurations. Dis-           execution overhead to cold-start behavior in the serverless
+abling PLE increases latency for both workloads: IR experi-         function lifecycle.
+ences an 8% slowdown, while memtier degrades by 37%.
+   These limitations motivate controlling parallelism closer to
+the function runtime. Rather than reacting to idle transitions      C. Characterizing Cold Start Bottlenecks
+after they occur, a serverless platform could use execution            While Section V-B analyzes warm-start execution behavior,
+history to select an appropriate concurrency level (e.g., thread    serverless performance is also heavily influenced by container
+                                                                                                                                   10
+
+
+
+
+Fig. 8: Runtime of runc with (a) number of vCPUs, (b) different CPU quota, (c) number of Sysbench threads, and (d) other
+Runc instances.
+
+
+initialization latency. In particular, cold-start overhead can        vCPU settings. However, in single vCPU VMs, running runc
+dominate total function execution time, especially for short-         alongside a single-threaded CPU-intensive sysbench workload
+lived workloads. To quantify this effect, we evaluated several        made runc slower. In this case, running runc alone took 44
+SeBS benchmarks [20] and observed that container startup              ms, while running it alongside sysbench took 61 ms, making
+accounts for around 65% of total execution time. These                it slower to run with CPU-intensive workloads. Having fewer
+findings motivate a deeper analysis of the sources of cold-start      vCPUs yields higher CPU utilization of the runc container
+behavior.                                                             and may reduce the priority the container receives over the
+   To compare cold-start behavior, we measured container              sysbench-CPU workload.
+startup time in both regular VMs and CVMs. The results                   3) Launching Multiple Containers in Parallel: Third, we
+indicate that CVMs do not inherently introduce additional             ran 4 instances of runc on 4 different VMs. All the VMs
+cold-start overhead relative to regular VMs. Although CVMs            had 4 vCPUs that were pinned to the same set of 4 cores
+do not significantly increase cold-start latency, cold-start itself   as mentioned above. The time taken by runc on these four
+dominates execution time, making its optimization critical for        VMs was 54.8 ms, 55.9 ms, 56.5 ms, and 52.4 ms, which
+confidential serverless deployments. We therefore investigate         is almost 10 ms (15%) faster than running runc solely on a
+the factors that dominate container initialization latency across     4-vCPU VM. These results indicate that the runc startup is
+different execution configurations. We systematically analyze         not CPU-saturated; instead, moderate parallelism can improve
+runc [29], the low-level container runtime responsible for            performance by reducing idle periods and keeping cores active.
+creating and launching containers, under varying CPU configu-            From Figure 8(d), we can observe that running three in-
+rations, contention levels, and isolation mechanisms to identify      stances of runc simultaneously on a one-vCPU VM kept the
+the dominant contributors to cold-start latency.                      runtime of runc lower. This is because, when running runc,
+   1) Single-core vs. Multi-core VMs: First, we compare run-          most of the time the CPU remains idle, and running two or
+ning runc on a single core and multiple-core regular VMs              three instances of runc together, in this configuration, would
+with the hyperthreading turned off. The single vCPU execution         not impact each other, but rather keep the CPU warm, which
+took 44 ms while the multi-vCPU VM took over 60 ms. From              results in better performance. However, running 4 instances
+Figure 8(a), we can see that running on a 1-vCPU VM is faster         throttled the CPU and hence increased the runtime.
+than running on a multi-vCPU VM. The increased latency in                4) Cgroup Write Contention: Experiments above show that
+multi-vCPU VMs is attributable to additional synchronization          runc performs better in a single vCPU rather than in a multi-
+and coordination overhead introduced by parallel execution            core environment. Forcing runc to use fewer vCPUs or running
+across cores. Running on 1 core would mitigate this synchro-          it with another workload in a controlled condition results in a
+nization issue and hence make the runtime of runc faster.             lower runc runtime due to warm cores and having to suffer less
+   2) Impact of CPU Quota Throttling and CPU Load:                    contention. This contention, associated with WRITE|PERCPU
+Second, we see how runc performs in a condition where                 operations during PID updates to cgroups, can sometimes
+the cores are stressed. We ran several instances of runc on           account for up to 50% of runc startup time. During this period,
+a VM by restricting the time the VM can use the CPU by                the runc process makes no forward progress. KernelShark [30]
+implementing a quota for the VM’s cgroup. Restricting the             traces (Figure 9) show the contention interval, with the stack
+VM to use 50% of the period did not make any impact.                  trace identifying percpu_down_write and the underlying
+However, decreasing this number further increased the runtime         percpu_rwsem semaphore as the source.
+of runc, as shown in Figure 8(b).                                        5) Reducing Launch Overhead in Trusted Settings: As
+   Interestingly, when running runc alongside a CPU-intensive         discussed in Section V-A3, consolidating multiple container
+sysbench workload, container startup time decreased to 59             instances of the same function within a single CVM improves
+ms—approximately 6 ms faster than the baseline. This behav-           memory efficiency even without cross-VM deduplication. We
+ior arises because runc exhibits relatively low CPU utilization;      next consider whether selected container-level isolation mech-
+under contention, the scheduler prioritizes short-lived tasks,        anisms can be relaxed to reduce launch overhead under a
+and sustained CPU activity keeps cores active, reducing wake-         restricted trust setting.
+up latency. As shown in Figure 8(c), increasing the number of            Threat Model and Security Boundary. We assume a
+sysbench threads further reduces runc startup time in multi-          per-function CVM deployment in which multiple container
+                                                                                                                               11
+
+
+
+
+                                         Fig. 9: Contention in runc and its stack trace.
+
+
+instances of the same serverless function execute within a        D. Optimizations for Warm and Cold Start Performance
+dedicated CVM and are mutually trusted. Container instances
+                                                                     Based on the observations from Sections V-B and V-C, we
+belonging to different functions execute in separate CVMs,
+                                                                  summarize practical optimization strategies for both warm-
+even when those functions belong to the same tenant. Con-
+                                                                  start and cold-start scenarios. Some factors, such as NUMA
+tainers belonging to different tenants are likewise isolated in
+                                                                  locality and LLC contention, are largely outside user control.
+separate CVMs. The cloud host and hypervisor remain outside
+                                                                  However, runtime configuration choices and container initial-
+the trust boundary, whereas the CVM hardware, guest OS, and
+                                                                  ization policies offer opportunities to mitigate overhead.
+container runtime are trusted. Under this model, the hardware-
+enforced CVM boundary provides isolation across different            In warm-start scenarios, serverless functions that rely on
+functions and tenants, while container-level mechanisms pro-      multithreading exhibit a trade-off between parallelism benefits
+vide additional defense-in-depth among instances of the same      and thread synchronization/VMEXITs overhead. While par-
+function within a CVM. Relaxing selected container-level          allelism initially improves performance, for some serverless
+mechanisms therefore weakens isolation only among mutually        functions, it leads to increased synchronization and VMEXIT
+trusted instances of the same function and does not remove the    amplification, particularly in CVMs.
+CVM isolation boundary protecting other functions or tenants.        For cold starts, the observations in Section V-C suggest
+These optimizations should not be applied when mutually           three classes of optimization depending on their deployment
+untrusted containers share an execution environment. We do        requirements.
+not assume that CVM isolation eliminates microarchitectural          Configuration-level optimizations. Several optimizations can
+side channels through shared hardware resources; evaluating       be applied through resource and runtime configuration without
+such attacks is outside the scope of this work. Under this        modifying the kernel or relaxing isolation. Our measurements
+threat model, we evaluate three container-level mechanisms        show that runc initialization often underutilizes the available
+that contribute to container launch overhead.                     CPU resources, while excessive vCPU allocation can increase
+                                                                  synchronization overhead. Accordingly, selecting an appropri-
+                                                                  ate number of vCPUs and controlling initialization parallelism
+                                                                  can reduce container-launch latency.
+   Isolations Relaxation. Cgroups in Linux limit the resource        Kernel-level optimization. We identify prolonged con-
+usage of individual processes, preventing a container from        tention associated with WRITE|PERCPU operations on the
+monopolizing CPU, memory, or I/O resources. We evaluate se-       percpu_rwsem semaphore during PID writes to the cgroup
+lectively removing cgroup-related operations during container     hierarchy. This contention can be mitigated by enabling the
+creation to reduce the associated launch overhead. Similarly,     CONFIG_CGROUP_FAVOR_DYNMODS kernel configuration,
+Seccomp (Secure Computing Mode) restricts the system calls        which prioritizes the relevant write operations. Unlike the
+available to a container, reducing the kernel attack surface.     configuration-level optimizations above, this optimization re-
+We evaluate bypassing Seccomp filtering during container          quires a kernel configuration change and recompilation.
+launch. As the threat model above shows, this optimization           Trust-dependent isolation relaxation. Under the restricted
+trades intra-CVM defense-in-depth for lower startup overhead.     trust model defined in Section V-C5, additional reductions in
+Finally, we examine the overhead of network namespace             startup latency are possible by selectively relaxing container-
+creation for a Docker container, which includes setting up        level isolation mechanisms. Skipping cgroup assignment dur-
+isolated virtual network interfaces and associated network        ing runc startup reduces launch time by 27%, bypassing
+state. We configure new containers to reuse the network           Seccomp filtering reduces startup latency by approximately
+namespace of an already running container, thereby avoiding       30 ms, and reusing the network namespace of an existing
+this setup. This optimization removes network isolation among     container reduces startup time by approximately 50 ms. These
+the participating containers and is therefore considered only     techniques trade intra-CVM isolation and defense-in-depth for
+under the trust model defined above.                              lower startup latency and therefore are not general-purpose
+                                                                                                                                   12
+
+
+
+recommendations; they apply only under the trust assumptions        of lost cross-VM page deduplication to memory inefficiency,
+defined in Section V-C5.                                            connect this overhead to warm-container capacity, characterize
+                                                                    how costly VM exits interact with serverless runtime paral-
+                  VI. RELATED WORKS                                 lelism and idle transitions, and identify container-runtime and
+   Confidential computing has emerged as a promising ap-            isolation-related costs during container initialization. These
+proach to address the risks posed by untrusted cloud infrastruc-    analyses expose serverless-specific performance mechanisms
+tures, especially in multi-tenant environments where sensitive      and trade-offs that are complementary to the architectural
+data may be exposed to malicious insiders or compromised            solutions proposed in prior work.
+hypervisors. Much of the early work in this area focused on            Beyond confidential serverless systems, a broader body of
+hardware-based TEEs, such as Intel SGX and ARM Trust-               work has studied performance optimization in conventional
+Zone, which enable isolated execution of sensitive code in          serverless platforms, including reducing cold-start latency, im-
+secure enclaves. Prior work on SGX-based serverless comput-         proving scheduling policies, using snapshot-based techniques,
+ing has largely concentrated on SGX-specific limitations such       and exploiting container reuse and caching [19], [36]–[39].
+as enclave memory constraints, deployment complexity, and           Relatively few studies have explored the security implications
+incomplete system protection (Plug-In Enclaves [31], LLMaaS         of serverless computing, such as privacy concerns and side-
+[32], Clemmys [33]). These designs inherit the limitations          channel vulnerabilities [10]. These works target conventional
+of TEE-based solutions, such as the need for application            platforms. Performance of serverless computing on CVMs for
+refactoring, and other issues as explained in Section II-A. In      confidential workloads remains understudied.
+contrast, our work focuses on CVM-based serverless com-
+puting, which offers promising advantages over TEE-based
+                                                                                       VII. CONCLUSIONS
+approaches (Section II-B).
+   Recent advances in CVMs have motivated several perfor-              Running sensitive serverless applications on public cloud
+mance studies. Misono et al. [7] provide a comprehensive            platforms introduces privacy concerns, as the underlying host
+characterization of AMD SEV-SNP and Intel TDX, covering             may have visibility into the VM’s runtime state. Confidential
+VM boot, VMEXITs, I/O, and application performance. Yan et          Virtual Machines (CVMs) address this by encrypting mem-
+al. [8] and Qiu et al. [9] similarly characterize CVM overheads     ory to prevent host-level introspection. However, this added
+using general-purpose or domain-specific workloads. These           security comes with resource and performance overheads.
+studies establish important fundamental costs of confidential          In this paper, we present a systematic comparison of server-
+execution, but do not examine how these costs manifest across       less function execution across CVMs and regular VMs using
+the serverless execution lifecycle. In contrast, our work focuses   fifteen different benchmarks. Our results show that memory
+specifically on short-lived and latency-sensitive serverless        encryption in CVMs prevents host-level page deduplication
+workloads. It examines three serverless-specific consequences:      mechanisms such as Kernel Same-page Merging (KSM),
+the impact of CVM memory inefficiency on warm-container             resulting in reduced memory consolidation efficiency and
+capacity, workload-dependent warm-start execution overhead,         increased memory consumption as deployment scale grows.
+and container runtime initialization during cold starts. We         This limitation can reduce the number of warm containers
+further examine both Intel TDX and AMD SEV-SNP, while               that can be maintained in memory, thereby affecting the ability
+conducting detailed root-cause analysis of the serverless exe-      of serverless platforms to mitigate cold-start latency through
+cution overheads observed on Intel TDX.                             container reuse.
+   Prior work has also directly explored confidential serverless       Beyond memory inefficiency, our analysis identifies key
+computing, but with different objectives. Segarra et al. [34]       runtime factors that contribute to performance degradation in
+present CC-Knative, a confidential deployment of the Kna-           confidential serverless environments. In particular, workloads
+tive serverless runtime using Confidential Containers, and          with high synchronization and idle–active transitions generate
+primarily characterize the feasibility and substantial startup      frequent VMEXITs, and this effect is amplified under CVMs
+and scale-out costs introduced by CVM provisioning and              due to the higher cost of VMEXIT handling. Serverless
+attestation. Our study is complementary: rather than evalu-         resource provisioning further exacerbates this behavior, as
+ating the construction of a confidential serverless runtime,        higher-memory configurations expose more vCPUs, encour-
+we systematically characterize the behavior of already provi-       aging increased parallelism and synchronization. In addition,
+sioned CVM-based serverless environments across a diverse           reduced hypervisor visibility into guest execution limits the ef-
+benchmark suite, including memory efficiency, warm-start            fectiveness of mechanisms such as Pause-Loop Exiting (PLE),
+execution, and container-level cold-start bottlenecks. Sabanic      making CVMs more sensitive to contention and scheduling
+et al. [35] take a different approach by proposing a new            inefficiencies.
+confidential serverless architecture designed to overcome lim-         Finally, we analyze cold-start behavior and show that
+itations of conventional CVM-based deployments, including           container initialization can dominate overall invocation la-
+startup latency, communication overhead, and low function           tency. Our experiments demonstrate that targeted optimiza-
+density. Their evaluation therefore focuses on demonstrating        tions—such as selectively relaxing unnecessary isolation
+the benefits of their proposed architecture. In contrast, our       mechanisms in mutually trusted same-function instances—can
+work is a measurement and root-cause study of conventional          significantly reduce container launch time. Overall, our find-
+CVM-based serverless execution: we isolate the contribution         ings highlight the complex trade-offs between security, mem-
+                                                                                                                                                             13
+
+
+
+ory efficiency, and runtime performance in confidential server-                  [16] Intel. (2025) Intel® trust domain extensions (intel® tdx). [Online].
+less computing and provide practical insights for designing                           Available: https://www.intel.com/content/www/us/en/products/docs/acce
+                                                                                      lerator-engines/trust-domain-extensions.html
+efficient and secure serverless platforms on emerging confi-                     [17] OpenFaas. Openfaas. [Online]. Available: https://www.openfaas.com/
+dential computing infrastructures.                                               [18] A. Arcangeli, I. Eidus, and C. Wright, “Increasing memory density by
+                                                                                      using ksm,” in Proceedings of the Linux Symposium, Montreal, Canada,
+                              R EFERENCES                                             Jul. 2009, pp. 19–28.
+ [1] A. W. Services. (2024) Aws lambda. [Online]. Available: https:              [22] M. Shahrad, J. Balkind, and D. Wentzlaff, “Architectural Implications of
+     //aws.amazon.com/lambda/                                                         Function-as-a-Service Computing,” in Proceedings of the 52nd Annual
+ [2] Microsoft. (2024) Azure functions. [Online]. Available: https:                   IEEE/ACM International Symposium on Microarchitecture. Columbus
+     //azure.microsoft.com/en-us/products/functions                                   OH USA: ACM, Oct. 2019, pp. 1063–1075.
+ [3] G. Cloud. (2024) Cloud run functions. [Online]. Available: https:           [23] D. Saxena, T. Ji, A. Singhvi, J. Khalid, and A. Akella, “Memory
+     //cloud.google.com/functions                                                     deduplication for serverless computing with medes,” in Proceedings
+ [4] “Intel® trust domain extensions (intel® tdx) architecture specification,”        of the Seventeenth European Conference on Computer Systems, ser.
+     Intel Corporation, Tech. Rep., 2021, accessed: 2025-04-24. [Online].             EuroSys ’22. New York, NY, USA: ACM, 2022, p. 714–729.
+     Available: https://www.intel.com/content/www/us/en/developer/tools/tr       [24] Q. Liu, Y. Cheng, H. Shen, A. Wang, and B. Balaji, “Concurrency-
+     ust-domain-extensions/documentation.html                                         informed orchestration for serverless functions,” in ASPLOS 2025, 2025,
+ [5] AMD. (2025) Amd secure encrypted virtualization (sev). [Online].                 p. 147–161.
+     Available: https://www.amd.com/en/developer/sev.html                        [25] X. Ding, P. B. Gibbons, M. A. Kozuch, and J. Shan, “Gleaner: Mitigating
+ [6] “Architecture confidential compute architecture,” ARM, Tech. Rep.,               the Blocked-Waiter wakeup problem for virtualized multicore applica-
+     accessed: 2026-02-24. [Online]. Available: https://www.arm.com/archit            tions,” in USENIX ATC 14. Philadelphia, PA: USENIX Association,
+     ecture/security-features/arm-confidential-compute-architecture#HOWI              Jun. 2014, pp. 73–84.
+     TWORKS                                                                      [26] W. Jia, J. Shan, T. O. Li, X. Shang, H. Cui, and X. Ding, “vSMT-
+ [7] M. Misono, D. Stavrakakis, N. Santos, and P. Bhatotia, “Confidential             IO: Improving I/O performance and efficiency on SMT processors in
+     VMs Explained: An Empirical Analysis of AMD SEV-SNP and Intel                    virtualized clouds,” in USENIX ATC 20. USENIX Association, Jul.
+     TDX,” Proceedings of the ACM on Measurement and Analysis of                      2020, pp. 449–463.
+     Computing Systems, vol. 8, no. 3, pp. 1–42, Dec. 2024.                      [27] J. Shan, X. Ding, and N. Gehani, “Apples: Efficiently handling spin-lock
+ [8] M. Yan and K. Gopalan, “Performance overheads of confidential virtual            synchronization on virtualized platforms,” IEEE TPDS, vol. 28, no. 7,
+     machines,” in 2023 31st International Symposium on MASCOTS. IEEE,                pp. 1811–1824, 2017.
+     pp. 1–8.
+                                                                                 [28] RedisLabs. memtier benchmark. [Online]. Available: https://github.c
+ [9] L. Qiu, R. Taft, A. Shraer, and G. Kollios, “The price of privacy:
+                                                                                      om/RedisLabs/memtier benchmark
+     A performance study of confidential virtual machines for database
+     systems,” in Proceedings of the 20th International Workshop on Data         [29] O. C. Initiative. runc. [Online]. Available: https://github.com/openconta
+     Management on New Hardware. ACM, pp. 1–8.                                        iners/runc
+[10] J. Shen, H. Zhang, Y. Geng, J. Li, J. Wang, and M. Xu, “Gringotts: Fast     [30] KernelShark. Kernelshark. [Online]. Available: https://kernelshark.org/
+     and accurate internal denial-of-wallet detection for serverless comput-     [31] M. Li, Y. Xia, and H. Chen, “Confidential serverless made efficient
+     ing,” in Proceedings of the 2022 ACM SIGSAC Conference on Computer               with plug-in enclaves,” in 2021 ACM/IEEE 48th Annual ISCA, 2021,
+     and Communications Security. ACM, pp. 2627–2641.                                 pp. 306–318.
+[11] Z. N. Zhao, A. Morrison, C. W. Fletcher, and J. Torrellas, “Last-level      [32] Z. Cai, R. Ma, Y. Fu, W. Zhang, R. Ma, and H. Guan, “Llmaas: Serving
+     cache side-channel attacks are feasible in the modern public cloud,” in          large-language models on trusted serverless computing platforms,” IEEE
+     Proceedings of the 29th ACM International Conference on ASPLOS,                  Transactions on Artificial Intelligence, vol. 6, no. 2, pp. 405–415, 2025.
+     Volume 2, 2024, pp. 582–600.                                                [33] B. Trach, O. Oleksenko, F. Gregor, P. Bhatotia, and C. Fetzer, “Clemmys:
+[12] Intel. (2025) Intel® software guard extensions (intel® sgx). [Online].           towards secure remote execution in faas,” in Proceedings of the 12th
+     Available: https://www.intel.com/content/www/us/en/products/docs/acce            ACM SYSTOR, ser. SYSTOR ’19. New York, NY, USA: Association
+     lerator-engines/software-guard-extensions.html                                   for Computing Machinery, 2019, p. 44–54.
+[13] S. Arnautov, B. Trach, F. Gregor, T. Knauth, A. M. Martin, C. Priebe,       [34] C. Segarra, T. Feldman-Fitzthum, D. Buono, and P. Pietzuch, “Serverless
+     J. Lind, D. Muthukumaran, D. O’Keeffe, M. Stillwell, D. Goltzsche,               confidential containers: Challenges and opportunities,” in Proceedings
+     D. Eyers, R. Kapitza, P. Pietzuch, and C. Fetzer, “Scone: Secure linux           of the 2nd Workshop on SESAME, ser. SESAME ’24. New York, NY,
+     containers with intel sgx,” in 12th USENIX Symposium on OSDI.                    USA: Association for Computing Machinery, 2024, p. 32–40.
+     USENIX Association, 2016, pp. 689–703.                                      [35] P. Sabanic, M. Misono, T. Bodea, J. Pritzi, M. Hackl, D. Stavrakakis,
+[14] C.-C. Tsai, D. E. Porter, and M. Vij, “Graphene-sgx: A practical library         and P. Bhatotia, “Confidential serverless computing,” 2025. [Online].
+     os for unmodified applications on sgx,” in 2017 USENIX ATC (USENIX               Available: https://arxiv.org/abs/2504.21518
+     ATC 17). USENIX Association, 2017, pp. 645–658.
+                                                                                 [36] P. Silva, D. Fireman, and T. E. Pereira, “Prebaking functions to warm
+[15] C. Priebe, D. Muthukumaran, J. Lind, H. Zhu, S. Cui, V. A. Sartakov,
+                                                                                      the serverless cold start,” in Proceedings of the 21st International
+     and P. Pietzuch, “Sgx-lkl: Securing the host os interface for trusted
+                                                                                      Middleware Conference. ACM, pp. 1–13.
+     execution,” 2020. [Online]. Available: https://arxiv.org/abs/1908.11143
+[19] H. Yu, R. Basu Roy, C. Fontenot, D. Tiwari, J. Li, H. Zhang, H. Wang,       [37] A. Fuerst and P. Sharma, “FaasCache: keeping serverless computing
+     and S.-J. Park, “RainbowCake: Mitigating cold-starts in serverless with          alive with greedy-dual caching,” in Proceedings of the 26th ACM
+     layer-wise container caching and sharing,” in Proceedings of the 29th            International Conference on ASPLOS, ser. ASPLOS ’21. ACM, pp.
+     ACM International Conference on ASPLOS, Volume 1. ACM, pp. 335–                  386–400.
+     350.                                                                        [38] L. Ao, G. Porter, and G. M. Voelker, “Faasnap: Faas made fast using
+[20] M. Copik, G. Kwasniewski, M. Besta, M. Podstawski, and T. Hoefler,               snapshot-based vms,” in Proceedings of the Seventeenth European
+     “SeBS: A serverless benchmark suite for function-as-a-service comput-            Conference on Computer Systems, ser. EuroSys ’22. New York, NY,
+     ing,” publisher: arXiv Version Number: 2.                                        USA: ACM, 2022, p. 730–746.
+[21] J. Kim and K. Lee, “FunctionBench: A suite of workloads for serverless      [39] A. Mohan, H. Sane, K. Doshi, S. Edupuganti, N. Nayak, and V. Sukhom-
+     cloud function service,” in 2019 IEEE 12th International Conference on           linov, “Agile cold starts for scalable serverless,” in 11th USENIX
+     Cloud Computing (CLOUD). IEEE, pp. 502–504.                                      Workshop on HotCloud. Renton, WA: USENIX Association, Jul. 2019.
+

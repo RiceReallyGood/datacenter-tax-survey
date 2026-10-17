@@ -1,0 +1,999 @@
+                                                ParaCell: Paravirtualized Secure Containers with
+                                                   Lightweight Intra-Container Isolation and
+                                                      Intent-Driven Memory Management
+                                                                        Yiyang Wu∗                                                Xunjie Wang∗
+                                                     Institute of Parallel and Distributed Systems                 Institute of Parallel and Distributed Systems
+                                                            Shanghai Jiao Tong University                                 Shanghai Jiao Tong University
+                                                                    Shanghai, China                                               Shanghai, China
+                                                               adminstrator@sjtu.edu.cn                                         vectorxj@sjtu.edu.cn
+arXiv:2605.20906v1 [cs.OS] 20 May 2026
+
+
+
+
+                                                                          Jinyu Gu                                                 Haibo Chen
+                                                     Institute of Parallel and Distributed Systems                 Institute of Parallel and Distributed Systems
+                                                            Shanghai Jiao Tong University                                 Shanghai Jiao Tong University
+                                                                    Shanghai, China                                               Shanghai, China
+                                                                  gujinyu@sjtu.edu.cn                                         haibochen@sjtu.edu.cn
+
+                                         Abstract                                                             1   Introduction
+                                         Secure containers isolate each container with its own ker-           Containers are the dominant deployment unit in today’s
+                                         nel, mitigating shared-kernel attacks prevalent in traditional       cloud. OS-level containers such as RunC [18] share the host
+                                         container systems. However, existing designs still face a fun-       kernel, delivering near-native performance [43, 59, 78] but
+                                         damental isolation–performance trade-off. Nested-cloud de-           inheriting a broad kernel attack surface [37, 38, 45] and cross-
+                                         ployments amplify the cost of VM exits and page-table man-           container interference [54, 73, 76]. Secure containers address
+                                         agement, while emerging agentic workloads expose bursty              these limitations by moving from a shared-kernel architecture
+                                         memory demand that requires fine-grained elasticity. We              to a separate-kernel architecture: each container runs with its
+                                         attribute this trade-off to two root causes. First, existing         own guest kernel, so untrusted workloads no longer directly
+                                         designs lack lightweight intra-container isolation primitives        share the host kernel as their primary execution substrate.
+                                         for frequent container user–kernel transitions. Second, the          This model has become an important foundation for secure
+                                         host treats container memory management as opaque, forc-             multi-tenancy in production clouds, including systems from
+                                         ing reactive secondary faults and coarse-grained huge page           AWS [24], Ant Group [30], and Microsoft Azure [25]. Kata-
+                                         mappings to amortize their cost.                                     style RunV containers [10, 19] are a representative realization
+                                            This paper presents ParaCell, a paravirtualized secure            of this model, using hardware virtualization to enforce the
+                                         container runtime built on two insights. First, intra-address-       container boundary while preserving Linux compatibility.
+                                         space hardware protection primitives can provide light-                 Existing secure-container designs, however, face growing
+                                         weight intra-container isolation. ParaCell uses MPK-based            pressure in nested-cloud deployments and emerging agentic
+                                         XGates to isolate the container user and container kernel            workloads. Nested-virtualization deployments, where ten-
+                                         within a single address space, turning frequent user–kernel          ants run their own hypervisors inside leased VMs, make
+                                         transitions into direct domain switches. Second, container           hardware-assisted RunV costly: VM exits and nested EPT
+                                         kernel allocators already encode memory-management in-               faults must be mediated through the outer hypervisor, sub-
+                                         tent. ParaCell introduces Pager to interpose on allocation           stantially increasing the latency of operations on the con-
+                                         and free events, batch proactive GPA→HPA bindings and un-            tainer boundary [42, 66, 86]. At the same time, agentic work-
+                                         bindings, and avoid reactive shadow page-table faults while          loads such as OpenClaw [15] and Hermes [5] are moving
+                                         preserving fine-grained memory elasticity.                           to cloud-hosted deployments for easier use and manage-
+                                            ParaCell is implemented as a drop-in replacement for              ment [4, 14, 17]. Such workloads make sandboxing a first-
+                                         RunV. Our experiments demonstrate that, across traditional           class requirement because they execute dynamic, partially
+                                         cloud and emerging agent applications, ParaCell reduces              untrusted tool actions. Meanwhile, their memory demand is
+                                         latency by up to 57% and 79% over PVM, and by up to 33%              also highly bursty and fluctuating: prior work reports peak-
+                                         and 88% over RunV, in bare-metal and nested setups, re-              to-average spikes of up to 15.4× [85], and our traces from
+                                         spectively. On agent workloads, ParaCell saves up to 35.6%           SWE-bench runs show a mean 23.3% waste when memory
+                                         memory compared with the state-of-the-art VM memory                  is accounted at 2MB granularity instead of 4KB granular-
+                                         reclamation technique, HyperAlloc.                                   ity (Figure 1). These workloads need secure containers that
+                                         ∗ Contributed equally to this work.
+
+                                                                                                          1
+                                                                                 Wu et al., Yiyang Wu, Xunjie Wang, Jinyu Gu, and Haibo Chen
+
+
+provide both efficient frequent boundary crossings and fine-            ParaCell reduces latency by up to 57% and 79% over PVM,
+grained memory elasticity.                                              and by up to 33% and 88% over RunV, in bare-metal and
+   Following this analysis, we attribute the mismatch to                nested setups, respectively. On agent workloads, ParaCell
+two root causes. The first root cause is the lack of light-             saves up to 35.6% memory over the state-of-the-art recla-
+weight intra-container isolation primitives. A secure con-              mation technique HyperAlloc [80], with negligible memory
+tainer must isolate the container user from its container               waste of less than 0.4% on average. In summary, this paper
+kernel, while still making common user–kernel transitions               contributes:
+such as syscalls and page faults cheap. Hardware-virtualized            • An analysis of nested-cloud and agent workloads that iden-
+designs (e.g., RunV) preserve efficient in-guest transitions,             tifies two structural causes of secure-container overhead:
+but bind this intra-container boundary to hardware virtual-               heavyweight intra-container isolation and opaque guest
+ization, which becomes costly and inflexible under nesting.               memory-management intent (§2; §3.1).
+Software-virtualized designs (e.g., PVM [42]) avoid that de-            • The design and implementation of ParaCell, which com-
+pendence, but isolate the container user and container kernel             bines MPK-based XGates for lightweight guest user–
+with separate address spaces, placing page-table switches on              kernel transitions with Pager for intent-driven, fine-
+frequent transition paths.                                                grained container memory management (§3–§5).
+   The second root cause is the opacity of container memory-            • An evaluation showing that ParaCell improves secure-
+management intent to the host. Traditional virtualization                 container performance under both bare-metal and nested
+exposes the guest’s page-table state rather than its allocator            deployments while providing fine-grained memory elas-
+intent. The host therefore discovers actual memory demand                 ticity (§6).
+reactively, through secondary faults such as EPT violations or
+shadow faults. This, however, creates a granularity dilemma.            2     Background and Motivation
+Fine-grained 4KB backing preserves good memory utiliza-
+                                                                        2.1   Secure Containers
+tion but turns page faults into frequent host–guest transi-
+tions, whereas huge-page backing amortizes those faults but             Conventional OS-level containers such as RunC [18] rely on
+wastes memory for bursty and sparse workloads.                          a shared kernel architecture, achieving low overhead at the
+   We therefore propose ParaCell, a paravirtualized secure-             cost of fundamental isolation and scalability limitations. First,
+container runtime that addresses these two root causes                  the large kernel attack surface shared by all tenants has long
+through two insights. The first insight is that recent intra-           been recognized as a major source of container escapes and
+address-space protection primitives can provide the missing             sandbox breaks [54, 58, 66, 68]. Second, co-located containers
+lightweight intra-container isolation layer. ParaCell there-            interfere through shared kernel code paths and global kernel
+fore uses MPK-based XGates to place the container user and              state, leading to cross-tenant performance interference [67],
+container kernel in one address space while separating them             especially on modern many-core servers [29, 41, 81].
+into MPK-protected domains. This changes frequent user–                    Secure containers avoid these issues by moving to a sep-
+kernel transitions from address-space switches into light-              arate kernel architecture that provides each container with
+weight domain switches, preserving the isolation abstraction            its own kernel. For this reason, major cloud vendors such
+without relying on hardware virtualization support.                     as AWS [24], Ant Group [30], and Microsoft Azure [25]
+   The second insight is that the container kernel already              have adopted secure containers as an important deployment
+knows the memory-management intent that the host lacks.                 model in cloud environments. In this paper, we therefore
+Kernel allocators define the lifecycle of physical pages: alloca-       restrict our scope to secure containers.
+tion means a page is about to become active, and free means
+the backing memory can be reclaimed. ParaCell introduces                2.2   Why RunV Falls Short
+Pager to expose these allocator events as an explicit contract          Hardware-assisted virtualization-based secure containers
+between the container kernel and the host. Rather than wait-            (RunV [19]), such as Kata Containers [10], address the isola-
+ing for secondary faults to infer demand, Pager proactively             tion limitations of shared-kernel containers by placing each
+binds and unbinds container pages to host pages. It directly            container inside a VM with its own kernel, using hardware
+maintains host-side mappings from allocator intent, rather              virtualization support such as Intel VT-x [69] and AMD-
+than synchronizing them reactively through shadow page-                 V [72]. However, this design increasingly falls short in impor-
+table faults, preserving efficient management while keeping             tant scenarios such as nested clouds and agentic workloads.
+host allocation close to actual guest use at 4KB granularity.
+   We implement ParaCell as a drop-in replacement for RunV              2.2.1 Nested Clouds. First, nested cloud settings dramati-
+in the containerd ecosystem and evaluate traditional cloud              cally amplify the cost of hardware virtualization, making
+applications (both nested and non-nested deployments) and               RunV increasingly unattractive for modern IaaS deploy-
+emerging agent workloads (SWE-bench [47] with Claude                    ments [42, 66]. In this setting, secure containers (L2 VMs)
+Code, SkillsBench [50]). Across cloud and agent applications,           run inside tenant VMs (L1) leased from an IaaS provider
+                                                                    2
+ParaCell: Paravirtualized Secure Containers with Lightweight Intra-Container Isolation and Intent-Driven Memory Management
+
+
+(L0), a configuration commonly used to obtain stronger iso-                                           800                                                                                           median (17.1%)
+
+
+
+
+                                                                                                                                             E ecution Time Fraction (%)
+                                                                                                                  4KB           2MB
+
+
+
+
+                                                                            Memory Consumption (MB)
+                                                                                                                                                                           15                       mean (23.3%)
+lation and Kubernetes-compatible cluster management [42].
+                                                                                                      600
+However, RunV is inefficient when it cannot directly access
+                                                                                                                                                                           10
+hardware virtualization support, as in nested clouds.                                                 400
+
+Nesting amplifies hardware-assisted virtualization                                                    200
+                                                                                                                                                                           5
+
+overheads. RunV relies on hardware virtualization support
+                                                                                                       0                                                                   0
+such as extended page table (EPT) and VM control structure                                                  0           2            4   6                                      0      25      50       75     >100
+                                                                                                                            Time (Min)                                          Huge Page Fragmentation Overhead (%)
+(VMCS) for efficient memory isolation and CPU virtualiza-
+tion. Under nesting, however, these mechanisms are only                                                                 (a)                                                                  (b)
+directly available to the outermost hypervisor. As a result,
+the L0 hypervisor must virtualize the virtualization interface              Figure 1. Memory characteristics of SWE-bench agent exe-
+for the L1 guest, so privileged operations from L2 containers               cution. (a) In-use guest memory at different page granulari-
+can no longer be handled by the L1 guest hypervisor alone                   ties over execution time. (b) Distribution of execution time
+and must instead be mediated by L0.                                         fraction across memory waste levels.
+   This extra indirection penalizes two critical paths. First,
+each VM exit from an L2 container must be forwarded
+                                                                            across all sampled SWE-bench executions, memory waste,
+through L0 to L1 and then resumed along the reverse path,
+                                                                            defined as the extra memory consumed by 2MB pages rela-
+adding two extra world switches to each VM exit round
+                                                                            tive to 4KB pages, has a mean of 23.3% and a median of 17.1%.
+trip [86]. Prior work shows that it can reduce throughput
+                                                                            Consequently, these patterns demand two properties from
+by up to 4.3× for I/O-intensive applications [66]. Second,
+                                                                            the container runtime: (1) the host must allocate and reclaim
+EPT management is even more expensive. Beyond the same
+                                                                            container memory quickly (high resizing performance); and
+L0-mediated VM-exit path for L2 EPT fault handling, nested
+                                                                            (2) the gap between guest-used and host-allocated memory
+memory virtualization also requires L0 to maintain a shadow
+                                                                            must remain small (high memory utilization).
+EPT (SEPT) for each L2, further increasing the cost of L2
+                                                                               RunV instead faces a utilization–performance trade-off. It
+EPT faults [42, 86]. Prior work reports that nested EPT fault
+                                                                            typically relies on huge EPT pages for performance, which
+handling introduces four extra world switches and increases
+                                                                            can reduce page walk latency by 40% and improve perfor-
+container startup latency by 114% compared with the bare-
+                                                                            mance of typical memory-intensive applications by 12% [49].
+metal case [86].
+                                                                            However, it makes memory resizing coarse-grained and
+2.2.2 Agentic Workloads. Second, emerging agentic                           increases fragmentation, since partially used huge pages
+workloads expose a fundamental mismatch with RunV’s                         cannot be reclaimed efficiently [80]. Consequently, RunV
+memory management model. Agent systems such as                              struggles to simultaneously provide both high resizing per-
+Codex [9], Claude Code [6], OpenClaw [15], and Hermes [5]                   formance and memory utilization for agent workloads.
+integrate LLM reasoning with autonomous tool execution:
+the agent observes workspace state, asks the LLM to gener-                  2.3                                 Existing Secure-Container Studies
+ate tool actions, and executes those actions as subprocesses.               We study existing secure container designs along three di-
+This execution model is now moving from local developer                     mensions: performance, memory elasticity, and compatibility.
+environments into public clouds: Alibaba Cloud and Ten-                     For performance, we focus on frequent cross-boundary oper-
+cent Cloud offer OpenClaw and Hermes deployment ser-                        ations such as syscalls and page faults. For memory elasticity,
+vices [4, 14, 17], where tenants rent isolated environments                 we examine whether a design can provide fast resizing while
+to run agents. Since these generated actions are dynamic,                   preserving high memory utilization. For compatibility, we
+partially untrusted, and externally sourced, agent execution                consider whether it requires software or hardware modifica-
+requires sandboxing as an essential property [20, 85]. How-                 tions. Table 1 summarizes the comparison.
+ever, their memory characteristics make RunV ill-suited as                  PVM. PVM [42] eliminates the hardware virtualization de-
+the sandbox substrate.                                                      pendency by adopting a paravirtualization architecture: the
+Bursty and fluctuating agentic workloads demand fine-                       host resides in kernel mode while both guest user and guest
+grained memory elasticity. We profile agent memory char-                    kernel execute in user mode, each with separate page tables.
+acteristics by sampling at 1Hz during SWE-bench [47] runs                   As a result, each syscall and page-fault forwarding path must
+with Claude Code. Figure 1(a) shows the memory-usage                        perform two and three page-table switches, respectively.
+time series for a sampled run, illustrating that agent mem-                    For memory virtualization, PVM relies on KVM shadow
+ory demand is highly bursty and fluctuating. Prior work                     paging, which maintains a shadow page table (SPT) for each
+reports peak-to-average spikes of up to 15.4× within 1–2                    guest page table (GPT) and synchronizes the GPT with the
+seconds [85], and we also observe similar bursty spikes dur-                SPT during shadow faults. Figure 2 illustrates the workflow
+ing agent execution. Furthermore, Figure 1(b) shows that,                   for handling an anonymous page fault from the guest user.
+                                                                        3
+                                                                                                  Wu et al., Yiyang Wu, Xunjie Wang, Jinyu Gu, and Haibo Chen
+
+
+Table 1. Comparison of existing secure container designs.                                   PVM can leverage the conventional virtio-balloon dri-
+BM: bare-metal. NST: nested.                                                             ver [63, 75] to return memory to the host, but it is still subject
+                                                                                         to the utilization–performance trade-off (§ 2.2.2).
+                                  Performance                           Memory           CKI. CKI [66] extends the Protection Keys for Supervisor
+  System                     Syscall      Page Fault                    Elasticity
+                                                                                         (PKS) [44] hardware feature to create an isolated intra-kernel
+  RunV [10]                                         (BM)    (NST)                        domain without relying on hardware virtualization. It runs
+  PVM [42]                                                                               the guest kernel as a sandboxed module in kernel mode,
+  CKI [66]                                                                               thereby eliminating the page-table switches between guest
+  X-Container [65]                                                                       user and guest kernel that PVM incurs. Additionally, CKI
+  gVisor [2]                (BM)      (NST)                                              preallocates memory in fixed segments to remove the two-
+  LiteShield [57]                                                                        stage address translation entirely. Together, these techniques
+  ParaCell (ours)                                                                        improve syscall and page fault performance over traditional
+                                                                                         software virtualization. However, this design is not deploy-
+                                                                                         able on commodity processors because it requires hardware
+              Guest                   Guest Kernel               U-PT                    modifications to PKS, and its fixed-segment preallocation
+              User           $                 &"Fix                                     also prevents fine-grained memory reclamation.
+                             PF
+                             ,                   '() Allocator                           X-Container. X-Container [65] adopts a Xen-PV-based Li-
+            Fault Instr               PF Handler                                         bOS architecture, in which the guest kernel and user applica-
+                      -                               +
+                             iret                 GFP
+                                                                                         tion are colocated without isolation. By using dynamic binary
+           *"SF                                            !"SF                          rewriting to transform system calls into direct function calls,
+               U-SPT                                       DM-SPT
+                                                                                         it achieves low syscall overhead. However, its threat model is
+                                      Shadow
+                                                                                         incompatible with agentic applications. For example, agents
+                                    Fault Handler
+                                                                                         increasingly operate browser environments [1, 11, 16], while
+                          %"Fix                     #"Allocate                           modern browsers rely on processes to isolate mutually un-
+                                    Host Kernel and Fix                                  trusted web content [8, 21] and provide crash isolation across
+                                                                                         browser components [13]. Additionally, page table opera-
+Figure 2. Additional shadow faults incurred by shadow pag-                               tions on page faults still require hypercalls to the hypervisor.
+ing during anonymous page fault handling. Page fault for-                                Moreover, it statically allocates all guest memory to avoid
+warding ( 1 ) and emulation of guest page table writes ( 7 )                             shadow paging overhead, precluding memory elasticity.
+are omitted for brevity. PF: page fault. SF: shadow fault. GFP:                          gVisor. gVisor [2] adopts an application kernel, called the
+get_free_pages. U-PT: page table of the faulting process.                                Sentry, which implements a Linux-like interface for each
+U-SPT: shadow page table of the faulting process. DM-SPT:                                sandboxed container. By moving the kernel interfaces nor-
+shadow page table of kernel direct mapping.                                              mally provided by the host kernel into a per-container Sen-
+                                                                                         try, gVisor reduces the host kernel attack surface while re-
+                                                                                         taining a process-like resource model. In practice, gVisor is
+                                                                                         commonly deployed with two platforms. When hardware-
+Specifically, it first traps into the guest kernel’s page fault
+                                                                                         assisted virtualization is not available (e.g., in nested clouds),
+handler ( 1 ). When the guest kernel allocates and clears a
+                                                                                         gVisor places the Sentry in userspace and leverages Sys-
+page ( 2 ) through the kernel direct mapping (a.k.a. linear
+                                                                                         trap [23] to redirect syscalls and page faults to the Sentry,
+mapping), the corresponding guest page has not yet been
+                                                                                         incurring additional IPC overhead. Otherwise, gVisor uses
+backed by an HPA. This triggers a shadow fault ( 3 ) to syn-
+                                                                                         KVM [48] so that the Sentry acts as both the guest OS kernel
+chronize the direct mapping GPT with its SPT (DM-SPT).
+                                                                                         and the VMM, reducing costly guest user/kernel switches
+The host kernel then allocates a host page for the GPA and
+                                                                                         (e.g., syscall transitions). However, page faults still involve
+installs it into the DM-SPT ( 4 ). However, this only fixes the
+                                                                                         additional EPT violations, as in RunV. For memory elas-
+GVA of the direct mapping (i.e., fixing only the DM-SPT).
+                                                                                         ticity, the Sentry can use fallocate to directly notify the
+Then the page is mapped to the faulting user GVA ( 7 ) in
+                                                                                         host about freed memory, avoiding the overhead of memory
+U-PT, after which the guest kernel invokes iret to resume
+                                                                                         ballooning [63, 75]. However, because gVisor reimplements
+user execution at the same faulting instruction. However,
+                                                                                         Linux kernel interfaces in the Sentry, it may lack the full
+this access triggers another shadow fault ( 9 ) due to missing
+                                                                                         compatibility and kernel-level optimizations of native Linux.
+U-SPT entry, causing an additional GPT-to-SPT synchro-
+nization overhead for each new GVA alias of the same GPA.                                LiteShield. LiteShield [57] adopts a microkernel architecture
+Together, PVM’s complex page fault handling causes up to a                               that delegates most application syscalls to user-space system
+2.1× slowdown compared with RunC on memory-intensive                                     services via shared-memory IPC. This design provides low
+applications in our evaluation (§6.2.2).                                                 syscall latency by avoiding context switches, but relies on
+                                                                                     4
+ParaCell: Paravirtualized Secure Containers with Lightweight Intra-Container Isolation and Intent-Driven Memory Management
+
+
+polling service threads and thus hurts CPU utilization. Its                 abstraction of a separate guest kernel, while deprivileging
+page faults and memory elasticity remain efficient because                  the guest kernel to user mode to avoid rigid dependence
+memory management is still handled by the host kernel.                      on hardware-assisted virtualization, following prior PV se-
+However, compatibility is limited by the need to reimplement                cure containers [42, 65]. Within each container, ParaCell
+or port existing stacks into the user-space service layer.                  preserves isolation among multiple user applications and be-
+                                                                            tween user applications and the guest kernel, while enabling
+3     Overview                                                              efficient transitions between guest user and kernel. As in
+3.1   Analysis of Isolation–Performance Trade-offs                          prior PV secure container designs, the host kernel acts as the
+                                                                            hypervisor: it schedules containers, handles and forwards
+Important cloud workloads (§2.2.1, §2.2.2) place simultane-
+                                                                            interrupts for the guest kernel, and processes VirtIO requests.
+ous isolation and performance demands on secure containers
+                                                                            Unlike prior work, however, ParaCell provides efficient fine-
+along two axes: (1) they require intra-container isolation
+                                                                            grained memory management for container memory. We
+while preserving efficient cross-boundary performance, and
+                                                                            next introduce the two key insights behind ParaCell.
+(2) they require fine-grained container memory isolation
+while delivering efficient memory resizing performance. We
+refer to these tensions as the isolation–performance trade-offs                        U/K Isolation          AS Isolation            MPK Isolation
+and attribute them to two root causes.
+                                                                                            Container
+Root cause #1: The lack of lightweight intra-container                                           Guest User                  Guest User
+isolation primitives. A secure container requires two prop-                        User
+                                                                                                              Syscall Gate
+erties within the container: isolation between the container                       Mode
+user and its kernel, and efficient transitions across this user–                                              Guest Kernel
+
+kernel boundary. The former preserves the conventional
+                                                                                                                          Per-Container
+privilege separation expected by applications, while the latter                                 Interrupt Gate
+                                                                                                                              Pager
+keeps frequent cross-boundary operations (e.g., syscalls and                      Kernel
+page faults) efficient. Existing VM-based secure containers                       Mode      Host Kernel (Hypervisor)
+                                                                                               Interrupt         VirtIO          Memory
+choose between two imperfect isolation mechanisms. Hard-                                        Handler          Driver          Manager
+ware virtualization preserves efficient in-guest user–kernel
+transitions, but binds the isolation to hardware support and
+is inflexible in environments such as nested clouds (§2.2.1).               Figure 3. ParaCell architecture. U/K: user/kernel privilege.
+Software virtualization avoids this rigid dependence, but                   AS: address space. MPK: Memory Protection Key.
+makes frequent user–kernel transitions inefficient.
+Root cause #2: The opacity of guest memory manage-                          Insight #1: Using emerging lightweight hardware pro-
+ment intent. Traditional virtualization virtualizes the MMU                 tection primitives to enlighten intra-container isola-
+and page table abstraction. However, this abstraction does                  tion. To address root cause #1, we observe that recent hard-
+not reflect actual memory usage: a guest kernel typically                   ware extensions that facilitate intra-address-space level iso-
+establishes a direct mapping (a.k.a. linear mapping) that cov-              lation gracefully fits the requirement of intra-container iso-
+ers its entire GPA range at boot time, so all guest page table              lation. MPK[44] for x86 is a good example that is capable
+entries are populated long before any page is actually used                 of presenting an orthogonal supplement to software virtual-
+by the guest kernel or user process. The host, treating the                 ization to bypass the costly address space switch overhead.
+guest as an opaque VM, cannot distinguish a pre-mapped but                  To utilize these opportunities, We propose XGates (§4.1) in
+idle page from one actively in use from page-table operation                ParaCell to bridge the guest user and kernel by adopting
+interfaces. Therefore, the host relies on a reactive mechanism,             such intra-address-space isolation under software virtualiza-
+on-demand paging via secondary faults (e.g., EPT violations                 tion. By unifying the guest’s address space, we eliminate the
+and shadow faults), to discover actual access patterns. This                strict overhead of address space switch between guest user
+creates a fundamental granularity trade-off in host-side mem-               and guest kernel, which is a must for traditional software
+ory management: fine-grained backing preserves memory                       virtualization. We reduce the interfaces between the host
+utilization but incurs per-page secondary fault overhead,                   and container as much as possible and enforce address-space
+while huge-page backing amortizes this overhead but exac-                   isolation on the container-host boundary to prevent potential
+erbates memory fragmentation.                                               jailbreak attack from the container to the host. To further
+                                                                            exploit the optimization opportunities, we design the XGates
+3.2   Architecture Overview                                                 architecture to perform different switch policies for different
+We propose ParaCell, a paravirtualized (PV) secure container                control flow classes (syscalls, self-generated exceptions, and
+runtime that addresses the two root causes. As shown in                     external interrupts) respectively and exploit the optimization
+Figure 3, ParaCell preserves the VM-like secure container                   opportunities on syscall and self-generated exception paths.
+                                                                        5
+                                                                                Wu et al., Yiyang Wu, Xunjie Wang, Jinyu Gu, and Haibo Chen
+
+                                                                                      Self-Generated   External
+                                                                          Syscall                                     U/K Iso      AS Iso      MPK Iso
+Insight #2: Exposing guest kernel memory manage-                                         Interrupt     Interrupt
+
+ment intent to the host enables efficient fine-grained
+                                                                        Guest            Guest             Guest         Syscall            Guest
+container memory management. To address root cause                      User             Kernel            User           Gate              Kernel
+#2, we observe that the guest is not an arbitrary process, as
+it runs a kernel whose page allocator already knows which                                                                 Intr.
+pages will be used and when. Therefore, ParaCell leverages                                                                Gate
+                                                                              Switch Gate
+Pager (§4.2) to bridge this semantic gap by interposing at the
+memory management interface of the guest kernel, where
+pages transition between allocation and free through well-                                                          Interrupt Handler
+                                                                           Interrupt Handler
+defined helper functions. These lifecycle events are synchro-
+nous and intentional, allowing Pager to bind GPA→HPA                         Conventional                          Optimized (XGates)
+
+mappings at allocation time. This enables a new form of
+shadow page table: instead of a lazily synchronized copy             Figure 4. ParaCell’s control-flow-aware domain-switch ar-
+repaired by shadow faults, ParaCell uses it as the direct tar-       chitecture compared with traditional PV switch gates design.
+get of page-table updates. When the guest kernel installs a          U/K: user/kernel. AS: address space. MPK: Memory Protec-
+mapping, Pager translates the GPA to its bound HPA and               tion Keys. Iso: isolation.
+writes the entry directly into the shadow page table. When
+pages are freed, Pager correspondingly unbinds GPA→HPA
+mappings and returns the backing pages to the host. This
+design collapses two-stage translation into a single stage to        GK. Third, external interrupts require host-side acknowledg-
+eliminate secondary faults, and keeps host-allocated memory          ment and routing, so they must remain on the conventional
+tightly aligned with guest usage at 4KB granularity. To fur-         host-mediated path.
+ther reduce context-switch overhead, ParaCell places Pager              Based on this classification, each container owns a pair of
+in kernel mode to reduce per-switch overhead and batches             XGates rather than a single unified switch gate. The Syscall
+related hypercalls to amortize VM-exit overhead.                     Gate runs in hardware ring-3 and implements the fully de-
+                                                                     privileged syscall transition. Its entry points are introduced
+4     Detailed Design                                                by binary rewriting, and its mutable state, including vCPU
+                                                                     context pointers, remains in GK-protected memory. The In-
+4.1   Lightweight Intra-container Isolation
+                                                                     terrupt Gate runs in hardware ring-0 and handles privileged
+Moving towards intra-address-space isolation. Section 2              event delivery; it fast-forwards self-generated exceptions to
+showed that address-space-based guest user–kernel isolation          the guest kernel, while leaving external interrupts to the
+places expensive page-table switches on frequent transition          host-mediated path. This split removes host intervention
+paths. ParaCell instead co-locates the guest user and guest          from the hot syscall path, avoids unnecessary host emula-
+kernel in one address space and separates their data access          tion for internal exceptions, and preserves correctness for
+with MPK-protected domains. Figure 4 illustrates this archi-         hardware-driven events.
+tecture. In the Guest User domain (GU), guest-kernel memory          Deprivileging syscalls. Turning the syscall path into a
+is non-readable and non-writable; in the Guest Kernel do-            deprivileged switch requires replacing the privileged opera-
+main (GK), the kernel has full memory visibility. The design         tions used by a conventional syscall/sysret transition. Tradi-
+invariant is that GU–GK transitions occur only through con-          tional PV designs rely on three such operations: privileged
+trolled gates, which perform the protection-key update and           cr3 updates switch between isolation domains, swapgs-based
+restore the execution context for the target domain. With            bookkeeping locates the vCPU’s guest-kernel context (ker-
+address-space switching removed, frequent user–kernel tran-          nel_gs, kernel_rsp, etc.), and the hardware syscall sequence
+sitions become direct domain switches instead of privileged          provides switch atomicity by suppressing interrupt delivery
+page-table switches.                                                 during the transition.
+Control-flow-aware switch gate design. After eliminat-                  ParaCell replaces these operations with gate-local mech-
+ing address-space switching, the main design question is             anisms. MPK domain updates replace cr3-based isolation
+whether the host must semantically participate in a GU–GK            switches. GK-protected thread-local state replaces swapgs-
+transition. ParaCell classifies transitions into three cases.        based context lookup, so the gate can always recover the
+First, syscalls are explicit software transfer points; once          correct vCPU context within the gate if thread–vCPU affinity
+syscall sites are rewritten to enter a gate, the host no             changes during entries. Explicit virtual interrupt masking
+longer needs to trap on the syscall instruction. Second, self-       replaces hardware syscall atomicity: the gate blocks virq in-
+generated exceptions such as page faults still arrive through        jection during the critical section by emulating cli/sti through
+a privileged trap, but the host does not need to emulate their       the interrupt flag in the vCPU context. Together with syscall-
+guest-kernel handling, so the trap can be fast-forwarded to          frame manipulation, these mechanisms turn a syscall into
+                                                                 6
+ParaCell: Paravirtualized Secure Containers with Lightweight Intra-Container Isolation and Intent-Driven Memory Management
+
+
+a regular gate call that can replace the privileged syscall                 4.2    Fine-Grained Elastic Memory Management
+instruction in rewritten binaries.                                          Guest kernel’s page allocation events, rather than page table
+   During initialization, ParaCell fetches the guest kernel’s               operations, expose the actual memory management intent: a
+syscall handler entry, registers the vCPU thread-local map-                 physical page enters active use only when the guest kernel’s
+ping, and exhaustively rewrites syscall invocation sites into               allocator hands it out and becomes host-reclaimable only
+hijackable hook points. Figure 5 illustrates the Syscall Gate’s             when the allocator takes it back. These allocation and free
+runtime behavior. When an application executes a rewritten                  events (e.g., Linux kernel primitives __get_free_pages and
+syscall site, control is first redirected into the Syscall Gate.            free_pages) precisely indicate when a GPA requires, or no
+                                                                            longer requires, a backing host physical page. By exposing
+                                                                            these events to the host, ParaCell can bind a GPA to an
+                             mov $WRITE, %rax
+            Initialization
+                             syscall
+                                                                            HPA at allocation time and unbind it at free time, replacing
+                                                 Binary
+                                                 Rewrite
+                                                                            reactive, fault-driven two-stage translation with intentional,
+                             mov $WRITE, %rax
+                Runtime      call to_kernel
+                                                                            intent-driven single-stage translation. Specifically, ParaCell
+                                                                            (1) transfers allocation intent through explicit GPA→HPA
+        to_kernel:
+        wrpkru GK
+                                         to_user:
+                                         load __thread_vcpu
+                                                                            (un)binding, (2) amortizes host page handoff with PCP lists,
+        load __thread_vcpu               call pop_regs                      and (3) places Pager in kernel mode to reduce per-switch
+        call para_cli                    call save_kernel_ctx
+        call switch_kernel_ctx           call para_sti
+                                                                            overhead, thereby keeping the page-fault path close to that
+        call push_regs                   wrpkru GU                          of a traditional OS.
+        jmp syscall_wrapper              ret
+                                                                            Pager workflow. To realize this intent-driven model, Para-
+                         syscall_wrapper:                                   Cell introduces the Pager: a dedicated memory mediator that
+                         call do_syscall_64
+                         jmp to_user                                        translates guest allocation/free operations into GPA→HPA
+                                                                            bindings/unbindings on host pages. To handle the pre-
+Figure 5. Runtime Syscall Deprivileging inside the Syscall                  mapped direct mapping, the guest explicitly registers this
+Gate. GK: Guest Kernel. GU: Guest User. para_cli/sti: em-                   region with the Pager so that these PTEs are managed ac-
+ulated cli/sti with vCPU’s interrupt flag manipulation.                     cording to allocator lifecycle events rather than their static
+                                                                            presence. Figure 6 illustrates the workflow for page allocation
+                                                                            and free, as well as page table updates.
+   Inside the gate, to_kernel handles the forward transition.
+                                                                                         Free          Alloc        Page Fault          AS Iso           U/K Iso
+It saves user execution context on the stack, switches to the
+GK memory domain, and issues an emulated cli to block in-                                                               Guest Kernel
+terrupt delivery in the critical section. It then restores guest-
+                                                                                                  PF           Per-CPU Page Lists               Buddy
+kernel context from the registered GK-protected thread-local                      User          Handler                                        Allocator
+state and dispatches to the designated syscall wrapper. When                      Mode           pv_ops
+                                                                                                .mmu
+the syscall wrapper returns, control is relayed back to the                                     .set_pte
+
+gate and to_user performs the reverse transition: it saves                                          # GFP        Full         Empty            Unbound
+                                                                                                                #$Drain            % Reﬁll % Return
+return state, restores user context, re-enables interrupt de-
+                                                                                                                Per-Container Pager
+livery, switches the domain key back to GU, and resumes
+execution at the original user return point. The whole pro-
+                                                                                                      PT
+                                                                                                                " Set
+                                                                                                                         GPA→HPA
+                                                                                                                                      " Map      DM-PT
+
+cess is self-contained and does not rely on privilege-level                   Kernel
+                                                                                                                                    ! Revoke
+switches.                                                                     Mode                 ! Look-up                                       # Alloc
+Interrupt Fastpath. Unlike the Syscall Gate, interrupt han-                                                             ! Record       " Unmap
+dling still enters the ring-0 Interrupt Gate because interrupt                                                    Memory Manager
+delivery is privilege-mediated. At entry, the gate first classi-                                                        Host Kernel
+fies the interrupt source. For self-generated exceptions (e.g.,
+page faults), ParaCell follows a fast path that avoids unnec-               Figure 6. Pager architecture and workflow. PT: page ta-
+essary host-side handling: it switches to GK, restores the                  ble. DM-PT: page table managing direct mapping. GFP:
+required guest-kernel context, and directly forwards con-                   get_free_pages. AS Iso: address space isolation. U/K Iso:
+trol to the guest interrupt handler. For external interrupts,               user/kernel privilege isolation.
+the gate falls back to the conventional host-mediated path,
+because source acknowledgment and routing remain host re-                     On allocation (green in the figure), the Pager allocates
+sponsibilities. This split preserves correctness for hardware-              a backing page from the host ( 1 4 , as explained below),
+driven events while minimizing trap-and-switch overhead                     records the GPA→HPA binding ( 2 ). It also immediately
+on internal interrupt paths.                                                maps the translated HPA into the direct-mapping PTE ( 3 ),
+                                                                        7
+                                                                                  Wu et al., Yiyang Wu, Xunjie Wang, Jinyu Gu, and Haibo Chen
+
+
+as this allocation typically indicates that the guest kernel will         guest–host boundary. Conversely, isolating it within a con-
+soon access the page through the direct mapping, for example              ventional guest component is insufficient, as page table up-
+to clear the page or populate it with file data (e.g., page cache).       dates and TLB maintenance are privileged operations. Para-
+On subsequent mappings (blue) of the same GPA (e.g., into                 Cell therefore colocates Pager with the guest kernel in the
+the page table of a user process), the guest kernel first calls           same address space but places it in kernel mode, separating
+__get_free_pages to obtain a HPA-backed page ( 1 ), after                 them only by user/kernel privilege levels. Privilege-level iso-
+which the Pager looks up the corresponding HPA ( 2 ) and di-              lation is sufficient, as the Pager maintains only per-container
+rectly installs it into the shadow page table ( 3 ), eliminating          private state and contains no global data. By avoiding shared
+further secondary faults. When a guest page is freed (or-                 host-kernel mappings, switching to Pager does not require
+ange), the Pager performs the reverse: it revokes the binding             side-channel mitigations such as KPTI and IBRS.
+from the table ( 2 ), removes the direct mapping ( 3 ) and                Differences from traditional shadow paging. With these
+returns the backing host page to the host ( 1 4 , as explained            mechanisms, a page fault (blue in the figure) remains close
+below). This keeps host-allocated memory tightly aligned                  to the traditional OS handling path: the guest kernel allo-
+with guest usage at 4KB granularity, avoiding the inefficien-             cates a physical page, updates the faulting process’s page
+cies of reclamation mechanisms such as memory ballooning,                 table, and resumes execution. Along this path, Pager adds
+hotplugging, and delayed host-side reclamation.                           only amortized binding overhead and minimal redirection
+Efficient mediation. Efficient mediation of Pager requires                overhead for privileged page-table updates and TLB main-
+reducing two costs: host page handoff between the hyper-                  tenance. Unlike traditional shadow paging, ParaCell does
+visor and the Pager, and switches to the Pager during page-               not trap-and-emulate guest page table writes or maintain an
+table updates. In terms of host page handoff, immediately                 asynchronous shadow page table, thereby avoiding the cost
+binding/unbinding on every allocation/free would still incur              of shadow faults.
+frequent full context switches to the host. Hence, ParaCell               Differences from existing reclamation techniques.
+piggybacks on Linux per-CPU page (PCP) lists, which serve                 Pager differs from previous work in two ways. First, it uses
+as a per-core cache between the fast allocation path and                  guest free events as reclamation signals, immediately reflect-
+the global buddy allocator. PCP lists allow most allocations              ing the guest kernel’s memory management intent. This fine
+and frees to be handled locally without touching the global               timing suits bursty agentic workloads, whose memory de-
+allocator, and only refill from or drain back to the buddy                mand changes quickly across short execution phases (§2.2.2).
+allocator in batches. This design reduces contention on the               Second, metadata-driven techniques (e.g., HyperAlloc [80]
+global allocator and avoids cross-CPU cacheline bouncing.                 and ballooning) scan metadata to detect free pages, tying
+   Specifically, pages in the global buddy allocator remain               reclamation performance to metadata granularity and of-
+unbound and have no backing HPA. Binding and unbinding                    ten requiring coarse amortization. In contrast, Pager avoids
+happen at the boundary between PCP lists and the buddy allo-              metadata scanning entirely while preserving fine granularity.
+cator. As shown in Figure 6, when a PCP list is refilled (green
+in the figure) from the buddy allocator, the Pager obtains a              5   Implementation
+batch of host pages from the hypervisor and pre-binds them
+to the corresponding GPAs; when pages drain (orange) from                 We build ParaCell on PVM [42]. On the host-kernel side,
+a PCP list back to the buddy allocator, the Pager unbinds the             we add 3.9K lines of code (LoC) to support the Pager and
+batch and returns the host pages. Individual allocations (e.g.,           the Interrupt Gate in XGates. On the guest-kernel side, we
+__get_free_pages) and frees on the hot path merely move                   intrusively modify less than 50 LoC to hook interactions
+pre-bound pages in and out of PCP lists without any host                  between the buddy allocator and PCP lists, and add 700 LoC
+involvement. This preserves the mature low-contention PCP                 in a separate file to interact with the Pager and support the
+design, minimizes intrusive allocator changes, and keeps                  interfaces needed for Syscall Gate initialization. In terms
+elasticity off the hot path. Meanwhile, the memory overhead               of XGates’s Syscall Gate, we build a dynamic library with
+of pre-bound but not-yet-allocated pages is negligible, as the            about 200 LoC on top of current syscall hook technique [82]
+size of a single PCP list is typically small, accounting for less         to implement Syscall Gate initialization and runtime logic,
+than 1% of the total memory.                                              including domain switches, interrupt mediation, and syscall
+   After batching host page handoff, ParaCell reduces the                 frame manipulation. Note that the Syscall Gate can also
+remaining switch overhead by choosing where to isolate                    be implemented as a standalone loader in the guest kernel
+the Pager. The isolation boundary of the Pager is therefore               to make it compatible with static binaries and more self-
+another key design choice. Isolating it inside the hypervisor             contained; we leave it as future work.
+would force every mediated operation to cross the expensive               KVM/QEMU integration. To remain compatible with and
+                                                                          reuse the existing KVM/QEMU stack, ParaCell introduces
+                                                                          some implementation-induced overhead. First, ParaCell still
+                                                                          maintains both the guest page table and the shadow page
+                                                                      8
+ParaCell: Paravirtualized Secure Containers with Lightweight Intra-Container Isolation and Intent-Driven Memory Management
+
+
+table. It enables direct HPA installation (§4.2) by hooking                 traditional cloud workloads: syscall-intensive and memory-
+guest page-table writes through Linux pv_ops and adding                     intensive workloads (§6.2). Third, we evaluate both the per-
+22 LoC for hooking page-table reads, which are needed be-                   formance and memory elasticity of agentic workloads (§6.3).
+cause hardware-maintained bits (e.g., Accessed and Dirty)                   Baselines. We compare ParaCell with three baselines: RunV,
+are updated only in the shadow page table. Thus, ParaCell                   PVM [42], and RunC. For memory elasticity experiments, we
+propagates writes to both tables and serves A/D-bits reads                  additionally compare against VirtIO-Balloon, VirtIO-Mem,
+from the shadow table by mapping the shadow page table                      and HyperAlloc [80]. For PVM and RunV, we include huge-
+into the guest kernel as read-only. It also incurs metadata                 page configurations for VM (container) memory. For RunC,
+maintenance overheads (evaluated in § 6.1.1), such as re-                   we enable side-channel mitigations such as KPTI and IBRS,
+verse mappings and shadow page table locking, which a                       since all other VM-based baselines enable these protections
+standalone design could avoid. We leave this optimization                   at the boundary between containers and the host kernel.
+to future work.                                                             Testbed. All evaluations are conducted on an AMD server
+   Second, KVM assumes that a user-space VMM (e.g.,                         with an EPYC-9654 CPU running at 2.4GHz and 125GB of
+QEMU) provides virtual memory regions as guest RAM.                         memory. For nested-cloud experiments, containers are de-
+On guest page faults, it invokes get_user_pages (GUP) to                    ployed inside a hardware-assisted L1 VM configured with
+fault in QEMU-owned pages and install them into the SP-                     32 vCPUs and 64GB of memory. Both the L0 host and the L1
+T/EPT. On release, QEMU reclaims pages via madvise with                     VM run Ubuntu 22.04 with Linux 6.7.0-rc6.
+MADV_DONTNEED, which is costly at fine granularity. ParaCell
+allows Pager to request host pages directly without mapping                 6.1     Microbenchmarks
+them into the QEMU process. If the host later accesses such                 We use microbenchmarks to evaluate ParaCell’s system per-
+memory (e.g., through the host’s VirtIO stacks), the page                   formance and memory-reclamation performance, and ex-
+fault is intercepted and resolved by reusing the existing page              plain the overheads and optimizations relative to the base-
+if already allocated by Pager. This improves normal memory                  lines.
+fault-in and reclamation by avoiding GUP and QEMU page
+table invalidation, respectively.                                           6.1.1 System Benchmarks. We first evaluate system per-
+Limitations. One limitation is that MPK-based isolation                     formance, including syscalls, page faults, and process man-
+can be bypassed through control-flow hijacking or misuse of                 agement, with LMbench [12] microbenchmarks. Table 2
+wrpkru [55], so prior work enhances it with binary rewrit-                  reports raw syscall latency, and Figure 7 summarizes the
+ing [70]. However, binary rewriting can break compatibility                 LMbench results for page faults and process management.
+and interfere with JIT compilation because of x86 variable-
+length instructions [39, 66]. ParaCell therefore retains the                      Table 2. Raw syscall (getpid) latency comparison.
+privileged syscall path as an optional fallback. Meanwhile,
+orthogonal work can strengthen intra-address-space isola-                         System    ParaCell   ParaCell w/o Depr.    PVM   RunV   RunC
+tion, such as using debug registers to monitor sensitive in-                 Latency (ns)     107             256            320    96    404
+structions [39, 74], combining static binary rewriting with
+dynamic traps for binary inspection [70], or reintroduc-
+ing control-flow integrity checks to prevent hijacking at-                  Syscall. ParaCell matches RunV latency, adding only 11ns
+tacks [61]. We leave their integration to future work. Finally,             for syscall hooking and software emulation of deprivileged
+even if the isolation is bypassed, the host, XGates, and Pager              syscall instructions (§4.1). In contrast, PVM incurs ∼210ns
+expose only narrow interfaces (17 calls), which arguably                    overhead from two page-table switches, while RunC adds
+remain sufficient to protect the host. Another limitation is                ∼300ns overhead due to side-channel mitigations. Disabling
+that some applications may already use MPK for their own                    syscall deprivileging in ParaCell (ParaCell w/o Depr.) adds
+purposes [31]. In such cases, ParaCell allows application-                  ∼150ns overhead for the additional privilege-level switch.
+level configuration during deployment to re-enable address-                 Page fault. On bare metal, ParaCell reduces anonymous
+space-based isolation to trade off isolation overhead against               page fault latency by 63.9% compared with PVM, 27.8% com-
+compatibility.                                                              pared with PVM using huge pages, and 31.4% compared with
+                                                                            RunV without huge pages. Under nested virtualization, the
+                                                                            reduction grows to 82.8% compared with PVM and 93.0%
+                                                                            compared with RunV. We next break down the latency of
+6    Evaluation                                                             an anonymous page fault. The total latency of ParaCell is
+This section presents an evaluation of ParaCell along three                 3991ns. The additional KVM metadata maintenance accounts
+axes. First, we measure system and memory-reclamation                       for 771ns (19%) for the PTE of the faulting user process and
+performance with microbenchmarks (§6.1). Second, we test                    466ns (12%) for the direct-mapping PTE, which could be
+whether these gains carry over to applications along two                    mitigated as discussed in §5. The raw set_pte accounts for
+                                                                        9
+                                                                               Wu et al., Yiyang Wu, Xunjie Wang, Jinyu Gu, and Haibo Chen
+
+
+                                                                       or hot-unplug, because these designs rely on a host-initiated
+                                                                       operation to discover and remove reclaimable memory. For
+                                                                       HyperAlloc, we include a regular-page setup by disabling
+                                                                       huge-page mapping for container memory, which emulates
+                                                                       fine granularity with zero additional metadata overhead.
+
+
+
+
+Figure 7. System benchmark latency on LMbench. 2M: 2MB
+huge-page mapping for VM (container) memory. NST: nested
+virtualization.
+
+
+275ns (7%), thanks to the lightweight switch overhead to
+Pager. The batched GPA→HPA binding (plus HPA alloca-                   Figure 8. Memory reclamation throughput shown in log-
+tion) is amortized to 175ns (4%) per page. Finally, XGates             arithmic scale. 2M: 2MB huge-page mapping for VM (con-
+reduces the GU/GK switch latency to 1622ns, approaching                tainer) memory.
+the RunV result of 1028ns.
+   ParaCell reduces the fault latency of copy-on-write (CoW)              Figure 8 shows that ParaCell substantially improves fine-
+by up to 58.8% over PVM and 17.1% over RunV, and by 85.0%              grained reclamation. Compared with regular-page setups,
+and 92.3% under nested virtualization, respectively. Segmen-           ParaCell improves reclamation throughput by 10.7× over
+tation faults do not require a secondary fault for host paging,        RunV and 26.2× over PVM with VirtIO-Balloon, and by 1.3×
+so ParaCell improves over PVM by up to 39.6% on bare metal             over regular-page HyperAlloc. Ballooning pays repeated
+and 72.2% under nested virtualization by eliminating page-             guest–host transitions and EPT/SPT invalidations at 4KiB
+table switches. However, it remains slower than RunV due               granularity. HyperAlloc avoids the VirtIO path by sharing
+to modest page-fault forwarding overhead. This slowdown                guest allocator state with QEMU, but it still performs a host-
+is acceptable because segmentation faults are typically infre-         side scan and per-page invalidation, whereas ParaCell ex-
+quent or followed by additional user-level paging, making              poses page deallocation directly on the guest free path.
+the overhead unlikely to dominate end-to-end performance.                 Compared with huge-page setups, ParaCell trades some
+Process management. On bare metal, ParaCell incurs                     raw throughput for fine-grained reclaimability. Huge-page
+12.5%–14.4% and −3.5%–26.1% slowdowns over PVM on                      ballooning and VirtIO-Mem improve reclamation through-
+fork/exit and fork/execve, respectively. This is because               put by operating on 2MB chunks, reaching 42.6GB/s and
+ParaCell delegates page-table writes during page-table                 24.2GB/s on RunV, respectively. However, VirtIO-Mem is
+cloning to Pager through pv_ops, whereas PVM optimizes                 primarily designed for VM expansion; shrinking can reliably
+this path by allowing direct page-table writes and deferring           reclaim only memory from the movable zone, often at the
+GPT-to-SPT synchronization to shadow faults. Compared                  cost of memory compaction. HyperAlloc reaches 56.8GB/s
+with RunV, ParaCell incurs up to a 3.6× slowdown because               because each operation covers a larger block, but all these
+its exit path performs KVM metadata maintenance due to a               huge-page setups can leave partially used 2MB chunks unre-
+current implementation limitation (§5). We argue that this             claimable at the application’s allocation granularity (§6.3).
+slowdown is acceptable because ParaCell accelerates the
+subsequent on-demand paging compared with both PVM                     6.2   Traditional Cloud Workloads
+and RunV. The trend is similar under nested virtualization,            We next evaluate if the microbenchmark gains translate to
+since process management incurs infrequent VM exits.                   traditional cloud workloads. We organize them into two
+                                                                       groups: syscall-intensive and memory-intensive workloads.
+6.1.2 Memory Reclamation. §6.1.1 evaluates the cost of
+faulting pages into a container. This section evaluates how            6.2.1 Syscall-Intensive Workloads. We first run sqlite-
+quickly a system can reclaim container memory to reduce                bench [3] on SQLite [22] to measure end-to-end latency
+its host footprint. We measure reclamation throughput over             dominated primarily by frequent file syscalls. To isolate stor-
+an 8GB region. In ParaCell, reclamation consists only of               age I/O, we place database artifacts on an in-memory file
+guest-kernel page deallocation, because physical pages are             system. Figure 9 reports both bare-metal and nested results.
+already exposed to the host at the time they are freed. In               For small fill/overwrite workloads, where syscall over-
+the other baselines, reclamation also includes the host-side           head dominates, ParaCell reduces latency by up to 28.8%
+shrink work, such as HyperAlloc shrinking, balloon inflation,          compared with PVM and matches RunV latency, benefiting
+                                                                  10
+ParaCell: Paravirtualized Secure Containers with Lightweight Intra-Container Isolation and Intent-Driven Memory Management
+
+
+                                                                            flushes the TLB directly via Pager, avoiding this overhead.
+                                                                            Except for dedup, ParaCell reduces latency by up to 11.9%
+                                                                            compared with RunV, while incurring at most 5.4% and 2.9%
+                                                                            overhead relative to RunV (2M) and RunC, respectively. The
+                                                                            exception is again dedup, because RunV does not return
+                                                                            unmapped memory to the host, and RunC does not require
+                                                                            an additional kernel direct-mapping TLB flush. Under nested
+                                                                            virtualization, the same trend becomes more pronounced,
+                                                                            achieving up to 78.5% latency reduction.
+Figure 9. Normalized latency on sqlite-bench. 2M: 2MB                       TLB-miss-intensive workloads. ParaCell, PVM, and RunC
+huge-page mapping for VM (container) memory. NST: nested                    show similar performance on the TLB-miss-intensive work-
+virtualization.                                                             loads in both settings. RunV incurs up to 50% slowdown over
+                                                                            the others due to its two-dimensional page walks.
+from lightweight intra-container isolation. For larger batched
+operations, where page fault overhead becomes more visible,                 6.3   Agentic Workloads
+ParaCell reduces latency by up to 33.5% and 14.9% compared                  We evaluate ParaCell on end-to-end agentic workloads using
+with PVM and RunV, respectively. On the largest batch (de-                  two complementary benchmarks: SkillsBench [50] (applying
+noted by the 100K suffix), ParaCell reduces latency by up to                agent skills) and SWE-bench [47] (solving software issues).
+58.8% and 38.9% over PVM and RunV, respectively. Similar to                 SkillsBench provides deterministic ground-truth scripts for
+the slowdown shown in §6.1.1, RunC shows significant slow-                  each agent skill, enabling accurate end-to-end latency mea-
+down even compared with PVM on small and larger-batch                       surements free of agent nondeterminism. We drive SWE-
+workloads, indicating that the overhead of side-channel miti-               bench with Claude Code [6] on Sonnet 4.6 [7] to obtain a
+gations in the kernel can potentially dominate the end-to-end               genuine agent workload. We empirically find that memory
+latency of applications if not treated properly. Nested con-                elasticity is largely insensitive to agent-level nondetermin-
+figurations further amplify the benefit because page faults                 ism. We therefore use Claude-Code-driven SWE-bench for
+contribute a larger share of end-to-end time. ParaCell reduces              memory elasticity experiments, while restricting latency
+latency by up to 69.7% and 89.6% compared with PVM and                      measurements to deterministic SkillsBench.
+RunV, respectively.                                                         Performance. We randomly sample multiple SkillsBench
+6.2.2 Memory-Intensive Workloads. To demonstrate                            tasks and report normalized latency. Figure 11 shows the
+that the microbenchmark improvements of ParaCell gen-                       latency of tool execution, while user-perceived completion
+eralize to realistic memory-intensive workloads, we next                    time also includes LLM inference and agent initialization [85].
+evaluate applications that are intensive in page faults and                 Following its study, tool execution accounts for ∼40% of to-
+TLB misses, drawn from PARSEC [84] and vmitosis [60].                       tal completion time. We therefore estimate user-perceived
+                                                                            latency by adding the remaining 60% for LLM inference and
+                                                                            agent initialization to the measured tool-execution time, and
+                                                                            report all numbers below in this form. In the bare-metal
+                                                                            setting, ParaCell reduces latency by 5.7% and 3.4% on geo-
+                                                                            metric mean, and by up to 15.1% and 8.3%, compared with
+                                                                            PVM and PVM (2M), respectively. Compared with RunV and
+                                                                            RunV (2M), ParaCell incurs geometric-mean slowdowns of
+                                                                            3.7% and 6.5%, and maximum slowdowns of 8.3% and 13.8%,
+                                                                            respectively. The results reflect the worst case for ParaCell,
+                                                                            since these baselines never reclaim guest memory, whereas
+Figure 10. Normalized latency on memory-intensive work-                     ParaCell delivers fine-grained reclamation as reported be-
+loads. 2M: 2MB huge-page mapping for VM (container) mem-                    low. Under nested virtualization, ParaCell outperforms all
+ory. NST: nested virtualization.                                            baselines, reducing geometric-mean latency by 26.2%, 21.9%,
+                                                                            24.8%, and 1% over PVM, PVM (2M), RunV, and RunV (2M),
+Page-fault-intensive workloads. As shown in Figure 10,                      respectively.
+in the bare-metal setting, ParaCell reduces latency by up to                Memory elasticity. We sample tasks from SWE-bench mul-
+46% compared with PVM and by up to 39% compared with                        tiple times and profile memory at 1Hz during each run to
+PVM (2M). The larger gap on dedup arises from frequent                      track both the host-allocated memory and the memory truly
+memory unmaps that trigger TLB flushes. In PVM, these                       consumed by the guest at 4KB granularity. We define mem-
+cause additional TLB-emulation VM exits, whereas ParaCell                   ory overhead as the extra host-allocated memory relative
+                                                                       11
+                                                                               Wu et al., Yiyang Wu, Xunjie Wang, Jinyu Gu, and Haibo Chen
+
+
+                                                                      a hardware–software co-design to reduce the TCB size for
+                                                                      each lightweight TEE enclave. UnderBridge [34] harmonizes
+                                                                      microkernel services within a single address space and re-
+                                                                      duces the IPC switch overhead between each microkernel
+                                                                      service using PKS. CKI [66] extends the hardware feature to
+                                                                      create an isolated intra-kernel domain for guest and host ker-
+                                                                      nels without relying on hardware virtualization, optimizing
+                                                                      the performance of nested virtualization.
+Figure 11. Normalized end-to-end latency on SkillsBench.                 In contrast, ParaCell reintroduces intra-address-space iso-
+2M: 2MB huge-page mapping for VM (container) memory.                  lation into paravirtualized containers to reduce the domain
+NST: nested virtualization.                                           switch overhead between the guest kernel and the guest user
+                                                                      while still preserving the isolation invariants.
+to the guest’s truly in-use 4KB memory. On SkillsBench,               VM memory elasticity. Prior VM memory-elasticity mech-
+ParaCell’s host-allocated memory closely tracks guest in-use          anisms differ mainly in how they bridge the guest–host
+memory throughout the execution, resulting in only 0.2%               semantic gap around reclaimable pages. Classic memory
+mean memory overhead. In contrast, HyperAlloc suffers                 ballooning [63, 75] reclaims memory by inflating a guest-
+from internal fragmentation within huge pages, leading to             side balloon driver and letting the guest OS choose which
+35.8% mean memory overhead. Similar trends can be ob-                 pages to surrender. This preserves guest policy, but recla-
+served in SWE-bench results. Figure 12 shows the distribu-            mation still depends on explicit host–guest coordination
+tion of normalized execution time across different memory             and can react poorly to bursty demand. VirtIO-Mem [40]
+overhead levels. ParaCell achieves a mean memory overhead             resizes VMs through memory hotplug and hot-unplug, but it
+of only 0.4%, with nearly all execution time concentrated             works at coarse block granularity. Hyperupcalls [26] reduces
+below 1% memory overhead. In contrast, HyperAlloc incurs              coordination overhead by letting the hypervisor execute
+a mean overhead of 15.9% and spends a noticeable execution            guest-supplied logic to inspect allocator state directly, while
+time fraction (2%) above 50% memory overhead.                         V-Probe [77] and HyperAlloc [80] push this direction fur-
+                                                                      ther through active page-metadata inspection and allocator
+                                                                      co-design. Orthogonally, transcendent memory [56] uses
+                                                                      host memory as auxiliary swap or cache space and requires
+                                                                      explicit adaptation to the guest programming model.
+                                                                         In contrast, ParaCell places elasticity directly on the guest
+                                                                      free path and targets page-granular reclaim with low bound-
+                                                                      ary overhead, without relying on balloon inflation, coarse
+                                                                      hot-unplug units, or wholesale allocator replacement.
+                                                                      Nested virtualization optimizations. Nested virtualiza-
+                                                                      tion has long suffered from excessive world switches between
+Figure 12. Distribution of execution time fraction across             the bare-metal hypervisor (L0), guest hypervisor (L1), and
+host-allocated memory overhead levels during SWE-bench                nested guest (L2) [27], and prior work attacks this cost along
+runs, shown at two x-axis scales to expose both the low (left)        four complementary directions. Some work [52, 71] relies on
+and high (right) overhead regions.                                    specialized hardware to reduce the frequency or cost of VM
+                                                                      exits, but these features are not widely available. DVH [53]
+                                                                      builds an I/O fast path that exposes L0 virtual devices di-
+7   Other Related Work                                                rectly to L2, removing L1 from the I/O critical path at the
+                                                                      cost of surrendering L1’s policy enforcement on L2 I/O. Hy-
+Intra-address-space isolation. Intra-address-space isola-             perTurtle [86] employs code offloading, executing selected
+tion is a technique to achieve lightweight isolation across           L1 logic as verified eBPF programs inside L0 to reduce world
+different components within a single address space. Various           switches, but is constrained by eBPF expressiveness. Other
+systems leverage existing hardware protection primitives to           work [28, 79, 83] sidesteps nesting altogether by eliminating
+implement such isolation for different purposes. ERIM [70]            or repurposing L1, at the cost of reduced hypervisor-level
+and Hodor [39] focus on protecting userspace data-plane               flexibility and orchestration.
+libraries from calling applications and each other without               ParaCell adopts a paravirtualization design and uses MPK
+requiring device-level resource isolation. BULKHEAD [36]              to accelerate guest privilege transitions, avoiding the costs
+targets kernel compartmentalization, isolating untrusted              caused by missing hardware virtualization in nested clouds.
+kernel components from each other using PKS. LightEn-
+clave [35] extends this idea to the enclave level and proposes
+                                                                 12
+ParaCell: Paravirtualized Secure Containers with Lightweight Intra-Container Isolation and Intent-Driven Memory Management
+
+
+Container optimizations for specific workloads. A large                               [16] Playwright mcp. https://playwright.dev/mcp/introduction.
+body of work optimizes the container stack for different                              [17] Quickly deploy hermes agent on the cloud. https://www.tencentcloud.
+workload classes. For serverless functions, where cold-start                               com/act/pro/hermesagent.
+                                                                                      [18] runc. https://github.com/opencontainers/runc.
+latency and deployment density dominate, prior work slims                             [19] runv. https://github.com/hyperhq/runv.
+down the container and microVM [24, 51, 59] stacks, or accel-                         [20] Sandboxing. https://docs.openclaw.ai/gateway/sandboxing.
+erates instantiation via checkpoint restore [25, 32], RDMA-                           [21] Site isolation design document.            https://www.chromium.org/
+based remote fork [78], and cross-function environment                                     developers/design-documents/site-isolation/.
+sharing [43, 64]. For microservices with microsecond-scale                            [22] Sqlite. https://www.sqlite.org/.
+                                                                                      [23] The systrap platform. https://github.com/google/gvisor/blob/master/
+tail-latency targets, prior work reduces per-invocation over-                              pkg/sentry/platform/systrap/README.md.
+heads through microsecond-scale scheduling [46], eBPF-                                [24] Alexandru Agache, Marc Brooker, Alexandra Iordache, Anthony
+based shared-memory dataplanes [62], and kernel-bypass                                     Liguori, Rolf Neugebauer, Phil Piwonka, and Diana-Maria Popa. Fire-
+I/O [33]. For LLM agents, AgentCgroup [85] characterizes                                   cracker: Lightweight virtualization for serverless applications. In 17th
+and controls OS-level resource usage of agent processes,                                   USENIX symposium on networked systems design and implementation
+                                                                                           (NSDI 20), pages 419–434, 2020.
+exposing gaps in existing cgroup-based isolation.                                     [25] Ahmed Alquraan, Abdelrahman Baba, Rafael Mendes da Silva, Sameh
+   ParaCell improves general container mechanisms, partic-                                 Elnikety, Paul Batum, Yan Chen, Hamid Henry Safi, Seth Fine, and
+ularly performance-critical boundary crossings and memory                                  Samer Al-Kiswany. Drops: Managing serverless resource pools in mi-
+elasticity, in a workload-agnostic manner, creating opportu-                               crosoft azure functions. In Proceedings of the 21st European Conference
+                                                                                           on Computer Systems, pages 1281–1297, 2026.
+nities to incorporate existing optimizations.
+                                                                                      [26] Nadav Amit and Michael Wei. The design and implementation of
+                                                                                           hyperupcalls. In 2018 USENIX Annual Technical Conference (USENIX
+8    Conclusion                                                                            ATC 18), pages 97–112, 2018.
+ParaCell is a paravirtualized secure container runtime. Para-                         [27] Muli Ben-Yehuda, Michael D Day, Zvi Dubitzky, Michael Factor, Nadav
+Cell enables lightweight intra-container isolation with MPK                                Har’El, Abel Gordon, Anthony Liguori, Orit Wasserman, and Ben-Ami
+                                                                                           Yassour. The turtles project: Design and implementation of nested
+and fine-grained memory elasticity by exposing guest-kernel                                virtualization. In 9th USENIX Symposium on Operating Systems Design
+memory-management intent. Evaluation shows promising                                       and Implementation (OSDI 10), 2010.
+performance and memory utilization across traditional cloud                           [28] Stella Bitchebe and Alain Tchana. Out of hypervisor (ooh): efficient
+workloads and emerging agent workloads. ParaCell points                                    dirty page tracking in userspace using hardware virtualization features.
+                                                                                           In SC22: International Conference for High Performance Computing,
+to a broader design direction in which the host cooperates
+                                                                                           Networking, Storage and Analysis, pages 1–14. IEEE, 2022.
+with guest-kernel abstractions, rather than inferring them                            [29] Silas Boyd-Wickizer, Austin T Clements, Yandong Mao, Aleksey
+indirectly, to build secure runtimes that are both faster and                              Pesterev, M Frans Kaashoek, Robert Morris, and Nickolai Zeldovich.
+more memory-efficient.                                                                     An analysis of linux scalability to many cores. In 9th USENIX Sym-
+                                                                                           posium on Operating Systems Design and Implementation (OSDI 10),
+References                                                                                 2010.
+                                                                                      [30] Xiaohu Chai, Keyang Hu, Jianfeng Tan, Tiwei Bie, Guotao Tan, Tianyu
+ [1] Computer use.        https://platform.openai.com/docs/guides/tools-                   Zhou, Anqi Shen, Dawei Shen, Xinyao Yang, Xin Chen, et al. Skernel:
+     computer-use.                                                                         An elastic and efficient secure container system at scale with a split-
+ [2] The container security platform. https://gvisor.dev/.                                 kernel architecture. In Proceedings of the 21st European Conference on
+ [3] db_bench_sqlite3.cc. https://github.com/google/leveldb/blob/main/
+                                                                                           Computer Systems, pages 605–623, 2026.
+     benchmarks/db_bench_sqlite3.cc.                                                  [31] Xiangdong Chen, Zhaofeng Li, Tirth Jain, Vikram Narayanan, and
+ [4] Deploy openclaw in seconds. https://www.alibabacloud.com/en/                          Anton Burtsev. Limitations and opportunities of modern hardware
+     campaign/ai-openclaw.                                                                 isolation mechanisms. In 2024 USENIX Annual Technical Conference
+ [5] Hermes agent. https://hermes-agent.nousresearch.com/.                                 (USENIX ATC 24), pages 349–368, 2024.
+ [6] How claude code works. https://code.claude.com/docs/en/how-                      [32] Dong Du, Tianyi Yu, Yubin Xia, Binyu Zang, Guanglu Yan, Cheng-
+     claude-code-works.                                                                    gang Qin, Qixuan Wu, and Haibo Chen. Catalyzer: Sub-millisecond
+ [7] Introducing claude sonnet 4.6. https://www.anthropic.com/news/                        startup for serverless computing with initialization-less booting. In
+     claude-sonnet-4-6.                                                                    Proceedings of the Twenty-Fifth International Conference on Architec-
+ [8] Introducing site isolation in firefox. https://blog.mozilla.org/security/             tural Support for Programming Languages and Operating Systems, pages
+     2021/05/18/introducing-site-isolation-in-firefox/.                                    467–481, 2020.
+ [9] Introducing upgrades to codex. https://openai.com/index/introducing-             [33] Joshua Fried, Gohar Irfan Chaudhry, Enrique Saurez, Esha Choukse,
+     upgrades-to-codex/.                                                                   Íñigo Goiri, Sameh Elnikety, Rodrigo Fonseca, and Adam Belay. Mak-
+[10] Kata containers. https://katacontainers.io/.                                          ing kernel bypass practical for the cloud with junction. In 21st USENIX
+[11] Let claude use your computer from the cli. https://code.claude.com/                   Symposium on Networked Systems Design and Implementation (NSDI
+     docs/en/computer-use.                                                                 24), pages 55–73, 2024.
+[12] Lmbench - tools for performance analysis.              https://lmbench.          [34] Jinyu Gu, Xinyue Wu, Wentai Li, Nian Liu, Zeyu Mi, Yubin Xia, and
+     sourceforge.net/.                                                                     Haibo Chen. Harmonizing performance and isolation in microker-
+[13] Multi-process architecture. https://www.chromium.org/developers/                      nels with efficient intra-kernel isolation and communication. In 2020
+     design-documents/multi-process-architecture/.                                         USENIX Annual Technical Conference (USENIX ATC 20), pages 401–417,
+[14] Openclaw - deploy openclaw in seconds. https://www.tencentcloud.                      2020.
+     com/act/pro/intl-openclaw.
+[15] Openclaw overview. https://docs.openclaw.ai/.
+                                                                                 13
+                                                                                                Wu et al., Yiyang Wu, Xunjie Wang, Jinyu Gu, and Haibo Chen
+
+
+[35] Jinyu Gu, Bojun Zhu, Mingyu Li, Wentai Li, Yubin Xia, and Haibo                      high-concurrency startup in serverless computing. In 2022 USENIX
+     Chen. A {Hardware-Software} co-design for efficient {Intra-Enclave}                  Annual Technical Conference (USENIX ATC 22), pages 53–68, 2022.
+     isolation. In 31st USENIX Security Symposium (USENIX Security 22),              [52] Jin Tack Lim, Christoffer Dall, Shih-Wei Li, Jason Nieh, and Marc
+     pages 3129–3145, 2022.                                                               Zyngier. Neve: Nested virtualization extensions for arm. In Proceedings
+[36] Yinggang Guo, Zicheng Wang, Weiheng Bai, Qingkai Zeng, and                           of the 26th Symposium on Operating Systems Principles, pages 201–217,
+     Kangjie Lu. Bulkhead: secure, scalable, and efficient kernel compart-                2017.
+     mentalization with pks. arXiv preprint arXiv:2409.09606, 2024.                  [53] Jin Tack Lim and Jason Nieh. Optimizing nested virtualization perfor-
+[37] Md Sadun Haq, Thien Duc Nguyen, Ali Şaman Tosun, Franziska                           mance using direct virtual hardware. In Proceedings of the Twenty-Fifth
+     Vollmer, Turgay Korkmaz, and Ahmad-Reza Sadeghi. Sok: A com-                         International Conference on Architectural Support for Programming
+     prehensive analysis and evaluation of docker container attack and                    Languages and Operating Systems, pages 557–574, 2020.
+     defense mechanisms. In 2024 IEEE symposium on security and privacy              [54] Congyu Liu, Sishuai Gong, and Pedro Fonseca. Kit: Testing os-level
+     (SP), pages 4573–4590. IEEE, 2024.                                                   virtualization for functional interference bugs. In Proceedings of the
+[38] Yi He, Roland Guo, Yunlong Xing, Xijia Che, Kun Sun, Zhuotao Liu,                    28th ACM International Conference on Architectural Support for Pro-
+     Ke Xu, and Qi Li. Cross container attacks: The bewildered eBPF on                    gramming Languages and Operating Systems, Volume 2, pages 427–441,
+     clouds. In 32nd USENIX Security Symposium (USENIX Security 23).                      2023.
+     USENIX Association, 2023.                                                       [55] Shiqi Liu, Yongpeng Gao, Mingyang Zhang, and Jie Wang. Nanozone:
+[39] Mohammad Hedayati, Spyridoula Gravani, Ethan Johnson, John                           Scalable, efficient, and secure memory protection for arm cca. arXiv
+     Criswell, Michael L Scott, Kai Shen, and Mike Marty. Hodor:{Intra-                   preprint arXiv:2506.07034, 2025.
+     Process} isolation for {High-Throughput} data plane libraries. In               [56] Dan Magenheimer, Chris Mason, Dave McCracken, and Kurt Hackel.
+     2019 USENIX Annual Technical Conference (USENIX ATC 19), pages                       Transcendent memory and linux. In Proceedings of the Linux Sympo-
+     489–504, 2019.                                                                       sium, pages 191–200, 2009.
+[40] David Hildenbrand and Martin Schulz. Virtio-mem: Paravirtual-                   [57] Kaesi Manakkal, Nathan Daughety, Marcus Pendleton, and Hui
+     ized memory hot (un) plug. In Proceedings of the 17th ACM SIG-                       Lu. {LITESHIELD}: Secure containers via lightweight, composable
+     PLAN/SIGOPS International Conference on Virtual Execution Environ-                   userspace {𝜇Kernel} services. In 2025 USENIX Annual Technical Con-
+     ments, pages 1–14, 2021.                                                             ference (USENIX ATC 25), pages 973–985, 2025.
+[41] Jörg Hoffmann. Everything you always wanted to know about plan-                 [58] Filipe Manco, Costin Lupu, Florian Schmidt, Jose Mendes, Simon Kuen-
+     ning: (but were afraid to ask). In Annual Conference on Artificial                   zer, Sumit Sati, Kenichi Yasukata, Costin Raiciu, and Felipe Huici. My
+     Intelligence, pages 1–13. Springer, 2011.                                            vm is lighter (and safer) than your container. In Proceedings of the
+[42] Hang Huang, Jiangshan Lai, Jia Rao, Hui Lu, Wenlong Hou, Hang Su,                    26th Symposium on Operating Systems Principles, pages 218–233, 2017.
+     Quan Xu, Jiang Zhong, Jiahao Zeng, Xu Wang, et al. Pvm: Efficient               [59] Edward Oakes, Leon Yang, Dennis Zhou, Kevin Houck, Tyler Harter,
+     shadow paging for deploying secure containers in cloud-native envi-                  Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-Dusseau. SOCK:
+     ronment. In Proceedings of the 29th Symposium on Operating Systems                   Rapid task provisioning with serverless-optimized containers. In 2018
+     Principles, pages 515–530, 2023.                                                     USENIX Annual Technical Conference (USENIX ATC 18), pages 57–70.
+[43] Jialiang Huang, Mingxing Zhang, Teng Ma, Zheng Liu, Sixing Lin,                      USENIX Association, 2018.
+     Kang Chen, Jinlei Jiang, Xia Liao, Yingdi Shan, Ning Zhang, Mengting            [60] Ashish Panwar, Reto Achermann, Arkaprava Basu, Abhishek Bhat-
+     Lu, Tao Ma, Haifeng Gong, and Yongwei Wu. TrEnv: Transparently                       tacharjee, K Gopinath, and Jayneel Gandhi. Fast local page-tables for
+     share serverless execution environments across different functions                   virtualized numa servers with vmitosis. In Proceedings of the 26th ACM
+     and nodes. In Proceedings of the ACM SIGOPS 30th Symposium on                        International Conference on Architectural Support for Programming
+     Operating Systems Principles (SOSP ’24). ACM, 2024.                                  Languages and Operating Systems, pages 194–210, 2021.
+[44] Intel. Memory protection keys for userspace, 2019.                              [61] Soyeon Park, Sangho Lee, Wen Xu, Hyungon Moon, and Taesoo Kim.
+[45] Omar Jarkas, Ryan Ko, Naipeng Dong, and Redowan Mahmud. A                            libmpk: Software abstraction for intel memory protection keys (intel
+     container security survey: Exploits, attacks, and defenses. ACM Com-                 {MPK}). In 2019 USENIX Annual Technical Conference (USENIX ATC
+     puting Surveys, 57(7):1–36, 2025.                                                    19), pages 241–254, 2019.
+[46] Zhipeng Jia and Emmett Witchel. Nightcore: efficient and scalable               [62] Shixiong Qi, Leslie Monis, Ziteng Zeng, Ian-chin Wang, and KK Ra-
+     serverless computing for latency-sensitive, interactive microservices.               makrishnan. Spright: extracting the server from serverless computing!
+     In Proceedings of the 26th ACM international conference on architectural             high-performance ebpf-based event-driven, shared-memory process-
+     support for programming languages and operating systems, pages 152–                  ing. In Proceedings of the ACM SIGCOMM 2022 Conference, pages
+     166, 2021.                                                                           780–794, 2022.
+[47] Carlos E Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei,           [63] Joel H Schopp, Keir Fraser, and Martine J Silbermann. Resizing memory
+     Ofir Press, and Karthik Narasimhan. Swe-bench: Can language models                   with balloons and hotplug. In Proceedings of the Linux Symposium,
+     resolve real-world github issues? arXiv preprint arXiv:2310.06770, 2023.             volume 2, pages 313–319, 2006.
+[48] Avi Kivity, Yaniv Kamay, Dor Laor, Uri Lublin, and Anthony Liguori.             [64] Carlos Segarra, Pedro Henrique Penna, Enrique Saurez, Íñigo Goiri,
+     kvm: the linux virtual machine monitor. In Proceedings of the Linux                  Peter Pietzuch, Shan Lu, and Rodrigo Fonseca. Nanvix: A multikernel
+     symposium, volume 1, pages 225–230. Dttawa, Dntorio, Canada, 2007.                   os design for high-density serverless deployments. arXiv preprint
+[49] Chuandong Li, Sai Sha, Yangqing Zeng, Xiran Yang, Yingwei Luo,                       arXiv:2604.11669, 2026.
+     Xiaolin Wang, and Zhenlin Wang. Fhpm: Fine-grained huge page                    [65] Zhiming Shen, Zhen Sun, Gur-Eyal Sela, Eugene Bagdasaryan,
+     management for virtualization. arXiv preprint arXiv:2307.10618, 2023.                Christina Delimitrou, Robbert Van Renesse, and Hakim Weatherspoon.
+[50] Xiangyi Li, Wenbo Chen, Yimin Liu, Shenghan Zheng, Xiaokun Chen,                     X-containers: Breaking down barriers to improve performance and iso-
+     Yifeng He, Yubo Li, Bingran You, Haotian Shen, Jiankai Sun, et al.                   lation of cloud-native containers. In Proceedings of the Twenty-Fourth
+     Skillsbench: Benchmarking how well agent skills work across diverse                  International Conference on Architectural Support for Programming
+     tasks. arXiv preprint arXiv:2602.12670, 2026.                                        Languages and Operating Systems, pages 121–135, 2019.
+[51] Zijun Li, Jiagan Cheng, Quan Chen, Eryu Guan, Zizheng Bian, Yi Tao,             [66] Jiacheng Shi, Yang Yu, Jinyu Gu, and Yubin Xia. A hardware-software
+     Bin Zha, Qiang Wang, Weidong Han, and Minyi Guo. {RunD}: A                           co-design for efficient secure containers. In Proceedings of the Twentieth
+     lightweight secure container runtime for high-density deployment and                 European Conference on Computer Systems, pages 1229–1245, 2025.
+
+                                                                                14
+ParaCell: Paravirtualized Secure Containers with Lightweight Intra-Container Isolation and Intent-Driven Memory Management
+
+
+[67] Michael M Swift et al. Locked in, leaked out: Measuring isolation via                for performance and confidentiality in the cloud. In 2023 IEEE 16th
+     kernel locks. arXiv preprint arXiv:2507.21248, 2025.                                 International Conference on Cloud Computing (CLOUD), pages 275–281.
+[68] Olufogorehan Tunde-Onadele, Jingzhu He, Ting Dai, and Xiaohui Gu.                    IEEE, 2023.
+     A study on container vulnerability exploit detection. In 2019 ieee              [84] Xusheng Zhan, Yungang Bao, Christian Bienia, and Kai Li. Parsec3.
+     international conference on cloud engineering (IC2E), pages 121–127.                 0: A multicore benchmark suite with network stacks and splash-2x.
+     IEEE, 2019.                                                                          ACM SIGARCH Computer Architecture News, 44(5):1–16, 2017.
+[69] Rich Uhlig, Gil Neiger, Dion Rodgers, Amy L Santoni, Fernando CM                [85] Yusheng Zheng, Jiakun Fan, Quanzhi Fu, Yiwei Yang, Wei Zhang,
+     Martins, Andrew V Anderson, Steven M Bennett, Alain Kagi, Felix H                    and Andi Quinn. Agentcgroup: Understanding and controlling os
+     Leung, and Larry Smith. Intel virtualization technology. Computer,                   resources of ai agents. arXiv preprint arXiv:2602.09345, 2026.
+     38(5):48–56, 2005.                                                              [86] Ori Ben Zur, Jakob Krebs, Shai Aviram Bergman, and Mark Silber-
+[70] Anjo Vahldiek-Oberwagner, Eslam Elnikety, Nuno O. Duarte, Michael                    stein. Accelerating nested virtualization with {HyperTurtle}. In
+     Sammler, Peter Druschel, and Deepak Garg. Erim: secure, efficient in-                2025 USENIX Annual Technical Conference (USENIX ATC 25), pages
+     process isolation with protection keys (mpk). In Proceedings of the 28th             987–1002, 2025.
+     USENIX Conference on Security Symposium, SEC’19, page 1221–1238,
+     USA, 2019. USENIX Association.
+[71] Lluís Vilanova, Nadav Amit, and Yoav Etsion. Using smt to accel-
+     erate nested virtualization. In Proceedings of the 46th International
+     Symposium on Computer Architecture, pages 750–761, 2019.
+[72] A Virtualization. Secure virtual machine architecture reference man-
+     ual. AMD Publication, 33047, 2005.
+[73] Simon Volpert, Sascha Winkelhofer, Jörg Domaschka, and Stefan Wes-
+     ner. Detecting noisy neighbors in cpu-isolated cgroups environments.
+     In Proceedings of the 16th ACM/SPEC International Conference on Per-
+     formance Engineering, ICPE ’25, page 224–231, New York, NY, USA,
+     2025. Association for Computing Machinery.
+[74] Alexios Voulimeneas, Jonas Vinck, Ruben Mechelinck, and Stijn Vol-
+     ckaert. You shall not (by) pass! practical, secure, and fast pku-based
+     sandboxing. In Proceedings of the Seventeenth European Conference on
+     Computer Systems, pages 266–282, 2022.
+[75] Carl A Waldspurger. Memory resource management in vmware esx
+     server. ACM SIGOPS Operating Systems Review, 36(SI):181–194, 2002.
+[76] Kun Wang, Song Wu, Kun Suo, Yijie Liu, Hang Huang, Zhuo Huang,
+     and Hai Jin. Characterizing and optimizing kernel resource isolation
+     for containers. Future Generation Computer Systems, 141:218–229,
+     2023.
+[77] Yaohui Wang, Ben Luo, and Yibin Shen. Efficient memory overcom-
+     mitment for {I/O} passthrough enabled {VMs} via fine-grained page
+     meta-data management. In 2023 USENIX Annual Technical Conference
+     (USENIX ATC 23), pages 769–783, 2023.
+[78] Xingda Wei, Fangming Lu, Tianxia Wang, Jinyu Gu, Yuhan Yang, Rong
+     Chen, and Haibo Chen. No provisioned concurrency: Fast RDMA-
+     codesigned remote fork for serverless computing. In 17th USENIX
+     Symposium on Operating Systems Design and Implementation (OSDI
+     23), pages 497–517. USENIX Association, 2023.
+[79] Dan Williams, Yaohui Hu, Umesh Deshpande, Piush K Sinha, Nilton
+     Bila, Kartik Gopalan, and Hani Jamjoom. Enabling efficient hypervisor-
+     as-a-service clouds with ephemeral virtualization. In Proceedings of
+     the12th ACM SIGPLAN/SIGOPS International Conference on Virtual
+     Execution Environments, pages 79–92, 2016.
+[80] Lars Wrenger, Kenny Albes, Marco Wurps, Christian Dietrich, and
+     Daniel Lohmann. Hyperalloc: Efficient vm memory de/inflation via
+     hypervisor-shared page-frame allocators. In Proceedings of the Twen-
+     tieth European Conference on Computer Systems, pages 702–719, 2025.
+[81] Yao Xiao, Nikos Kanakaris, Anzhe Cheng, Chenzhong Yin, Nesreen K
+     Ahmed, Shahin Nazarian, Andrei Irimia, and Paul Bogdan. Exploiting
+     application-to-architecture dependencies for designing scalable os. In
+     ICASSP 2025-2025 IEEE International Conference on Acoustics, Speech
+     and Signal Processing (ICASSP), pages 1–5. IEEE, 2025.
+[82] Kenichi Yasukata, Hajime Tazaki, Pierre-Louis Aublin, and Kenta Ishig-
+     uro. zpoline: a system call hook mechanism based on binary rewriting.
+     In 2023 USENIX Annual Technical Conference (USENIX ATC 23), pages
+     293–300, Boston, MA, July 2023. USENIX Association.
+[83] Mengmei Ye, Angelo Ruocco, Daniele Buono, James Bottomley, and
+     Hubertus Franke. Free the turtles: Removing nested virtualization
+
+                                                                                15
+

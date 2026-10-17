@@ -1,0 +1,1417 @@
+    How to Copy Memory? Coordinated Asynchronous
+            Copy as a First-Class OS Service
+         Jingkai He1,2 , Yunpeng Dong1 , Dong Du1,2 , Mo Zou3 , Zhitai Yu3 , Yuxin Ren3 , Ning Jia3 ,
+                                         Yubin Xia1,2 , Haibo Chen1,2
+                                1 Institute of Parallel and Distributed Systems, Shanghai Jiao Tong University
+                2 Engineering Research Center for Domain-specific Operating Systems, Ministry of Education, China
+                                                                3 Huawei Technologies Co., Ltd.
+
+
+Abstract                                                                             Keywords: Memory Copy, Asynchronous Copy, OS Service
+In modern systems, memory copy remains a critical perfor-                            ACM Reference Format:
+mance bottleneck across various scenarios, playing a per-                            Jingkai He, Yunpeng Dong, Dong Du, Mo Zou, Zhitai Yu, Yuxin Ren,
+vasive role in system-wide execution such as syscalls, IPC,                          Ning Jia, Yubin Xia, and Haibo Chen. 2025. How to Copy Memory?
+and user-mode applications. Numerous efforts have aimed                              Coordinated Asynchronous Copy as a First-Class OS Service. In
+at optimizing copy performance, including zero-copy with                             ACM SIGOPS 31st Symposium on Operating Systems Principles (SOSP
+page remapping and hardware-accelerated copy. However,                               ’25), October 13–16, 2025, Seoul, Republic of Korea. ACM, New York,
+they typically target specific use cases, such as Linux zero-                        NY, USA, 20 pages. https://doi.org/10.1145/3731569.3764800
+copy send() for messages of ≥10KB. This paper argues for
+copy as a first-class OS service, offering three key benefits:                       1    Introduction
+(1) with the asynchronous copy abstraction provided by the
+                                                                                     Memory copy remains pervasive across modern OSes [1–
+service, applications can overlap their execution with copy;
+                                                                                     6] and apps [7]. It can introduce significant performance
+(2) the service can effectively utilize hardware capabilities
+                                                                                     costs for memory-intensive and I/O-intensive workloads like
+to enhance copy performance; (3) the service’s global view
+                                                                                     KV store [7, 8], proxies [9, 10], and storage services [11, 12],
+of copies further enables holistic optimization. To this end,
+                                                                                     and is a common performance tax for various apps and OS
+we introduce Copier, a new OS service of coordinated asyn-
+                                                                                     services [13]. One example is inter-process communication
+chronous copy, to serve both user-mode applications and OS
+                                                                                     (IPC), where message-passing often becomes the primary bot-
+services. We build Copier-Linux to demonstrate Copier’s
+                                                                                     tleneck [14], typically requiring one or more copies. Syscalls
+ability to improve performance for diverse use cases, includ-
+                                                                                     constitute another example where cross-privilege switching
+ing Redis, Protobuf, network stack, proxy, etc. Evaluations
+                                                                                     entails copy for security reasons and semantic gaps. De-
+show that Copier achieves up to a 1.8 × speedup for real-
+                                                                                     spite providing an easy-to-use abstraction, copy-based data
+world applications like Redis and a 1.6 × improvement over
+                                                                                     movement is known for its inefficiency [15–19], blocking
+zIO, the state-of-the-art in optimizing copy efficiency. To
+                                                                                     computation as shown in Fig.1-a.
+further facilitate adoption, we develop a toolchain to ease
+                                                                                        Numerous efforts have been made to mitigate costs caused
+the use of Copier. We also integrate Copier into a commer-
+                                                                                     by copy. One approach leverages hardware features, e.g.,
+cial smartphone OS (HarmonyOS 5.0), achieving promising
+                                                                                     SIMD instructions [20, 21] and on-chip DMA [1, 22], to boost
+results.
+                                                                                     copy performance. However, a significant limitation is that
+CCS Concepts: • Software and its engineering → Operat-                               the hardware capabilities usually cannot be fully utilized.
+ing systems; Memory management; • Computer systems                                   For example, while libc memcpy() adopts SIMD (e.g., x86
+organization → Multicore architectures.                                              AVX [21, 23] and ARM SVE/NEON [20]) for better perfor-
+                                                                                     mance, the Linux kernel does not utilize SIMD because of
+Permission to make digital or hard copies of all or part of this work for            the high costs of saving and restoring register states (up to
+personal or classroom use is granted without fee provided that copies                several KB). Conversely, while the kernel can utilize DMA to
+are not made or distributed for profit or commercial advantage and that
+copies bear this notice and the full citation on the first page. Copyrights          improve copy performance and reduce CPU costs [1], such
+for components of this work owned by others than the author(s) must                  privileged features can hardly be utilized by user apps.
+be honored. Abstracting with credit is permitted. To copy otherwise, or                 Another common approach, zero-copy, reduces copy costs
+republish, to post on servers or to redistribute to lists, requires prior specific   through memory sharing or remapping, as shown in Fig.1-b.
+permission and/or a fee. Request permissions from permissions@acm.org.               However, state-of-the-art zero-copy methods face several
+SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea
+                                                                                     limitations for common cases, including page alignment re-
+© 2025 Copyright held by the owner/author(s). Publication rights licensed
+to ACM.                                                                              quirements, lack of support for scenarios requiring multiple
+ACM ISBN 979-8-4007-1870-0/2025/10. . . $15.00                                       replicas (e.g., CoW handler), and the susceptibility to Time-of-
+https://doi.org/10.1145/3731569.3764800                                              check to Time-of-use (TOCTTOU) attacks [14]. Meanwhile,
+                            start copy                use data     does not consume CPU cycles, it is slower than AVX and
+(a) Copy           Core-0        Copying data    Computation       wastes cycles to submit DMA tasks and wait for completion.
+                         ownership transfer               Time     (2) Eliminating copy based on global view is non-trivial, as
+(b) Zero-copy      Core-0                   Computation            forming the global view requires correctly tracking depen-
+                            submit copy task                       dency among copies across privilege levels.
+                   Core-0          Computation     Application     Challenge-3 (from single to multiple clients): How to
+(c) Copier                                                         ensure resource isolation, fairness, and correctness?
+                   Core-1         Copying data     OS service
+                                                                   Traditional sync copy (via functions) uses clients’ own time
+Figure 1. Comparison among different copy methods.                 slices, simplifying the fairness and isolation among clients.
+Copier achieves both low latency and an easy-to-use abstraction
+                                                                   As an OS service, however, clients may contend for Copier’s
+by reorganizing tasks among processing units.
+                                                                   service for copy. A further complication arises from the co-
+                                                                   ordination with other OS subsystems, e.g., memory manage-
+                                                                   ment supports features like CoW and on-demand paging,
+since the operations of remapping or sharing incur extra
+                                                                   which may trigger page faults during copy that Copier must
+costs, the performance benefits are conditional. For example,
+                                                                   properly handle in its own address space and context.
+the Linux kernel provides zero-copy send() and clarifies that
+                                                                      To address the challenges, we propose the following tech-
+it can only benefit messages ≥10KB [24]. Similarly, zIO pro-
+                                                                   niques. First, we design queue-based Copier abstractions.
+vides an on-demand way to achieve zero-copy, but requires
+                                                                   Different from prior kernel abstractions [25–27], which up-
+copy sizes ≥16KB to bring benefits [7].
+                                                                   date a task’s status only after completion, and execute tasks
+   This paper argues the necessity of making copy a first-
+                                                                   in a determined order, Copier abstractions highlight fine-
+class OS service (like file systems and network), for three
+                                                                   grained update of task status, and out-of-order execution.
+reasons. First, asynchronous copy with the OS service.
+                                                                   Fine-grained update enables apps to use data without waiting
+Our study reveals that there is often a sufficient time window
+                                                                   for the entire copy to complete, forming copy-use pipelines.
+between data being copied and used (§3), a period we refer
+                                                                   Out-of-order execution allows users to adjust the execution
+to as Time-of-Copy to Time-of-Use (Copy-Use) window. As
+                                                                   order of tasks as needed, solving head-of-line blocking. We
+shown in Fig.1-c, the OS service can leverage the window to
+                                                                   introduce csync primitive to enable apps to check and con-
+hide copy latency while not blocking application’s execution.
+                                                                   trol the progress of copy, and formally verify the semantic
+Second, effective utilization of under-utilized hardware.
+                                                                   equivalence between async copy with csync and sync copy.
+As an OS service, it can fully utilize hardware features like
+                                                                      Second, we design the piggyback-based dispatcher to
+SIMD and DMA, and provide the “best” copy performance to
+                                                                   harmonize heterogeneous copy units. It piggybacks DMA
+apps and OS services. Third, holistic optimization of copy
+                                                                   tasks onto AVX tasks and executes them in parallel, over-
+tasks. The service has a global view of the copy requests, and
+                                                                   lapping DMA copy with AVX copy without wasting cycles
+can bring holistic optimizations like absorbing unnecessary
+                                                                   on waiting for DMA to finish. Different from traditional
+intermediate copies and scheduling high-priority ones first.
+                                                                   dispatchers [1, 28] partitioning a single copy to run on dif-
+   We design Copier embodying the idea of copy as a first-
+                                                                   ferent units, which can only optimize large copies, Copier
+class OS service. Copier provides interfaces for both user apps
+                                                                   leverages the queuing nature of async tasks to fuse several
+and kernel services, addressing the following challenges.
+                                                                   copies and execute them in the same round of piggybacking,
+Challenge-1 (from sync to async): How to fully exploit             benefiting relatively small copies. Copier supports efficient
+the performance benefits of asynchronous copy while                tracking of copy dependency by utilizing system events (e.g.,
+maintaining the semantics of synchronous copy? Async               syscall trap and return) as indicators, thereby realizing copy
+copy can utilize the Copy-Use window to overlap data copy          absorption, which merges redundant copies.
+and use. However, the performance gains are limited by (1)            Last, recognizing copy can be treated as a resource, we de-
+the costs of submitting copy tasks for small copies, and (2) the   sign Copier scheduler and a cgroup extension taking copy
+blocking latency to wait for the completion of large copies.       length as the resource unit to ensure fairness and isolation.
+Besides, async copy complicates the programming model              We propose proactive fault handling to proactively identify
+and may impose a burden on developing or porting apps.             and handle faults, instead of relying on hardware faults.
+Challenge-2 (from function to OS service): How to fully               We design and implement Copier-Linux utilizing Copier
+utilize hardware features and leverage the global view             to improve the performance of apps and key kernel services.
+for optimization with minimal extra cost? As an OS                 We also integrate Copier into a commercial smartphone OS
+service, Copier can exploit both user-space and kernel-space       (HarmonyOS 5.0 [4, 35]) experimentally. Evaluation shows
+hardware to accelerate copy. With the global view of copies,       promising results. Specifically, for Redis [8], Copier achieves
+Copier can eliminate unnecessary intermediate copies. How-         a 1.8 × speedup in latency compared with baseline, and a
+ever, they are not free lunches: (1) Heterogeneous copy units      1.6 × speedup over zIO [7], the SOTA work in optimizing
+have asymmetric performance, e.g., although DMA copy
+Table 1. Overview of systems with copy optimizations. W/o alignment: whether the system requires buffers to be page-aligned.
+Cross privilege/address space: whether the system can optimize cross-privileged/cross-address-space copies. No blocking: whether
+copies will not block execution. Absorb copy: whether the system can eliminate unnecessary copies.
+                                          Systems                               Usability                              Performance
+                                                              Target              W/o     Cross      Cross     Hardware       No   Absorb
+                   Type       Name                  Insight
+                                                              scenario         alignment privilege addr. space features    blocking copy
+             U-mode memcpy         New hardware features      Apps                 ✓         ✗          ✗      SIMD [23]       ✗      ✗
+  Baseline
+             K-mode memcpy         Hardware w/o state costs Kernel                 ✓         ✓         ✓       ERMS [29]       ✗      ✗
+             L4 [30]               Temporary mapping          IPC                  ✓         ✗         ✓       Page table      ✗    Partial
+             Zero-copy socket [24] Shared pages               ≥10KB/OS socket       ✗        ✓          ✗      Page table     ✓       ✗
+             Linux sendfile [31]   Address transfer in kernel Copying files        ✓         ✓          ✗      CPU             ✗    Partial
+             Splice/vmsplice [32] Page moving (no copy)       Pipe                  ✗        ✓         ✓       Page table     ✓       ✗
+    Copy
+             Arrakis [33]          Hardware demultiplexing I/O                     ✓         ✓          ✗      SR-IOV         ✓       ✗
+optimization
+             XRP [34]              Offloading logic to kernel Storage              ✓         ✓          ✗      CPU             ✗      ✓
+             zIO [7]               No unnecessary copy        Copy ≥16KB         Partial     ✗          ✗      CPU            ✓       ✓
+             Fastmove [1]          DMA to save costs          NVM Storage (OS)     ✓         ✓         ✓       DMA             ✗      ✗
+             Copier                Async copy w/ OS service Kernel/Apps ≥0.5KB     ✓         ✓         ✓       SIMD+DMA       ✓       ✓
+
+                              (16KB) Kernel copy              (256KB) Kernel copy   copy remains their main performance bottleneck, consuming
+                              (16KB) User copy                (256KB) User copy     up to 66.2% of cycles. The copy includes kernel-mode copy
+                                                                                    and user-mode copy. Copy is also the major bottleneck of
+Cycle proportion
+
+
+
+
+                   50
+                                                                                    key scenarios on HarmonyOS 5.0 (smartphone), as shown in
+                                                                                    Fig.2-b. Copy can be a significant challenge for apps, especially
+                   25                                                               for memory-intensive or I/O-intensive ones (Finding-1).
+                                                                                    Prevalence of copy. Today’s copy acts as a common “perfor-
+                    0                                                               mance tax” — although it may not be the top-ranking bottle-
+                          -set edis-get   zlib penSSL Nginx libpng ffmpeg
+                   Redis     R                O                                     neck for specific apps, optimizing copy is valuable from the
+                                                Applications                        whole system perspective, e.g., 4–5% of (whole) datacenter
+                           (a) Cycle proportion of copy in Linux Apps               cycles are consumed by copy in Google datacenters [16, 17].
+                                                                                       However, copy is not easy to be eliminated. To illustrate
+          Camera Music Home Keyboard Online Browser
+     Apps                                                                           the challenges, we classify copy from a system perspective
+         recording playing swiping input meeting I/O
+                                                                                    into two types: intra-boundary copy and inter-boundary copy.
+    Prop. 6%–16% 4%–15% 12%–19% 3%–15%    4%–8%  49%
+                                                                                    Boundary means the same address space and privilege level.
+                         (b) Cycle proportion of copy on HarmonyOS                     Although developers make significant efforts to mitigate
+                   Figure 2. Analysis of copy across apps and OSes.                 unnecessary intra-boundary copies, some still remain for
+                                                                                    the following reasons: (1) Organizing memory, e.g., Redis
+copy efficiency. On phones, Copier reduces video decoding                           copies the key and value to new buffers after parsing a SET
+latency by up to 10%. Copier also performs well in boosting                         request to avoid fragmentations caused by protocol and sep-
+the performance of send() and recv() syscalls, Protobuf [36],                       arators; (2) Bridging semantic gaps, e.g., userspace network
+Binder IPC [37], CoW fault handling, etc.                                           stacks [43, 44] use copy to concatenate packets into a con-
+                                                                                    tinuous message in recv(); (3) Multi-replica requirement, e.g.,
+2                   Systematic Analysis of Copy in the Wild                         CoW handler creates multiple replicas of the page.
+                                                                                       Inter-boundary copy can be further grouped into cross-
+2.1                     Copy Performance is Still Critical
+                                                                                    privilege copy and cross-address-space copy, e.g., copies during
+Copy has been studied for decades; however, its performance                         recv() and IPC. Optimizations for these cases are harder
+remains critical for today’s apps and OSes.                                         compared with intra-boundary copy since OS support or app-
+Quantitative Analysis. We measure the cycle proportion                              OS co-design is usually necessary. Optimizing copy is highly
+of copy for widely used apps and libraries (on Linux), as                           valuable for the whole system, but challenging (Finding-2).
+shown in Fig. 2-a1 . Although they are carefully optimized,
+1 Detailed experimental settings. Fig.2-a is conducted on Linux (5.15.131)
+                                                                                    2.2   Existing Optimizations on Copy
+servers and Fig.2-b is conducted on smartphones, with settings detailed in
+§6. Redis SET/GET: Redis SET/GET commands; zlib: zlib [38] compressing              Prior optimizations on copy [1, 7, 24, 30–34] still face chal-
+strings; OpenSSL: OpenSSL [39] receiving encrypted messages (SSL_read( ),           lenging trade-offs. We present the comparison in Table.1.
+AES-GCM encrypted); Nginx: Nginx [10] proxying between echo servers/-               Copy with hardware features. Although hardware pro-
+clients to forward messages; libpng: libpng [40] decoding PNG images stored         vides support to optimize copy performance, we observe
+in an ext4 file system; ffmpeg: ffmpeg [41] encoding videos with libx265
+encoder. The cycle proportions of copies are measured with perf [42]. The           that apps and the kernel usually cannot fully utilize these
+16/256KB specifically corresponds to value sizes, string lengths, encrypted         hardware features. SIMD extensions [45] like AVX [23] can
+message lengths, forwarded message lengths, image sizes, and video bitrates.        move a large amount of data, which helps to accelerate copy.
+                                                                                   30
+These features have been adopted by user-mode apps (e.g.,                               (Kernel) Send (9KB jumbo frame)
+glibc [21]). However, the Linux kernel still cannot utilize                             (HTTPS) Chacha20-Poly1305 dec.
+                                                                                   25   (HTTPS) AES-GCM dec.
+these features [46] because of the significant overhead of                              (KV store) Redis
+saving and restoring SIMD-related registers (the total size                             (Data compression) Deflate
+                                                                                   20
+
+
+
+
+                                                                   Time (KCycle)
+amounts to several KB). Another case is DMA, which can be                               (IPC, mobile) Binder IPC
+utilized to copy data without CPU costs, e.g., Fastmove [1]                             (gRPC) Protobuf
+                                                                                   15   (Graphics) PNG decoding
+utilizes Intel I/OAT [47] DMA to boost DRAM-NVM copy.
+However, user apps usually cannot easily benefit from DMA                          10                                                           Copy-
+                                                                                                                                                ERMS
+due to the requirement of privileged operations (e.g., MMIO).
+Zero-copy. Prior efforts [48] exploit zero-copy methods,                            5
+                                                                                                                                                Copy-
+which usually utilize page remapping or shared memory.                                                                                          AVX2
+Linux vmsplice [32] and zero-copy socket [24] utilize page                          0
+                                                                                        0     2       4      6      8     10     12   14   16
+tables to share buffers between apps and OS. Zero-copy has                                                   Use Position (KB)
+its limitations. First, zero-copy-based kernel services have se-
+curity issues as kernel operations on the buffer are visible to      Figure 3. Copy-Use window and copy time. ERMS (Enhanced
+apps (potential TOCTTOU attacks [14, 49]). Second, shared            REP MOVSB/STOSB) [29] is the kernel’s copy method. The bars
+buffers complicate memory ownership management, e.g., the            show the Copy-Use window of data at x-axis position. The shaded
+app using zero-copy send() has to use additional syscalls to         areas show the time needed to copy x-axis size. The root cause
+check the buffer’s status, and ensure not to reuse it before the     of Copy-Use windows is that programs typically copy data
+background transmission finishes. Third, zero-copy relying           in bulk but use it piece by piece in fixed patterns. E.g., in
+on remapping requires the data to be page-aligned, which             Protobuf, after copying data to userspace in recv(), the CPU has to
+is not feasible in many cases. Last, a common limitation for         update socket status, return to userspace, initialize deserializing
+zero-copy is that it only supports one instance of data, and         context and deserialize the previous 8KB before it accesses the byte
+cannot support scenarios requiring multiple replicas.                at 8K. We obtain the data in the figure by modifying the apps and
+                                                                     recording the timestamps.
+   zIO [7] utilizes a new observation that most copied data
+will not be accessed, thus the copy can be avoided and de-
+signs a page-fault-based on-demand copy method. It sup-
+                                                                    of copies, which can be utilized to intelligently schedule
+ports multiple data replicas; however, it still requires page
+                                                                    copies and absorb unnecessary copies.
+table remapping, leading to non-trivial overheads. As a result,
+                                                                       Second, we observe that a time-of-copy to time-of-use
+zIO requires ≥16KB [7] size to bring benefits. This is common
+                                                                    (Copy-Use) window is common in copy-intensive apps and
+for other zero-copy methods [24, 50], e.g., Linux zero-copy
+                                                                    kernel services, which can be utilized to hide copy latency
+send() is suggested only for payload size ≥10KB [24]. Zero-
+                                                                    without compromising correctness and security (Insight-2).
+copy is effective in scenarios with large copy (e.g., photo ser-
+                                                                    The Copy-Use window refers to the time interval between
+vices [51]). However, in many scenarios the medium or small
+                                                                    the completion of the copy and the first use of the data.
+copies are the majority, e.g., our analysis of traces shows that
+                                                                    We evaluate the Copy-Use windows at different positions
+95.1% of Twitter memcached requests are ≤10KB [52], and
+                                                                    during data usage for representative apps and kernel services.
+69.8% of AliCloud block service requests are 4KB–10KB [53].
+                                                                    Results (Fig.32 ) show that the Copy-Use window is mostly
+   Some systems leverage zero-copy (or remapping) to reduce
+                                                                    sufficient to cover the time needed for data copy, and is
+copy times but still support multiple replicas, e.g., L4 [30]
+                                                                    usually as high as 2–10x the time required for copy. The
+and Linux sendfile() [31]. They are designed only for specific
+                                                                    substantial time window provides us with the opportunity
+scenarios and still require blocking to move data.
+                                                                    to overlap copy and computation, removing copy from the
+                                                                    critical path. Combined with the first insight, apps and kernel
+3     Copy as an OS Service                                         services can non-blockingly (or asynchronously) submit a
+3.1   Observations and Insights
+                                                                     2 Detailed experimental settings. Send: sending 16KB messages using
+Copier is inspired by two insights. First, observing that tra-
+                                                                    send( ) syscall (§6.1.2); Chacha20/AES dec.: receiving 16KB encrypted mes-
+ditional approaches supporting copy as library functions            sages with OpenSSL (§6.2.3); Redis: Redis SETs with 16KB values (§6.2.1);
+cannot fully utilize hardware capabilities, and that global         Deflate: compressing 16KB strings with zlib (§6.2.3); Binder IPC: passing
+management of copies brings holistic optimization opportu-          16KB messages with Android Binder (§ 6.1.2); Protobuf: receiving 16KB
+nities. We claim that copy should be treated as a first-class       serialized messages with protobuf (§6.2.3); PNG decoding: decoding 16KB
+OS service (Insight-1). The OS service can effectively re-          images stored in an ext4 file system with libpng. For Send, we study the
+                                                                    copy from userspace to kernel; for Chacha20/AES dec., Redis, and Protobuf,
+solve the challenges in existing works: (1) it can fully utilize    we study the copy in recv( ); for PNG decoding, we study the copy in read( );
+hardware features. Apps and other OS services can benefit           for Deflate, we study its internal userspace copy; for Binder, we study the
+from the enhanced copy performance. (2) it has a global view        kernel copy in Binder driver. The environment settings are detailed in §6.
+copy task to the global service (called Copier), and only          ▶Existing copy and use     ▶Internal imp with CSH Queues
+                                                                   func copyUse(src, dst, n): func amemcpy(dst, src, n, handler):
+synchronize the status before use.                                   memcpy(dst, src, n);       /* alloc desc, map copy to it */
+                                                                     free(src);                 desc = alloc_desc(dst, src, n);
+                                                                     /* some work ... */        enqueue(CopyQueue, {dst, src, n,
+3.2   Copier Overview                                                val = dst[0];                      desc, handler, ..});
+                                                                     return val;
+Based on these insights, we present Copier, an OS service                                     func csync(addr, n):
+                                                                   ▶Copier programming model    desc = lookup(addr);
+for async copy, with the following designs.                        func copyUse(src, dst, n): if (!desc_ready(addr, n)):
+Abstractions. Copier provides queue-based abstractions.              amemcpy(dst, src, n,         enqueue(SyncQueue, {addr, n});
+                                                                       handler={free, src});      while(!desc_ready(addr, n)){};
+To make the most of Copy-Use windows, Copier achieves                /* some work ... */
+fine-grained update of copy status with segment-based copy.          csync(addr=dst, len=8); /* Periodically invoked */
+To mitigate head-of-line blocking, Copier supports out-of-           val = dst[0];            func post_handlers():
+                                                                     return val;                run(dequeue(HandlerQueue));
+order execution with task promotion, which enables apps
+to raise the priority of some async copies as needed (§4.1).              Figure 4. Programming model and interfaces.
+To ensure the correctness of async copies, and form the
+global view, Copier tracks the order dependency of copies
+with cross-queue barriers, which synchronize the queues            (Fig.5). Queue-based abstractions offer non-blocking, async
+separated by privilege levels, and utilizes system events as       operations, circumventing the overhead of syscalls [26, 55].
+barrier indicators. Copier also tracks the data dependency of      Asynchronous copy with Copy Queue (𝑄𝐶𝑜𝑝𝑦 ). Clients
+copies to maintain correctness of the reordered tasks (§4.2).      enqueue Copy Tasks for copy via 𝑄𝐶𝑜𝑝𝑦 , as shown in Fig.5.
+Optimizations. To fully utilize hardware capabilities, we          A Copy Task includes the source and destination, identified
+design a dispatcher which piggybacks DMA tasks onto AVX            by virtual addresses or pages (used by kernel), and the copy’s
+tasks and executes them in parallel to overlap DMA copy            length. 3 𝑄𝐶𝑜𝑝𝑦 handles multiple tasks in FIFO order, main-
+with AVX copy (§ 4.3). Leveraging its global view, Copier          taining copy order for consistency. While it covers basic
+employs layered copy absorption to eliminate redundant in-         functionalities, it leads to a long waiting time for the comple-
+termediate copies in a fine-grained manner. Apps can further       tion of a big copy, affecting the effectiveness of asynchrony.
+exploit copy absorption with lazy copy semantics (§4.4).           Copier introduces segment-based copy to mitigate the issue.
+Management. Copier maintains fairness and isolation among          Fine-grained copy-use pipeline with segments. We ob-
+clients (user processes or OS services with standalone con-        serve that apps usually access copied data piece by piece in
+texts [54]) with Copier scheduler and cgroup extension (§4.5).     a regular pattern (e.g., sequential). Therefore, it is not nec-
+Usages. Copier introduces two programming primitives:              essary to complete the entire copy before use; ensuring the
+amemcpy() and csync(). Apps perform async copy with                availability of currently required data suffices. Based on this
+amemcpy(), and sync the data before use with csync(). Copier       observation, Copier abstractions enable the fine-grained up-
+provides a toolchain to ease the use, including libraries, a de-   date of a task’s progress. Copier partitions a copy into several
+bug tool, and an experimental compiler. We present Copier’s        segments, i.e., fixed-size regions, whose size is determined
+use cases for whole system copy optimization (§5) on two           by the granularity in Copy Task. Clients are required to spec-
+OSes, where Copier is used to optimize copies in OS services,      ify the address of the task’s descriptor — a bitmap tracking
+frameworks, and apps.                                              the copy status of each segment — which is checked by
+                                                                   clients to confirm the progress of the copy. Copier updates
+                                                                   descriptor’s relevant bit after finishing the copy to a segment.
+4     Copier Design                                                This design facilitates copy-use pipelines, enabling parallel
+4.1   Pipelined Copy-Use with Copier Abstraction                   data copy and use.
+As shown in Fig.4 (left), Copier’s library provides two major      Task promotion with Sync Queue (𝑄 𝑆 𝑦𝑛𝑐 ). To prevent
+high-level interfaces: amemcpy (async_memcpy) and csync            the head-of-line blocking caused by FIFO-queue-based ab-
+(copy_sync). Clients can submit an async copy task with            stractions [25–27] — with basic Copy Queue, preceding tasks
+amemcpy and ensure the data is ready before use with csync.        block subsequent ones even when the preceding data is not
+The detailed APIs and usage are described in §5.1.                 used immediately, Copier introduces 𝑄 𝑆 𝑦𝑛𝑐 , which enables
+   From the OS API perspective, clients interact with Copier       apps to adjust the execution order of async tasks as needed,
+through three types of (per-client) queues (CSH Queues):           i.e., out-of-order execution. When a client finds required seg-
+Copy Queue, Sync Queue, and Handler Queue, which                   ments unready, it submits a Sync Task with the required
+are mapped to the client’s address space. These queues are         address and length, as shown in Fig. 5 and csync in Fig. 4.
+the underlying abstractions supporting high-level APIs, as
+shown in Fig. 4 (right). Copier has its own context (e.g.,         3 Copier’s lib (§5.1) supports overlapping copy (memmove) by splitting it
+
+kthread in Linux) and polls the queues to handle the requests      into two tasks and first submitting the task whose source will be overwritten.
+                  Copy Task                               Sync Task          Added by concurrent threads
+                                     Descriptor                                                        Copier’s view for order dep.
+                     source                               destination    U-QCopy
+                                     (bitmap)               length
+                                                                                    1 2 3 4 5 6             U1 U2       U3 U4 U5 U6
+                  destination                                                  trap             return Barrier
+           tail      length            111 0              type valid                                                       Barrier
+ head              type valid    copy 0 0 0 0 copy                       K-QCopy Br 1 2 3 4 Br                 K1 K2 K3 K4
+                     FUNC       ﬁnished     in-progress                          Barrier    Barrier
+                  descriptor                                                (a) Order dependency (dep.) tracking using barrier
+                  granularity
+                                                                                         Sync U3
+                                                                         K-QSync (addr: 0x100,           …    Order to perform copy
+Copy eue (QCopy)                              Sync eue (QSync)                               len: 512)                             U5 U6
+                                                                                                           Promoted U3 U1 U2 U4
+Figure 5. Copy Queue and Sync Queue. They are mapped to                         (0x800→0x100) (0x400→0x800) by Sync
+                                                                         Data dep. U3               K1              K1    K2 K3 K4
+clients. Copier monitors them with optimized polling (§4.5).
+                                                                               (b) Data dependency tracking for Sync Task
+                                                                         Figure 6. Dependency tracking. U = userspace, K = kernel.
+This raises the priority of corresponding segments and all
+tasks it depends on, following data dependency in §4.2.
+Delegation-based handler. A challenge for prior zero-copy
+methods is post-copy handling, which involves immediate                 Cross-Queue Barrier. We observe that we can utilize trap
+actions on source buffers after copy, e.g., free in copyUse             (e.g., syscall) and return events as indicators to track dependen-
+(Fig.4). Linux zero-copy socket [24] relies on explicit syscalls        cies, as shown in Fig.6-a. Specifically, we introduce Barrier
+to check buffer’s ownership, while zIO [7] employs a garbage            Tasks. Each time before kernel submitting the first Copy Task
+collector to defer deallocation, introducing complexities and           after a trap, it submits a Barrier Task, recording current posi-
+limiting their usage. We propose delegation-based handling.             tion of user Copy Queue (and the times it is reused). Similarly,
+Specifically, we add the func field in Copy Task, encapsulat-           kernel submits a Barrier Task before returning to userspace.
+ing a function pointer and its arguments, designated to be              With the indicators, Copier knows the dependency between
+invoked upon copy completion. We use KFUNC for kernel                   the two queues: 𝐾1–𝐾4 before 𝑈 5 and after 𝑈 2.
+functions and UFUNC for user ones. Copier helps to execute                 A possible (corner) case in multi-threaded apps is that,
+the KFUNCs. For UFUNCs, Copier submits a task including                 when kernel submits tasks, other threads may submit tasks
+the function to Handler Queue. Copier library (§5) checks the           to user Copy Queue (𝑈 3–𝑈 4 in Fig.6-a). This concurrency
+queue and executes the handlers (post_handlers in Fig.4).               issue also exists in traditional sync copy, e.g., during kernel
+                                                                        performing copy_to_user, another concurrent thread per-
+4.2 Async but not Chaotic with Dependency Tracking                      forms copy. Same as its original behavior, the order between
+Although the async abstractions move copy out of the critical           𝐾1–𝐾4 and 𝑈 3–𝑈 4 is undetermined. Copier prioritizes tasks
+path, they introduce challenges in maintaining correctness.             in k-mode queues for simplicity, as shown in Fig.6-a (right).
+Executing the async tasks in the correct order is challenging           4.2.2 Data Dependency. To process Sync Tasks and en-
+for two reasons: (1) Separated async queues across privilege            able copy absorption (§4.4), Copier has to track data depen-
+levels lack efficient synchronization mechanisms. (2) Out-of-           dency — whether a Copy Task’s involved data is dependent
+order execution occurs because Sync Tasks prioritize some               on another due to overlapping memory regions. Data depen-
+copies. Copier tracks order dependency and data dependency              dency can be easily established by traversing Copy Tasks in
+to address these challenges respectively.                               reverse using the tracked order (§4.2.1) and comparing the
+4.2.1 Order Dependency. For kernel’s security, we main-                 regions (both sources and destinations).
+tain two sets of CSH Queues for each process by default:                   In Fig. 6-b, when processing the Sync Task which prior-
+user-mode (u-mode) queues for the app, and kernel-mode                  itizes 𝑈 3, Copier assesses the data dependency of 𝑈 3 and
+(k-mode) queues for kernel services sharing the process’s               finds it depends on 𝐾1. Then, Copier adjusts the copy order,
+context (e.g., syscalls). It is necessary to monitor the submis-        ensuring the essential tasks are done first. Notably, although
+sion order of tasks in u-mode and k-mode queues. E.g., the              it differs from order dependency, re-ordering is safe as the
+kernel submits a task (A→B) to the k-mode 𝑄𝐶𝑜𝑝𝑦 during                  tasks are independent. Copier handles Sync Tasks in k-mode
+recv, followed by the app submitting a task (B→C) to the                Sync Queue first, and then the tasks in u-mode queue.
+u-mode 𝑄𝐶𝑜𝑝𝑦 after recv returns. Copier must ensure A→B
+occurs before B→C for correctness. This dependency is de-               4.3 Harmonizing Copy Units with Task Piggybacking
+fined as order dependency. The order dependency of tasks                Copier’s OS service role brings opportunities for copies to
+within u-mode/k-mode queue is naturally determined by                   benefit from full hardware capabilities. By saving AVX regis-
+their order in the queue, without explicit specification. How-          ter states only upon Copier’s activation and restoring them
+ever, as the queues are non-blocking and user’s timestamps              just before it sleeps, we avoid the overhead of frequent state
+are untrustworthy, determining task order across u-mode                 saves and restores with each copy. We also employ parallel
+and k-mode queues poses a challenge.                                    copy with AVX and DMA [47] to enhance copy throughput.
+                                    Page Boundary                    B’s modiﬁed data before B→C             B’s descriptor
+                                                                     B’s copied but unmodiﬁed data     may be               not
+                                     src S4 S5 S6 S7 S8 S9                                                       111000
+                                                                                                       modiﬁed            accessed
+                                                                     Uncopied data ❹ Sync & use C
+                  64 12 25                                                                             check Copy Absorb
+                                     dst   S4 S5 S6 S7 S8 S9
+                       8 6                                           A     ❶        B ❸        C
+                                           Copy Task                                                     A          B         C
+                                                                   ❷ Sync B’s 3 seg., modify the 2nd
+ (a) Hardware throughput         (b) CPU-DMA hybrid task
+                                                                   (a) Fine-grained copy problem   (b) Layered absorption
+   Copy eue                      Time                                Figure 8. Design of Copy absorption. seg. = segment.
+ T1 T2 T3        Task4             DMA      S3    S7   S9
+ S1 S2 S3 S4 S5 S6 S7 S8 S9        CPU      S1 S2 S4 S5 S6 S8
+                                  (AVX2)
+                                    e-piggypack i-piggypack       the threshold, Copier uses the e-piggyback method. Differ-
+   Small subtask (≤ 1.4K)
+   Large subtask          Dispatcher (e=external, i=internal)     ent from i-piggyback, it picks subtasks from several adjacent
+                 Labels
+                                                                  tasks in the queue, provided they have no data dependency.
+            (c) Copier’s hardware dispatcher                      Copier picks DMA subtasks from the task’s latter part (i-
+Figure 7. Designs to utilize hardware. S1 = Subtask1. In (b),     piggyback), or the latter tasks (e-piggyback), as they typi-
+we assume all physical pages are non-contiguous.                  cally have longer Copy-Use windows, e.g., although S1 and
+                                                                  S5 in Fig.7-c are DMA candidates, they are assigned to AVX.
+                                                                  • Parallel execution. Copier first submits DMA subtasks
+Challenges. Although DMA copies without consuming CPU             (in batch) to the device queue, then executes AVX subtasks,
+cycles and excels at large copies (≥4KB), it has lower through-   and finally confirms the completion of DMA subtasks.
+put than AVX2, especially for small copies, as shown in Fig.7-    The piggyback mechanism ensures high utilization of both
+a. Submitting DMA tasks and waiting for them to complete          copy units without wasting cycles waiting for DMA comple-
+also wastes cycles that could be used for copy. It remains        tion. It can be applied to more heterogeneous units [56, 57].
+unclear how to integrate diverse hardware capabilities given      Address Transfer Cache (ATCache). DMA requires trans-
+their varying characteristics.                                    lating virtual addresses (VAs) to physical addresses (~240
+CPU-DMA hybrid subtasks. DMA requires that both source            cycles/page). We note that apps’ copy addresses often demon-
+and destination of the copy have contiguous physical ad-          strate high locality, as they tend to use recycled buffer pools
+dresses. We define a subtask as the basic unit within a Copy      and fixed I/O buffers to minimize (de)allocation overhead,
+Task to execute copy in specific hardware, e.g., DMA or AVX,      e.g., the address recurrence in Redis surpasses 75%. We pro-
+which is the largest unit meeting the continuity requirement.     pose ATCache, which caches VA, pages, and length, to reduce
+E.g., in Fig.7-b, non-contiguous pages divide the subtasks.       translation overhead. The memory subsystem will notify AT-
+    We observe that DMA is inefficient for small subtasks due     Cache to invalidate entries when the mappings change.
+to the overhead of submitting DMA tasks, whose costs in
+our server are sufficient to copy 1.4KB using AVX2. Based on      4.4 Merging Redundant Copy with Copy Absorption
+the observation, we propose hybrid subtasks — for a single        Continuous copies, especially those across privilege levels,
+task, Copier considers its subtasks with sufficient sizes as      are common in I/O-intensive apps, e.g., when Redis processes
+DMA candidates, e.g., S5/S7/S9, and uses CPU for others.          a SET, the value is first copied from kernel buffer (𝐾) to input
+Piggyback-based hardware dispatcher. Copier introduces            I/O buffer (𝐼 ) through recv(), and then copied to the database
+the dispatcher to allocate subtasks between heterogeneous         (𝐷) after parsing the request. In many cases, only a small
+copy units. As DMA is notably slower than AVX, improper           portion of the intermediate buffer (e.g., 𝐼 ) is accessed [7].
+allocation may result in non-trivial waiting time within CPU      Copy absorption, by design, eliminates the unnecessary copy
+to enforce dependencies. We propose the piggyback mecha-          (K→I) of untouched data and merges the copies into a “short-
+nism to pair and synchronize subtasks executed by CPU with        circuit” copy (K→D). zIO [7] utilizes a similar observation
+those performed by DMA. The dispatcher works in rounds,           but is limited to user-mode. With order dependency tracking
+it first schedules subtasks, and then executes them:              (§4.2.1), the OS service role endows Copier the global view
+• Packed scheduling. Copier piggybacks DMA copy onto              of copies, thus enabling cross-privilege copy absorption.
+AVX copy to overlap the DMA copy with AVX copy, avoiding          Challenges. Fine-grained granularity brings challenges. Con-
+the CPU consumption to wait for DMA completion. Specif-           sider two copies in the queue, A→B and B→C, when 𝐶 is
+ically, (1) for a large task (≥12KB), Copier picks subtasks       used, a naive design is to copy A→C directly. It is correct for
+from the DMA candidates within the task and assigns them          coarse-grained copy where 𝐵 must be fully copied once it is
+to DMA. It assigns other subtasks to AVX, as shown by i-          used, but not for Copier’s fine-grained copy. A case (Fig.8-a)
+piggyback in Fig.7-c. Copier tries to ensure the completion       is that after ❶ submitting A→B, the client ❷ modifies part of
+times of the subtasks on CPU and DMA are close based on           the data in 𝐵, and then ❸ submits B→C. When ❹ 𝐶 is synced,
+hardware metrics (Fig.7-a). (2) If the task’s length is below     we cannot simply copy A→C as part of 𝐵 is modified.
+Layered copy absorption. Recall the segment-based Copier           group (cgroup) [60] with a controller named copier. Users
+abstractions (§4.1), since clients sync the data before use, a     can configure the share of Copier resources of each cgroup
+segment could not have been accessed if its bit in descriptor      (copier.shares). We do not use CPU slices used by Copier as
+is not marked. Conversely, it might be modified if its bit is      copy resources, acknowledging copies’ completion times can
+marked. We propose layered absorption — instead of copying         vary due to cache and TLB states. Instead, Copier uses copy
+from one source, Copier copies from sources with the latest        length, the length copied, as the resources. The extension
+data. In Fig.8-b, when 𝐶 is synced, Copier copies the first 3      is compatible with existing OSes, and can be easily used by
+segments from 𝐵 and others from 𝐴, as 𝐵’s 3 segments are           users and frameworks [61] to achieve resource isolation.
+marked in the descriptor and might contain newer data.
+                                                                   4.5.3 Scheduling. Each Copier thread schedules clients
+Optimizations with app semantics. We present Lazy Copy
+                                                                   following CFS [62] — the key consideration is fairness. Specif-
+Task to further exploit copy absorption. Clients can mark a
+                                                                   ically, Copier threads maintain a total copy length for each
+Copy Task as lazy in the type field. It has the lowest priority
+                                                                   process and select the process with the minimum total copy
+and will be handled only when: a Copy/Sync Task depends
+                                                                   length to serve each time it schedules, akin to CFS’s strategy.
+on it, or a specified period has elapsed. A Lazy Task usually is
+                                                                   Administrators can adjust Copier’s copy slice, defining the
+not executed but acts as a mediator in copy absorption, which
+                                                                   maximum copy length upon each scheduling. The scheduler
+is beneficial in cases where the data is not accessed but just
+                                                                   works in each cgroup to maintain fairness and cooperates
+moved. E.g., a proxy reads a message from kernel (K1→U),
+                                                                   with the copier controller to schedule among cgroups.
+and sends it out (U→K2) after redirecting. As the proxy only
+uses a few data of the message (e.g., header), it can mark the     4.5.4 Multi-Address Spaces and Fault Handling. Serv-
+first task as lazy. With copy absorption, Copier performs copy     ing multiple processes faces challenges with the memory
+about K1→K2 during send(). A special Sync Task, abort, is          subsystem. The processes submit tasks with virtual addresses
+introduced to explicitly discard unnecessary Copy Tasks, e.g.,     (VAs) specific to their own address spaces, which cannot be
+the proxy can submit an abort task to discard K1→U (which          directly used by Copier. More complex still, these VAs might
+is still queued) after finishing sending the message. Notably,     not be backed by physical memory due to on-demand paging,
+Copier does not implicitly discard any tasks.                      CoW, or even malicious behavior, triggering page faults that
+                                                                   are hard to handle in Copier’s context. A naive design is to
+4.5   Fair and Isolated Multi-client Serving                       switch Copier’s page table to use the VAs directly; however,
+As an OS service, Copier has its own (k)threads (called Copier     it is costly and cannot effectively handle page faults.
+threads) to handle requests from clients. It needs to manage,      Proactive fault handling. Copier adopts a proactive ap-
+isolate, and schedule copy resources, and handle faults.           proach to handle the challenges. Instead of waiting for po-
+4.5.1 Copier Threads. Copier threads leverage and en-              tential faults, Copier proactively triggers and handles them.
+hance existing async mechanisms within OS kernels to poll          Specifically, Copier uses VMAs [63] and page tables to con-
+requests from the queues. We implement it based on io_uring        firm the VAs’ physical mapping and locks the mapping until
+(with SQPOLL) in Linux, where the io_uring kthreads poll the       the copy is completed [64]. The address translation can be op-
+clients’ queues. We introduce the following two extensions.        timized with ATCache (§4.3). If some pages are not mapped,
+                                                                   Copier constructs exception parameters and invokes fault
+Scenario-driven polling. Copier supports two polling modes:
+                                                                   handlers. Copier also applies security checks, e.g., address
+(1) NAPI mode [58] (default): Copier reuses io_uring’s NAPI
+                                                                   boundary checks. If the faults cannot be resolved or the copy
+support [59] to balance performance and polling overhead.
+                                                                   has security issues (e.g., illegal kernel addresses), Copier
+(2) Scenario-driven mode: Copier thread is activated only
+                                                                   drops the task and signals the process as before (sigsegv).
+when a target scenario is detected and sleeps when the sce-
+nario changes. This is particularly beneficial for devices with    4.6   Target Scenarios and Scope
+limited cores and a critical focus on power consumption, e.g.,
+our practice on commercial smartphones (§5.3).                     Like other OS services [25, 54], Copier is not a silver bullet
+                                                                   for all cases. We summarize Copier’s target scenarios and
+Copier thread auto-scaling. We design an auto-scaling
+                                                                   scope as follows. For the unsuitable cases, developers can
+mechanism to support dynamic loads, which keeps the aver-
+                                                                   fall back to prior sync copy.
+age load between predefined low_load and high_load. Copier
+launches more threads when sustained high loads are de-            Copy size. With sufficient Copy-Use windows, Copier out-
+tected, and puts threads to sleep when the load is low. Clients    performs a sync copy when the copy time exceeds the time
+are preferentially assigned to NUMA local Copier threads.          of task submission and csync, e.g., kernel copies of ≥ 0.3KB
+                                                                   and userspace copies of ≥ 0.5KB on our server. Due to bet-
+4.5.2 Resource Isolation with Extended Cgroup. With                ter utilization of hardware, Copier also benefits large copies
+Copier, copy is managed as a basic resource like CPU time and      even without sufficient Copy-Use windows (e.g., CoW), e.g.,
+memory. Based on this perspective, we extend Linux control         kernel copies of ≥ 2KB and userspace copies of ≥ 12KB.
+         Table 2. Major APIs introduced by Copier.                              We introduce a new primitive, csync (copy-sync), which
+    Levels   APIs                    Descriptions                               simply requires an address and the size, used to ensure im-
+             amemcpy(dst, src,       Async memcpy and memmove. They             mediate consistency and order. From an app’s view, it per-
+             size); amemmove (..); use the per-process default queues.          forms copy as usual and syncs the data before use using
+                                     Ensures prior async copy is finished. It
+  libCopier csync(addr, size);       submits Sync Task and polling waits if     csync(). We also add csync_all() to sync all uncompleted
+(high-level)                         some segments are not ready.               async copies.
+                                     Ensures all async copies and FUNCs         Internal implementation. To keep the high-level APIs
+             csync_all(void);
+                                     finish.
+             shm_descr_bind(shm, Bind descriptor (on shared memory) to
+                                                                                simple, libCopier prepares and maintains default queues for
+             descr, segment_len); shared memory that apps use.                  each process. To accelerate the creation of descriptors during
+             _amemcpy(.., fd,        Allows customized management of            task submission, libCopier maintains a descriptor pool and
+             FUNC, desc, opts);      descriptors, FUNCs, and lazy copy.         pre-allocates descriptors with different sizes. When libCopier
+             _amemmove(..);          desc = descriptor. fd = file descriptor.
+                                                                                requires a descriptor, it fetches the proper one from the pool.
+  libCopier _csync(offset, size, fd, Allows customized descriptor
+ (low-level) descriptor, opts);      management. Set fd to -1 to use the        Optimizations with low-level APIs. libCopier provides
+                                     default queues.                            low-level APIs (e.g., _amemcpy) for expert developers for
+             copier_create_          Creates a client with user and kernel
+             mapped_queue(len); queues, and mmaps the user queues.
+                                                                                better performance. These APIs are used to optimize frame-
+                                     Creates Copier queues, and returns a
+                                                                                works (e.g., Binder or gRPC) which can benefit many high-
+             copier_create_
+             queue(len);             fd on success.                             level apps or a few significant apps. Specifically, low-level
+      OS
+   (Syscall) set_copier_opt(opts);   Sets global parameters.                    APIs enable two optimizations: (1) customized descriptor man-
+             copier_awaken(fd); Wakes the Copier thread during sleep.           agement: developers can re-use the descriptor of the same
+                                                                                buffer (e.g., I/O buffers) to avoid costs of descriptor allocation
+                                                                                and recycling, and use pre-determined descriptors for _csync
+Data access pattern. Copier is suitable for apps with regular                   to avoid table lookup costs. (2) multi-queue supports: devel-
+access patterns (e.g., sequential) and sufficient Copy-Use                      opers can create per-thread queues for a process, and use the
+windows, which is common in I/O-intensive and memory-                           specific queues with the fd. As Copier only tracks the depen-
+intensive apps (e.g., KV store, network protocol processing,                    dencies among paired kmode and umode queues, per-thread
+file I/O, IPC, etc.) [7]. It is unsuitable for apps that access                 queues are used by apps whose copies in different threads
+data randomly.                                                                  do not have dependency, e.g., common web servers [70, 71].
+Sensitivity. Like other polling-based solutions [44, 65–67],                    Multithreading and concurrency. Copier utilizes a lock-
+Copier may consume more CPU cycles. Copier is efficient                         free ring buffer as the underlying implementation of CSH
+when there are underutilized cores (common in datacen-                          Queues (§ 4.1). To submit a task, libCopier acquires a task
+ters [68, 69]). When CPU resources are fully utilized, it ben-                  buffer by moving the queue head using fetch-and-add. After
+efits latency-critical apps but may hurt throughput-critical                    filling the fields, it sets the task’s valid bit. Upon discovering a
+apps. For apps with copy chains or large copies, copy absorp-                   valid task at the queue tail, Copier processes it and advances
+tion and hardware capabilities can save more cycles than                        the tail (the order of tasks follows the order of acquiring).
+those consumed by polling, benefiting throughput-critical
+                                                                                Csync guidelines. We summarize guidelines for csync in-
+apps even with fully utilized cores. We evaluate this in §6.3.4.
+                                                                                sertion based on practices. (1) Direct data access: sync before
+                                                                                reading/writing destinations (dst) and writing sources (src).
+5     Practice of Copier
+                                                                                (2) Buffer free: sync before dst/src buffers are freed, or use
+As with prior OS services [25, 54], Copier requires effort to                   post-copy handler (§4.1). (3) Used by external lib/func: e.g.,
+leverage its capabilities to bring benefits. We present the                     sync before passing the buffer to strchr. (4) Visible to (un-
+toolchain that is designed to ease the use of Copier and the                    modified) external threads: e.g., sync before updating page
+guidelines (§5.1), and two OSes supporting Copier (§5.2 and                     table during CoW fault handling.
+§ 5.3), with cases where we utilize Copier to optimize OS
+                                                                                Correctness and semantic equivalence with formal ver-
+services, frameworks, and apps.
+                                                                                ification. We have verified that: once csync is correctly added
+5.1    Copier Toolchain                                                         according to the guidelines, the semantics of amemcpy refine
+                                                                                those of memcpy in both single-threaded and multi-threaded
+The toolchain includes three parts: libCopier to provide APIs                   contexts. 4 This means, Copier will not introduce any new
+for development, CopierSanitizer to provide tools for debug-                    bugs (compared with memcpy) once csync is correctly used.
+ging, and CopierGen to automate the porting.
+                                                                                Shared memory. libCopier supports asynchronous copy to
+5.1.1 Development with libCopier. We design libCopier                           shared memory. Processes exchanging data through shared
+with both high-level and low-level APIs, as documented in                       memory (shm) need to establish a dedicated shared buffer
+Table.2. Most developers can use high-level APIs, e.g., amem-
+cpy (async-memcpy), with similar interfaces as sync copy.                       4 The formal proofs are attached in the appendix for reference.
+(Dshm) for descriptors, and bind (shm_descr_bind) it with             leave handling complex issues (e.g., pointer passing) as future
+the shared memory to use high-level csync. libCopier uses             work. Mira faces a similar problem (checking whether the
+data’s offset to the start of shm to locate the data’s descrip-       data is remote or local before access) to Copier and supports
+tor on Dshm. csync for shared memory will wait until the              complex apps, making us believe in CopierGen’s practicality.
+descriptor is marked ready. Android Binder IPC, which we
+discuss and evaluate in the paper, is a use case of Copier on         5.2   The Cases of Copier in Linux
+shared memory.                                                        We implement Copier-Linux5 based on Linux-5.15.131. Copier
+   Although csync is lightweight, too frequent use of it (e.g.,       is used to boost the performance of OS components, frame-
+per-byte csync or sync the same data repeatedly) may lead to          works, and apps.
+performance degradation. However, in practice, its overhead
+                                                                      Network stack. We use Copier to optimize copies during
+is limited. First, memory accesses in typical apps exhibit
+                                                                      recv() and send(), where copy is used to transfer data be-
+locality, e.g., sequential/strided access, so apps can sync once
+                                                                      tween userspace and kernel. For recv(), the Copy-Use win-
+every one to few KB of data used. Second, copied data in copy-
+                                                                      dow exists between kernel copying data to userspace and
+bottlenecked apps is often one-time use, e.g., in OpenSSL [39]
+                                                                      apps using the data. We modify the network stack to sub-
+the data is never reused after being decrypted. Apps can sync
+                                                                      mit Copy Tasks with a descriptor provided by libCopier for
+the whole copy before the first use to avoid excessive csyncs.
+                                                                      apps to check. The Copy Tasks include a KFUNC to reclaim
+   Based on our practice on 10 apps and kernel services, de-
+                                                                      the socket buffers for reuse. For send(), the Copy-Use win-
+velopers can port typical apps with acceptable efforts (§6.3.1).
+                                                                      dow exists between kernel copying data to socket buffers
+5.1.2 Bug Detection with CopierSanitizer. Like other                  and driver submitting the packets to hardware queues. With
+services and APIs, developers may misuse amemcpy or csync,            checksum offloaded to NICs [80, 81], the TCP/IP layers no
+causing potential bugs. We develop CopierSanitizer, a bug             longer require data access, but just use packet metadata. The
+detection tool to help users find omitted or improper csyncs.         network stack submits Copy Tasks at the socket layer and
+                                                                      syncs the data before the driver enqueues packets into the
+Key idea. We utilize shadow memory to detect Copier-related
+                                                                      NIC TX queues.
+bugs, which is widely used in prior industrial bug detec-
+tion tools like AddressSanitizer [72], etc. [73, 74]. Specifically,   Copy-On-Write fault handling. CoW enhances forking
+CopierSanitizer uses shadow memory to record the meta-                efficiency but incurs runtime overhead from page fault han-
+data of program memory, enabling the detection of errors by           dling [82, 83], where copy is a notable bottleneck. In Copier-
+tracking memory accesses and identifying illegal accesses. It         Linux, kernel submits Copy Tasks after allocating a new
+identifies memory accesses during compilation and inserts             page, and syncs before updating the page table. Instead of
+lightweight instrumentation code to record the states and             offloading the whole copy, Copier-Linux divides the work
+detect the errors.                                                    between CoW handler and Copier to reduce the waiting time.
+Internal implementation. We implement CopierSanitizer                 Android Binder IPC framework. Binder IPC [37] entails
+based on AddressSanitizer [72]. Specifically, when a program          a two-step data transfer: client’s data is copied to a kernel
+calls amemcpy (and amemmove, etc.), CopierSanitizer marks             buffer by Binder driver, then IPC server maps the kernel
+the source and destination memory as “inaccessible” (“poi-            buffer into its address space. Apps utilize Parcel [84] frame-
+soned” [75]). After the program calls csync, it marks the re-         work to manage Binder IPC, which enables typed data writ-
+gion involved as “accessible”. In this way, memory accesses           ing into or reading from Binder messages. Copier optimizes
+and frees without csync will be captured and reported to              the copy with low-level APIs. Copier-Linux places the de-
+developers. CopierSanitizer supports multi-threaded apps.             scriptor at the front of messages (shared memory) and Parcel
+   CopierSanitizer now focuses on user-mode apps, and can             utilizes _csync before use. The copy is hidden by Binder
+be extended to kernel by incorporating KASan [76].                    driver’s processing (e.g., scheduling the server thread) and
+                                                                      server’s processing. As all the changes are made inside Binder
+5.1.3 Porting with CopierGen. To ease the burden of                   and Parcel, apps can benefit without any modifications.
+porting existing apps, we explore the method of utilizing
+compiler tools to automate the porting, following prior works         5.3   Practice of Copier on HarmonyOS
+like Mira [77]. The key insight is that IRs preserve high-level       We integrate Copier with HarmonyOS 5.0 (HongMeng ker-
+abstractions like variables, but with data access constrained         nel [4]) on smartphones experimentally. A significant chal-
+to a few operations, e.g., load and store [78], providing inser-      lenge is that the energy sensitivity of smartphones makes un-
+tion points for csync. We design CopierGen with a series of           controlled polling unsuitable. In response to this, we use the
+Passes [79], based on LLVM and MLIR [78]. Basically, Copier-          scenario-driven design (§4.5) and avoid long-term polling.
+Gen identifies variables corresponding to sources and des-
+tinations of copies, and inserts csync before access to them.
+We implement and validate it for basic cases like arrays, but         5 The source code is available at https://github.com/SJTU-IPADS/Copier.
+                    12                                     14
+                             Copier                                 Copier w/ Cache                                        Baseline (Linux)          io_uring (batch)             IOR-b+Copier
+Throughput (GBps)
+
+
+                    10                                     12       Copier w/o Cache                                       UB                        Copier                       Zero copy send
+                             ERMS
+                                                           10       ERMS                                                   io_uring
+                     8       AVX2                                   AVX2                                             1.2
+
+
+
+
+                                                                                                  Latency (norm'd)
+                                                            8                                                                                                 1.2
+                     6       DMA                                    DMA
+                                                            6                                                        1.0
+                                                                                                                                                              1.0
+                     4                                                                                               0.8
+                                                            4                                                                                                 0.8
+                                                                                                                     0.6
+                     2                                      2                                                        0.4                                      0.6
+                     0                                      0                                                        0.2
+                         1   2   4    8   16 32 64 12 25        1    2   4   8   16 32 64 12 25                                                               0.4
+                                                     8 6                                    8 6                      0.0
+                             Length per Task (KB)                   Length per Task (KB)                                   1   2    4    8   16 32 64 12 25         1   2    4    8   16 32 64 12 25
+                                                                                                                                                        8 6                                      8 6
+                                                                                                                                   Data Length (KB)                         Data Length (KB)
+                    (a) No buffer repetition                (b) 75% buffer repetition                                                   (a) Recv                                 (b) Send
+Figure 9. Copy throughput. The benchmark submits sufficient                                       Figure 10. Average latency of send() and recv() syscalls. The
+copy tasks and records the completion times. For the baselines,                                   load is generated by echo servers and clients. Zero-copy recv()
+we replace Copier’s copy method with glibc AVX-memcpy and                                         is not evaluated as it requires special NIC architecture [88, 89].
+kernel-mode methods (ERMS, DMA).                                                                  IOR-b = io_uring (batch).
+
+
+Copier is utilized to enhance the performance of video record-                                    for 4KB) compared to the default copy method in the kernel
+ing and playback, which involve numerous copies and are                                           (ERMS [29]), and by up to 38% (33% for 4KB) compared to
+critical scenarios for current smartphones.                                                       the userspace copy method (AVX2) when there is no buffer
+                                                                                                  repetition. When the rate of buffer repetition is 75%, Copier’s
+6                        Evaluation                                                               throughput increases by up to 63% (53% for 4KB) compared
+                                                                                                  to ERMS, and by up to 32% (30% for 4KB) compared to AVX2;
+In this section, we aim to clarify the following questions.
+                                                                                                  the ATCache brings a 2%–11% higher throughput.
+• How is the performance of Copier in handling copy re-
+quests? (§6.1.1)                                                                                  6.1.2 Performance of OS Services with Copier
+• How does Copier benefit other OS services? (§6.1.2)                                             Syscalls (send and recv). We compare Copier with the
+• How does Copier benefit real-world applications? (§6.2)                                         following syscall optimization methods and systems:
+• Is Copier effective and energy efficient in smartphone set-                                     • Kernel offloading (Case: UB [87]) reduces the number of
+tings? (§6.2.4)                                                                                   context switches by offloading userspace code into kernel.
+• What are the development efforts to adopt applications to                                       • Asynchronous syscalls [26] (Case: io_uring [25]) paral-
+Copier? (§6.3.1)                                                                                  lelize execution of syscalls and app to hide the overhead.
+• Can Copier make benefits when the CPU cores are fully                                           • Batch submitting and processing (Case: io_uring with
+utilized? (§6.3.4)                                                                                batching [25]) can reduce the number of context switches
+Experimental setup. The experiments on servers are con-                                           and improve locality. The batch size is configured as 100.
+ducted on servers with 2 Xeon E5-2650 v4 CPUs [85] with a                                         • Zero-copy (Case: zero-copy socket [24]) reduces the copy
+constant 2.9GHz frequency and 128GB DDR4 memory, unless                                           costs by sharing memory between kernel and apps.
+otherwise specified. The baselines are run on Linux-5.15.131,                                        Results (Fig.10) show that Copier reduces the latency of
+which is the system Copier is based on. Linux 5.15.131 still                                      send by 7%–37% compared to baseline (normal syscalls) and
+represents SOTA kernel copy implementations because, de-                                          by 27%–59% with io_uring batching. Copier reduces the la-
+spite some engineering improvements [86], the way Linux                                           tency of recv by 16%–92% and by 55%–93% with batching.
+performs memory copy (i.e., using the ERMS instructions)                                          UB’s effect diminishes as data size increases since copy dom-
+has not changed in newer Linux versions. The experiments                                          inates the costs. Zero-copy send performs better than Copier
+on smartphones are conducted on Huawei Mate 60 Pro, with                                          with large data (≥ 32KB), but has little effect for smaller data,
+Kirin 9000S CPU and HarmonyOS 5.0. In all experiments,                                            and introduces a non-trivial burden to manage the shared
+Copier uses one dedicated core to copy.                                                           buffers, as discussed in § 2.2. io_uring does not reduce the
+Baselines We compare Copier with the following state-of-                                          latency of syscall execution, and the optimization effect de-
+the-art works: Linux zero-copy socket [24], Userspace Bypass                                      pends on the apps. Batched io_uring improves performance
+(UB) [87], and zIO [7]. We set zIO’s threshold to 4KB, which                                      of both normal syscalls and syscalls with Copier, but its effect
+caps the minimum copy to apply it.                                                                diminishes as the data size increases for normal syscalls.
+                                                                                                  Android Binder IPC. We use a benchmark [14] to measure
+6.1                      Micro Benchmarks                                                         the end-to-end latency for the IPC client to send a message
+6.1.1 Copy Performance. We evaluate the throughput                                                containing n strings of 1KB, the server to read these strings
+of Copier to handle Copy Tasks of different sizes. Results                                        one by one, and then send a reply to the client. This pattern
+(Fig.9) show that the throughput of Copier, which uses AVX2                                       is widely present in data storage, image rendering, and au-
+and DMA to copy in parallel, increases by up to 158% (55%                                         dio playback apps. Experimental results show that Copier
+               0.25
+Latency (ms)
+
+
+
+
+                                                                                                                                                                                                                                                Improv. (%)
+                                                                                                                                                      TP. (kMPS)
+                                                                                                                                                                      8                                                                    40                 Baseline
+
+
+
+
+                                                                                                                          42.5%
+                                                                                                                                    Baseline
+
+
+
+
+                                                                                                                 39.0%
+                                                                                                     32.2%
+                0.2
+
+
+
+
+                                                                           25.0%
+
+                                                                                        30.6%
+                                                                                                                                                                    6.4                                                                    30
+
+
+
+
+                                                               14.0%
+                                                                                                                                                                                                                                                              zIO
+
+
+
+                                                   11.2%
+                                                                                                                                    UB
+                            4.2%
+
+                                       8.1%
+               0.15                                                                                                                                                 4.8                                                                    20
+                0.1                                                                                                                 zIO                             3.2                                                                    10                 Copier
+               0.05                                                                                                                 Zero Copy                       1.6                                                                    0                  Copier-imp.
+                  0
+                                                                                                                                    Copier                            0                                                                   -10                 zIO-imp.
+                       1           2           4           8           16          32           64        128 256                                                          1    2   4   8   16 32 64 128 256
+                                               Value Length (KB)                                                                                                               HTTP Message Length (KB)
+                                       (a) GET average latency                                                                                                            (a) (Single core) Throughput (TP.)
+Latency (ms)
+
+
+
+
+                0.6                                                                                                        2
+
+
+
+
+                                                                                                                                                       TP. (kMPS)
+                                                                                                                                              32.3%
+                                                                                                             36.4%
+                                                                                                                                                                    80                            40                                1.4
+
+
+
+
+                                                                                                                                                                                                       Improv. (%)
+                                                                                                                                                                                                                                                    Baseline
+
+
+
+
+                                                                                                                                                                                                                     TP. (norm’d)
+               0.45                                                                                                      1.6                                        60                            30
+
+
+
+
+                                                                                                                                    34.1%
+                                                                                                                                                                                                                                    1.2
+
+
+                                                                                             43.4%
+                                                                                                                                                                                                                                                    Async
+                                                                                28.2%
+                                                                                                                         1.2
+                                                                   19.1%
+                                                     8.3%
+                            2.7%
+
+
+
+
+                0.3
+                                        6.6%
+
+
+
+
+                                                                                                                         0.8                                        40                            20                                  1             +HW.
+               0.15                                                                                                      0.4                                        20                            10                                0.8             +Absorb
+                  0                                                                                                        0                                         0                            0                                                 (Copier)
+                        1          2           4               8           16           32           64                           128       256                           2 4 6 8 10 12 14 16                                            1   256
+                                               Value Length (KB)                                                                                                           Number of Cores                                          Msg. Length (KB)
+                                        (b) SET average latency                                                                                                      (b) Scalability (8KB message)                                   (c) Breakdown
+
+Figure 11. Results of Redis GET and SET. Workload is gener-                                                                                           Figure 12. TinyProxy’s throughput. MPS: messages per sec-
+ated by official redis-benchmark [90] with 8 parallel (closed-loop)                                                                                   ond. imp. = improvement. Load is generated by echo servers and
+clients. For SETs, improvement diminishes for values of ≥64KB                                                                                         clients proxied by TinyProxy. Fig.-b is conducted on servers with
+due to the increased overhead of request sending. Redis version:                                                                                      Xeon Gold 6238R CPUs [91]. TinyProxy version: v1.11.1.
+v6.2.14.
+
+                                                                                                                                                      6.2.2 TinyProxy. Network proxies are widely used in sce-
+reduces the average end-to-end latency by 9.6%–35.5% when                                                                                             narios such as load balancing, reverse proxying, etc. [92]. We
+n varies between 10–800.                                                                                                                              observe that many proxy functions (e.g., redirecting, load
+CoW Handling. We use a benchmark that continuously                                                                                                    balancing, rate limiting, etc.) do not need to use most of
+triggers CoW page faults and measures the average latency of                                                                                          the data in a message, but typically only use the request
+fault handling. Results show that Copier reduces the average                                                                                          line and message headers. This presents opportunities to
+thread blocking time per page fault by 71.8% for 2MB pages                                                                                            apply copy absorption (and lazy copy). TinyProxy [9] is a
+and 8.0% for 4KB pages.                                                                                                                               widely used lightweight proxy. It first reads the message and
+                                                                                                                                                      uses the request line and header to decide on the upstream
+6.2                   Application Benchmarks                                                                                                          server. Then it uses memcpy() to organize the message and
+6.2.1 Redis. Copier optimizes the 5 copies in Redis: (1)                                                                                              sends the message out. Copier can optimize the three copies
+copy of requests from kernel to I/O buffer in recv(); (2) when                                                                                        involved into a single (async) copy. We evaluate the through-
+processing SETs, copy of value from the I/O buffer to the                                                                                             put when TinyProxy performs HTTP message forwarding
+value’s buffer; (3) when processing GETs, copy of value from                                                                                          (Fig. 12-a). Compared with the baseline, Copier increases
+the value’s buffer to the I/O buffer; (4) copy of replies from                                                                                        the throughput by 7.2%–32.3%. zIO achieves up to an 11.6%
+I/O buffer to kernel in send(); (5) one of internal copies                                                                                            improvement compared with the baseline; it can only elim-
+during processing. Due to proactive fault handling, Copier                                                                                            inate one userspace copy because of its inability to handle
+also moves page faults during copy out of the critical path.                                                                                          inter-boundary copies. Furthermore, due to the use of page
+   Results (Fig.11) show that compared to baseline, Copier                                                                                            remapping, zIO cannot optimize messages that do not occupy
+reduces end-to-end average latency by 2.7%–43.4% for SETs                                                                                             entire pages and is effective only for messages of ≥16KB.
+and 4.2%–42.5% for GETs. Copier reduces tail latency (P99) by
+                                                                                                                                                      6.2.3 Frameworks and Libraries
+5.9%–33.4% for SETs, and 5.59%–47.8% for GETs. It improves
+throughput by 2.4%–50.0% for SETs and 4.2%–32.0% for GETs.                                                                                            Protobuf [36] is the serialization library used by gRPC [93].
+   We evaluate Linux zero-copy send(), which is only effi-                                                                                            The apps receive a serialized message from network and dese-
+cient when the value length is ≥32KB due to its alignment                                                                                             rialize it into an object with Protobuf. With Copier, copying
+constraints, TLB flush costs, and additional syscalls for own-                                                                                        the message to userspace is executed in parallel with dese-
+ership management. We compare Copier with zIO [7] and                                                                                                 rialization. Copier reduces the average latency of receiving
+UB [87]. UB can only optimize SETs and GETs of ≤4KB be-                                                                                               and deserializing a message by 4%–33%, as shown in Fig.13-a.
+cause it slows down the program’s memory access. zIO re-                                                                                              OpenSSL [39] is a famous TLS/SSL library. On receiving a
+duces latency by up to 20.0% for GETs because it efficiently                                                                                          message, it first copies it to userspace via recv() and then
+eliminates one userspace copy. However, because Redis al-                                                                                             decrypts it. Copier enables the copy to be executed in paral-
+ways reuses the input buffer and causes page faults, zIO is                                                                                           lel with decryption. Copier reduces the average latency of
+only effective for SETs of ≥64KB (up to 6.1% improvement).                                                                                            SSL_read() (AES-GCM) by 1.4%–8.4%, as shown in Fig.13-b.
+Copier outperforms these SOTA solutions because of its fea-                                                                                           zlib [38, 94] is a widely used compression library. It uses a
+sibility and effectiveness in optimizing diverse copy cases.                                                                                          sliding window as the interval for pattern matching, whose
+                                                                                                                                                  Latency (ms)
+ Latency (µs)
+
+
+
+
+                                                            Latency (µs)
+                256       Baseline                                         256       Baseline                                                                    60        Baseline
+                 64       Copier                                            64       Copier                                                                                Copier
+                                                                                                                                                                 40
+                 16                                                         16
+                  4                                                          4                                                                                   20
+                  1                                                          1                                                                                    0
+                      1    2     4   8   16 32 64 128 256                        1     2   4                8     16 32 64 128 256                                        HD    1080p     4K
+                                Object Length (KB)                                         Msg. Length (KB)                                                                Video Resolution
+                               (a) Protobuf (Deser.)                                       (b) OpenSSL Dec.                                                           (c) Avcodec
+
+Figure 13. Results of libraries and HarmonyOS (smartphone). Since the maximum size of a TLS record is 16KB, the speedup of
+OpenSSL with Copier remains stable for sizes ≥ 16KB. Copier reduces the average latency by up to 33%, 8.4%, 10% for the three scenarios,
+respectively. Protobuf version: v4.23.0 OpenSSL version: v3.4.0.
+
+movement relies on data copy. Copier enables copying data                                                  0.25                               200
+
+
+
+
+                                                                                            Latency (ms)
+
+
+
+
+                                                                                                                                     TP. (kRPS)
+                                                                                                            0.2                               160                                     BL-8K
+to the sliding window to be executed in parallel with pat-                                                 0.15                               120                                     Copier-8K
+                                                                                                            0.1                                80
+tern matching, and achieves up to an 18.8% speedup when                                                    0.05                                40                                     BL-16K
+                                                                                                                                                                                      Copier-16K
+compressing (deflate_fast()) data under 256KB.                                                                0
+                                                                                                                   1   2   3   4
+                                                                                                                                                0
+                                                                                                                                                                 1    2     3   4
+                                                                                                             Number of Redis Server               Number of Redis Server
+6.2.4 Copier on Smartphone OS. Avcodec is HarmonyOS                                                               (a) Avg. latency                               (b) Throughput
+5.0’s unified audio/video coder/decoder framework. It copies
+data from inner buffers to the frame buffer after decoding.                                Figure 14. Redis SET performance with 4 cores.
+Copier enables the copy to be performed in parallel with sub-                              BL = Baseline. When Redis number = 4, at most 3 instances are
+sequent logic before data usage (passing to rendering). We                                 running simultaneously in Copier environment. We use 8 parallel
+use production benchmarks which decodes video for 300s.                                    clients per instance.
+Results (Fig.13-c, on Huawei Mate 60 Pro with Kirin 9000S
+CPU) indicate that Copier reduces the decoding latency per                                 copy absorption (§4.4). Results (Fig.12-c) show that for small
+frame by 3%–10% with a 0.07%–0.29% increase in energy con-                                 copy (1KB), as it can be fully overlapped, async copy plays a
+sumption, which reduces frame drops during video playback                                  major role; for large copy (256KB) that is hard to be fully over-
+by up to 22%. Copier’s scenario-driven polling design saves                                lapped, hardware and absorption also matter significantly.
+energy (§ 4.5.1), where Copier is activated only for copy-
+intensive workloads, and sleeps when queues are empty.                                     6.3.4 Whole System Resource Utilization. We evaluate
+                                                                                           how Copier’s design of using dedicated cores affects the
+6.3              Extended Studies                                                          system’s overall performance. We limit the total resources
+6.3.1 Efforts to Adapt Applications. The efforts for legacy                                to 4 cores and incrementally increase Redis instances until
+apps and OS services are moderate, as much complexity is                                   all cores are fully utilized. Results (Fig.14) show that when
+handled by libCopier, as shown in Table.3. CopierSanitizer                                 there are idle cores, Copier can optimize both latency and
+helps us locate positions to add csync and avoid omissions.                                throughput of the system. When resources are fully utilized,
+It took a graduate student 1-2 weeks to port complex apps                                  Copier reduces the request latency (by 18.8% for 8KB values
+with many copies (e.g., Redis and TinyProxy), and 1-2 days                                 and 17.4% for 16KB values). But as some cycles are used for
+to port relatively simple apps (e.g., zlib and Protobuf).                                  task submitting and polling, the overall throughput decreases
+                                                                                           (by 4.3% for 8KB and 6.5% for 16KB). For apps with copy
+App/OS Service LoC App/OS Service LoC App/OS Service LoC                                   chains or large copies, since Copier can utilize hardware
+    recv()      58   Tinyproxy     27 Redis (SET&GET)     37                               capabilities and copy absorption to reduce the CPU cycles
+                56    Protobuf     14       CoW           42
+    send()                                                                                 used by copy, using Copier can still increase the throughput,
+ zlib (deflate) 18    OpenSSL          Android Binder 55 driver,
+                                   31                 48 Parcel                            e.g., for TinyProxy (§ 6.2.2, § 6.3.2) using equally 16 cores,
+   Avcodec      94 (AES-GCM dec.)            IPC
+Table 3. Development efforts to adapt 10 apps and OS                                       Copier increases the throughput by 7.7%.
+services evaluated.                                                                        6.3.5 Microarchitectural Impact of Copier. Copier can
+                                                                                           mitigate pollution of the cache by decoupling large copy and
+6.3.2 Multi-threading Scalability. We evaluate Copier’s
+                                                                                           app execution, thus reducing cache miss rate, which aligns
+scalability using Tinyproxy, with the default per-process
+                                                                                           with the observations of DPDK and glibc [95, 96]. When
+queues. Results (Fig.12-b) show that Copier scales well with
+                                                                                           performing a large copy, app’s hot data may be evicted from
+16 threads and more than 130K tasks submitted per queue
+                                                                                           the top-level cache, resulting in a higher cache miss rate
+per second, thanks to Copier’s lock-free queue design.
+                                                                                           during execution. Copier reduces the eviction of hot data,
+6.3.3 Performance Breakdown. We analyze the impacts                                        thus reducing cache miss rate and optimizing CPI (cycles
+of async copy (§ 4.1, § 4.2), hardware capability (§ 4.3), and                             per instruction). Although Copier results in copied data not
+being placed in top-level cache, processors have efficient         and Lazylog [110] abstraction makes log ordering async. We
+cache prefetching, and apps typically prefer access patterns       are the first to utilize the async idea to copy as an OS service.
+friendly to prefetching, e.g., sequential access. We record the    Zero-copy for specific scenarios. IX [111], etc.[112–115]
+numbers of cycles and instructions for Redis processing 50K        propose new APIs to achieve zero-copy I/O stack. Corn-
+SETs/GETs, and remove those of copy and polling. Copier            flakes [116] trades off between zero-copy serialization and
+reduces the CPI of copy-irrelevant code by 4%–16% for SETs         copy-based ones. They have similar issues as discussed in
+and 6%–9% for GETs when value size varies between 4KB–             §2.2, which can be mitigated with Copier.
+64KB. In cache-sensitive scenarios [97–99], apps can switch        Fast kernel-userspace communication. Queues and shared
+to sync copy if Copier yields unfavorable results.                 memory achieve lightweight K-U communication [25–27].
+                                                                   𝜇SWITCH [117] proposes implicit context switching. mTCP
+7   Discussion                                                     [115] consolidates syscalls into a shared memory access.
+                                                                   Copier adopts the same idea, and proposes copy-use pipeline
+The prospects of Copier as a hardware primitive. We
+                                                                   to further exploit async copy benefits.
+believe Copier can be further integrated as a CPU hardware
+primitive to reduce CPU usage caused by polling and en-            Rearchitecting library-based solutions as system ser-
+hance the performance of async copy. Prior efforts [57, 100,       vices. mRPC [118] implements RPC marshaling as a system
+101] have integrated some memory copy optimizations to             service. Shenango et al. [119, 120] propose standalone sched-
+ISA primitives or memory controller functions. Although            uling services. FSP [121] rearchitects FS as a user process for
+they do not provide async copy capabilities, they demon-           fast development. Copier follows this line but focuses on a
+strate the feasibility of developing more efficient hardware       different challenge, how to copy memory efficiently.
+primitives for copy. Advanced AI accelerators, such as GPUs        Hardware-assisted copy optimizations. Mondrian [122,
+(e.g., Nvidia Tensor Memory Accelerator [102]) and NPUs            123], etc. [124] share memory through hardware capability.
+(e.g., Ascend NPU Memory Transfer Engine [103]), provide           M3 [125] proposes DTU for effective copy. RowClone [57]
+hardware primitives for async copy, but their domain-specific      adds memcpy primitive to ISA. 𝑀𝐶 2 [100] and SDAM [101]
+(e.g., tensor-specific) primitives are difficult to adapt to the   modify the memory controller to support lazy copy and
+complex software forms and copy requirements on CPUs.              software-defined address mapping. They require critical hard-
+The applicability of Copier in more OS services and                ware changes. DTO [28] provides a library to accelerate large
+scenarios. Besides the OS services discussed (send/recv            userspace copy with Intel DSA [56], but fails to maintain
+syscalls, Binder IPC and page fault handler), we believe that      fairness and isolation when multiple apps use DSA.
+Copier can benefit more OS services, including file I/O, de-
+vice virtualization, tiered memory management, etc. As a
+                                                                   9   Conclusion
+unified OS service, Copier provides a general interface for        We present Copier, the first effort to reconstruct asynchro-
+all OS services to asynchronously copy memory. We also             nous memory copy as a standalone OS service. Copier lever-
+believe that Copier demonstrates potential applicability in        ages Copy-Use windows and its OS service role to optimize
+a wider range of scenarios, such as disaggregated memory           copies throughout the entire system. Many novel design
+and tiered memory systems, etc.                                    spaces are explored, including OS abstractions, hardware
+The security of Copier. Copier avoids Time-of-Check-to-            dispatcher mechanisms, copy absorption, management and
+Time-of-Use risks of zero-copy because, instead of sharing         scheduling, and programming primitives. Our practices con-
+the ownership, it ensures the data has been copied to private      firm Copier’s generality and efficiency.
+buffers, which cannot be modified by attackers, before being
+checked. In scenarios where components that need to trans-
+                                                                   Acknowledgments
+fer data do not trust each other, Copier can provide a secure      We are grateful to our shepherd Jason Nieh for his detailed
+and efficient data passing method. LionsOS [104] proposes          suggestions, which significantly improved the paper. We
+an OS copy service (also named Copier) to ensure secure            thank the anonymous SOSP reviewers for their constructive
+data transfer between untrusted components, but it does not        feedback. We thank Haoru Zhao, whose suggestions signif-
+expose the opportunities of asynchrony and optimizations.          icantly improved the paper, and Jiawei Wang, who helped
+                                                                   us identify copy-intensive scenarios in HarmonyOS 5.0. We
+                                                                   also thank Erhu Feng, Jiahao Chen, Dingji Li, Fangnuo Wu,
+8   Related Work                                                   and Mingkai Dong for their valuable suggestions. This work
+Async syscalls and I/O parallelize OS and app execution,           was supported in part by the Fundamental Research Funds
+e.g., FlexSC [26, 105], etc. [106, 107]. The multikernel [108]     for the Central Universities.
+proposes async messaging. Demikernel [55] proposes async              Corresponding authors: Dong Du (dd_nirvana@sjtu.edu.
+queue-based I/O abstractions. SKYROS [109] accelerates repli-      cn), Yubin Xia (xiayubin@sjtu.edu.cn), and Haibo Chen
+cated storage by making nil-externalizing operations async,        (haibochen@sjtu.edu.cn).
+A     Simulation Proof of the Equivalence                                 We model amemcpy(dst, src, size, handler) as follows: (1)
+      between Async Copy with csync and                                a while loop with each round atomically reading a byte from
+      Sync Copy 6                                                      src and writing to dst until size bytes are copied (same as
+                                                                       memcpy except that writing will append to the value list),
+We prove at the protocol level that the semantics of async             and (2) upon invocation, recording the amemcpy’s status
+copy contextually refine those of sync copy. Specifically,             (args, id, false, false, handler) in the auxiliary list.
+we consider the refinement relation between two versions                  The step of the placeholder updates the passph field to
+                                                 def
+of an arbitrary multi-threaded program (𝑃 = 𝐶 1 ∥ . . . ∥ 𝐶𝑛 ),        true. If the csynced field is true, we will execute the handler.
+one using memcpy, written as (𝑃𝑠𝑦𝑛𝑐 ), and the other using                The csync operation atomically truncates the target ad-
+amemcpy and csync, written as (𝑃𝑎𝑠𝑦𝑛𝑐 ). To prove 𝑃𝑎𝑠𝑦𝑛𝑐               dress range. Once an amemcpy is fully csynced, (1) we update
+refines 𝑃𝑠𝑦𝑛𝑐 , we only need to show that, for each thread,            its csynced field to true and (2) if the passph field is already
+there is a rely-guarantee-based simulation (RGSim) [126]               true, we execute the handler.
+from 𝐶𝑖 −𝑠𝑦𝑛𝑐 to 𝐶𝑖 −𝑎𝑠𝑦𝑛𝑐 , i.e., for each step 𝐶𝑖 −𝑎𝑠𝑦𝑛𝑐 makes,
+                                                                       Consistency relation. If passph is true and csynced is false,
+𝐶𝑖 −𝑠𝑦𝑛𝑐 can make corresponding steps to preserve the con-
+                                                                       it means some free operation in 𝐶𝑖 −𝑠𝑦𝑛𝑐 has executed while
+sistency relation and generate the same observable behavior.
+                                                                       the corresponding handler in 𝐶𝑖 −𝑎𝑠𝑦𝑛𝑐 has not. We collect
+Program transformation. We define the transformation                   such freed memory in all threads as 𝑀 𝑓 𝑟𝑒𝑒 . Then
+from 𝐶𝑖 −𝑠𝑦𝑛𝑐 to 𝐶𝑖 −𝑎𝑠𝑦𝑛𝑐 as follows: (1) amemcpy replaces            𝑑𝑜𝑚(𝑀𝑎𝑠𝑦𝑛𝑐 ) = 𝑑𝑜𝑚(𝑀𝑠𝑦𝑛𝑐 ⊎ 𝑀 𝑓 𝑟𝑒𝑒 ).
+memcpy in all occurrences, (2) 𝐶𝑖 −𝑠𝑦𝑛𝑐 ’s code that corre-               For each memory address 𝑎 in 𝑀𝑠𝑦𝑛𝑐 , its value, 𝑀𝑠𝑦𝑛𝑐 (𝑎),
+sponds to the handler is replaced by a placeholder in 𝐶𝑖 −𝑎𝑠𝑦𝑛𝑐 ,      equals the corresponding latest value in 𝑀𝑎𝑠𝑦𝑛𝑐 ,
+which identifies the point where 𝐶𝑖 −𝑠𝑦𝑛𝑐 executes the handler,        𝑙𝑎𝑡𝑒𝑠𝑡 (𝑀𝑎𝑠𝑦𝑛𝑐 (𝑎)), where 𝑙𝑎𝑡𝑒𝑠𝑡 ((𝑣, 𝑖𝑑) ::𝑣𝑙 ′ ) returns the value
+(3) before reading or writing the dst range [addr, addr+len), a        with the largest 𝑖𝑑, and 𝑙𝑎𝑡𝑒𝑠𝑡 (𝑣) returns 𝑣.
+csync(addr, len) (or csync_all()) is inserted, (4) before writ-
+                                                                       Simulation proof.
+ing to the source (src) range [addr, addr+len], a 𝑐𝑠𝑦𝑛𝑐 (𝑎𝑑𝑑𝑟 −
+                                                                       Proof.
+𝑠𝑟𝑐 +𝑑𝑠𝑡, 𝑙𝑒𝑛) (or csync_all()) is inserted, and (5) before a des-
+                                                                          We divide the steps of 𝐶𝑖 −𝑎𝑠𝑦𝑛𝑐 into the following cate-
+tination (dst) range is visible to another thread, a csync_all()
+                                                                       gories: steps of amemcpy, step of csync, step of placeholder,
+is inserted. Note that amemcpy does not count as a read or
+                                                                       reading or writing a dst range of amemcpy, writing to a src
+write access.
+                                                                       range of amemcpy, and other steps (non-amemcpy related
+State model. For 𝑃𝑎𝑠𝑦𝑛𝑐 , the memory maps each address to              steps).
+                                          def
+a value (𝑣) or a list of value pairs (𝑣𝑙 = (𝑣, 𝑖𝑑) :: 𝑣𝑙 ′ ) in case      Rely and guarantee conditions specify that each step pre-
+there are pending amemcpy operations on the address. Each              serves consistency relation. Given consistency relation holds
+value pair consists of a value and the amemcpy’s identifier.           before the step, we prove it still holds after each step of
+When an amemcpy operation starts to copy memory, it is                 𝐶𝑖 −𝑎𝑠𝑦𝑛𝑐 .
+assigned a unique identifier. A csync operation on an ad-               1 Steps of amemcpy. For each byte copied in amemcpy,
+dress truncates the list to the latest value, i.e., the one with          𝐶𝑖 −𝑠𝑦𝑛𝑐 executes memcpy to copy the corresponding byte.
+the largest identifier. Reading a list of value pairs (only al-            The memory domains do not change. For each address
+lowed by amemcpy, other reads use csync first) returns the                 of dst range, 𝑀𝑠𝑦𝑛𝑐 (𝑎) = 𝑙𝑎𝑡𝑒𝑠𝑡 (𝑀𝑎𝑠𝑦𝑛𝑐 (𝑎)). The value of
+latest value. Writing to a list of value pairs (only allowed by            other addresses does not change.
+amemcpy) appends a new value pair to the list.                          2 Step of csync. After truncating the value list, 𝑀𝑠𝑦𝑛𝑐 (𝑎) =
+   𝑃𝑎𝑠𝑦𝑛𝑐 also has an auxiliary state, i.e., a list of amemcpy             𝑀𝑎𝑠𝑦𝑛𝑐 (𝑎). In the case when an amemcpy is fully csynced
+operations and their status. Each item in the list is (args,               and passph is true, the execution of the handler will free
+id, csynced, passph, handler). The first two fields are the                the part of memory that has already been freed in 𝐶𝑖 −𝑠𝑦𝑛𝑐 .
+arguments and the identifier of the amemcpy operation. The                 Therefore, memory domains still obey the consistency
+third field is true or false, indicating whether the amemcpy               relation.
+has been fully csynced or not. The fourth field is also a               3 Step of placeholder. 𝐶𝑖 −𝑠𝑦𝑛𝑐 correspondingly executes
+Boolean value, marking whether the execution has passed                    the free operation. If csynced is false, 𝑀 𝑓 𝑟𝑒𝑒 will include
+the placeholder or not. The last field records the handler for             the part of memory newly freed in 𝐶𝑖 −𝑠𝑦𝑛𝑐 , thus
+future execution.                                                         𝑑𝑜𝑚(𝑀𝑎𝑠𝑦𝑛𝑐 ) = 𝑑𝑜𝑚(𝑀𝑠𝑦𝑛𝑐 ⊎𝑀 𝑓 𝑟𝑒𝑒 ) still holds. If csynced
+Semantics modelling. We model memcpy(dst, src, size) as                    is true, then the handler will be executed. Consequently,
+a while-loop, with each round copying a byte atomically                   𝐶𝑖 −𝑠𝑦𝑛𝑐 and 𝐶𝑖 −𝑎𝑠𝑦𝑛𝑐 will free the same memory, thus the
+from src to dst until size bytes are copied. In cases where src            consistency relation still holds.
+and dst have overlapping parts, memcpy(dst, src, size) will             4 Reading or writing to dst range. 𝐶𝑖 −𝑠𝑦𝑛𝑐 correspond-
+copy either forward or backward to avoid overwriting data.                 ingly executes reads or writes. Because a csync is inserted
+6 The appendix was not peer-reviewed.
+  before the command, 𝐶𝑖 −𝑠𝑦𝑛𝑐 and 𝐶𝑖 −𝑎𝑠𝑦𝑛𝑐 will read the                    [11] Sage A. Weil, Scott A. Brandt, Ethan L. Miller, Darrell D. E. Long, and
+  same value, or after the write, the values are still equal.                      Carlos Maltzahn. 2006. Ceph: a scalable, high-performance distributed
+5 Writing to src range. 𝐶𝑖 −𝑠𝑦𝑛𝑐 correspondingly executes                          file system. In Proceedings of the 7th Symposium on Operating Systems
+                                                                                   Design and Implementation (Seattle, Washington) (OSDI ’06). USENIX
+  writes. Because a csync is inserted before the command,                          Association, USA, 307–320. https://www.usenix.org/legacy/events/
+  the values of the address are still equal.                                       osdi06/tech/full_papers/weil/weil_html/
+6 Non-amemcpy related steps. 𝐶𝑖 −𝑠𝑦𝑛𝑐 correspondingly                         [12] 2024. MongoDB. https://www.mongodb.com/.
+  executes the same step. The consistency relation still                      [13] Qizhe Cai, Shubham Chaudhary, Midhul Vuppalapati, Jaehyun
+  holds.                                                                           Hwang, and Rachit Agarwal. 2021. Understanding host network stack
+                                                                                   overheads. In Proceedings of the 2021 ACM SIGCOMM 2021 Conference
+  According to the compositionality and soundness of RGSim,                        (Virtual Event, USA) (SIGCOMM ’21). Association for Computing Ma-
+we prove that 𝑃𝑎𝑠𝑦𝑛𝑐 refines 𝑃𝑠𝑦𝑛𝑐 .                                               chinery, New York, NY, USA, 65–77. https://doi.org/10.1145/3452296.
+Qed.                                                                               3472888
+                                                                              [14] Dong Du, Zhichao Hua, Yubin Xia, Binyu Zang, and Haibo Chen.
+                                                                                   2019. XPC: architectural support for secure and efficient cross process
+References                                                                         call. In Proceedings of the 46th International Symposium on Computer
+                                                                                   Architecture (Phoenix, Arizona) (ISCA ’19). Association for Computing
+  [1] Jingbo Su, Jiahao Li, Luofan Chen, Cheng Li, Kai Zhang, Liang Yang,
+                                                                                   Machinery, New York, NY, USA, 671–684. https://doi.org/10.1145/
+      and Yinlong Xu. 2023. Revitalizing the Forgotten On-Chip DMA to              3307650.3322218
+      Expedite Data Movement in NVM-based Storage Systems. In 21st            [15] 2022. Fast memcpy, A System Design. https://www.sigarch.org/fast-
+      USENIX Conference on File and Storage Technologies (FAST 23). USENIX         memcpy-a-system-design/.
+      Association, Santa Clara, CA, 363–378. https://www.usenix.org/          [16] Svilen Kanev, Sam Likun Xi, Gu-Yeon Wei, and David Brooks. 2017.
+      conference/fast23/presentation/su                                            Mallacc: Accelerating Memory Allocation. In Proceedings of the
+  [2] Jiaxing Qiu, Zijie Zhou, Yang Li, Zhenhua Li, Feng Qian, Hao Lin, Di         Twenty-Second International Conference on Architectural Support for
+      Gao, Haitao Su, Xin Miao, Yunhao Liu, and Tianyin Xu. 2024. vSoC:            Programming Languages and Operating Systems (Xi’an, China) (ASP-
+      Efficient Virtual System-on-Chip on Heterogeneous Hardware. In               LOS ’17). Association for Computing Machinery, New York, NY, USA,
+      Proceedings of the ACM SIGOPS 30th Symposium on Operating Systems            33–45. https://doi.org/10.1145/3037697.3037736
+      Principles (Austin, TX, USA) (SOSP ’24). Association for Computing      [17] Svilen Kanev, Juan Pablo Darago, Kim Hazelwood, Parthasarathy
+      Machinery, New York, NY, USA, 558–573. https://doi.org/10.1145/              Ranganathan, Tipp Moseley, Gu-Yeon Wei, and David Brooks. 2015.
+      3694715.3695946                                                              Profiling a warehouse-scale computer. In Proceedings of the 42nd
+  [3] Mark Mansi, Bijan Tabatabai, and Michael M. Swift. 2022. CBMM:               Annual International Symposium on Computer Architecture (Portland,
+      Financial Advice for Kernel Memory Managers. In 2022 USENIX An-              Oregon) (ISCA ’15). Association for Computing Machinery, New York,
+      nual Technical Conference (USENIX ATC 22). USENIX Association,               NY, USA, 158–169. https://doi.org/10.1145/2749469.2750392
+      Carlsbad, CA, 593–608. https://www.usenix.org/conference/atc22/         [18] Abraham Gonzalez, Aasheesh Kolli, Samira Khan, Sihang Liu,
+      presentation/mansi                                                           Vidushi Dadu, Sagar Karandikar, Jichuan Chang, Krste Asanovic,
+  [4] Haibo Chen, Xie Miao, Ning Jia, Nan Wang, Yu Li, Nian Liu, Yutao             and Parthasarathy Ranganathan. 2023. Profiling Hyperscale Big Data
+      Liu, Fei Wang, Qiang Huang, Kun Li, Hongyang Yang, Hui Wang,                 Processing. In Proceedings of the 50th Annual International Symposium
+      Jie Yin, Yu Peng, and Fengwei Xu. 2024. Microkernel Goes General:            on Computer Architecture (Orlando, FL, USA) (ISCA ’23). Association
+      Performance and Compatibility in the HongMeng Production Micro-              for Computing Machinery, New York, NY, USA, Article 47, 16 pages.
+      kernel. In 18th USENIX Symposium on Operating Systems Design and             https://doi.org/10.1145/3579371.3589082
+      Implementation (OSDI 24). USENIX Association, Santa Clara, CA, 465–     [19] 2018. Avoid barrier_nospec() in 64-bit copy_from_user() (Linux
+      485. https://www.usenix.org/conference/osdi24/presentation/chen-             patch). https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.
+      haibo
+                                                                                   git/commit/?id=0fc810ae3ae110f9e2fcccce80fc8c8d62f97907.
+  [5] Ankit Bhardwaj, Chinmay Kulkarni, Reto Achermann, Irina Cal-            [20] 2022. AArch64: Add SVE memcpy (glibc patch). https://sourceware.
+      ciu, Sanidhya Kashyap, Ryan Stutsman, Amy Tai, and Gerd Zell-                org/pipermail/glibc-cvs/2024q2/084846.html.
+      weger. 2021. NrOS: Effective Replication and Sharing in an Op-          [21] 2022. Imporve 64bit memcpy performance for Haswell CPU with
+      erating System. In 15th USENIX Symposium on Operating Systems                AVX instruction (glibc patch). https://sourceware.org/pipermail/libc-
+      Design and Implementation (OSDI 21). USENIX Association, 295–312.            alpha/2014-June/051959.html.
+      https://www.usenix.org/conference/osdi21/presentation/bhardwaj          [22] Changwoo Min, Woonhak Kang, Mohan Kumar, Sanidhya Kashyap,
+  [6] Youngjin Kwon, Henrique Fingler, Tyler Hunt, Simon Peter, Emmett             Steffen Maass, Heeseung Jo, and Taesoo Kim. 2018. Solros: a data-
+      Witchel, and Thomas Anderson. 2017. Strata: A Cross Media File               centric operating system architecture for heterogeneous computing.
+      System. In Proceedings of the 26th Symposium on Operating Systems            In Proceedings of the Thirteenth EuroSys Conference (Porto, Portugal)
+      Principles (Shanghai, China) (SOSP ’17). Association for Computing           (EuroSys ’18). Association for Computing Machinery, New York, NY,
+      Machinery, New York, NY, USA, 460–477. https://doi.org/10.1145/              USA, Article 36, 15 pages. https://doi.org/10.1145/3190508.3190523
+      3132747.3132770                                                         [23] 2025.       Intel Advanced Vector Extensions 2 (Intel AVX2).
+  [7] Timothy Stamler, Deukyeon Hwang, Amanda Raybuck, Wei Zhang,                  https://edc.intel.com/content/www/us/en/design/ipla/software-
+      and Simon Peter. 2022. zIO: Accelerating IO-Intensive Applications           development-platforms/client/platforms/alder-lake-desktop/12th-
+      with Transparent Zero-Copy IO. In 16th USENIX Symposium on Op-               generation-intel-core-processors-datasheet-volume-1-of-
+      erating Systems Design and Implementation (OSDI 22). USENIX Asso-            2/002/intel-advanced-vector-extensions-2-intel-avx2/.
+      ciation, Carlsbad, CA, 431–445. https://www.usenix.org/conference/      [24] 2024. MSG_ZEROCOPY Document. https://www.kernel.org/doc/
+      osdi22/presentation/stamler                                                  html/v4.18/networking/msg_zerocopy.html.
+  [8] 2025. Redis Documentation. https://redis.io/docs/.                      [25] Jonathan Corbet. 2020. The rapid growth of io_uring. https://lwn.
+  [9] 2024. Tinyproxy: lightweight http(s) proxy daemon. https://tinyproxy.        net/Articles/810414/.
+      github.io.
+ [10] 2024. Nginx. https://nginx.org/en/.
+[26] Livio Soares and Michael Stumm. 2010. FlexSC: flexible system call       [44] Antoine Kaufmann, Tim Stamler, Simon Peter, Naveen Kr. Sharma,
+     scheduling with exception-less system calls. In Proceedings of the 9th        Arvind Krishnamurthy, and Thomas Anderson. 2019. TAS: TCP
+     USENIX Conference on Operating Systems Design and Implementa-                 Acceleration as an OS Service. In Proceedings of the Fourteenth EuroSys
+     tion (Vancouver, BC, Canada) (OSDI’10). USENIX Association, USA,              Conference 2019 (Dresden, Germany) (EuroSys ’19). Association for
+     33–46. https://www.usenix.org/conference/osdi10/flexsc-flexible-              Computing Machinery, New York, NY, USA, Article 24, 16 pages.
+     system-call-scheduling-exception-less-system-calls                            https://doi.org/10.1145/3302424.3303985
+[27] Kyu-Jin Cho, Jaewon Choi, Hyungjoon Kwon, and Jin-Soo Kim. 2024.         [45] 2022. Intel Architecture Instruction Set Extensions and Future Fea-
+     RFUSE: Modernizing Userspace Filesystem Framework through Scal-               tures. https://www.intel.com/content/www/us/en/support/articles/
+     able Kernel-Userspace Communication. In 22nd USENIX Conference                000005779/processors.html.
+     on File and Storage Technologies (FAST 24). 141–157.                     [46] 2018. Why can the kernel not use SSE/AVX registers and instructions?
+[28] Reese Kuper, Ipoom Jeong, Yifan Yuan, Ren Wang, Narayan Ran-                  https://unix.stackexchange.com/questions/475956.
+     ganathan, Nikhil Rao, Jiayu Hu, Sanjay Kumar, Philip Lantz, and          [47] 2006. Accelerating High-Speed Networking with Intel I/O Acceler-
+     Nam Sung Kim. 2024. A Quantitative Analysis and Guidelines of                 ation Technology. https://www.intel.com/content/dam/doc/white-
+     Data Streaming Accelerator in Modern Intel Xeon Scalable Pro-                 paper/i-o-acceleration-technology-paper.pdf.
+     cessors. In Proceedings of the 29th ACM International Conference         [48] Hsiao-keng Jerry Chu. 1996. Zero-copy TCP in Solaris. In Pro-
+     on Architectural Support for Programming Languages and Operat-                ceedings of the 1996 Annual Conference on USENIX Annual Techni-
+     ing Systems, Volume 2 (La Jolla, CA, USA) (ASPLOS ’24). Associa-              cal Conference (San Diego, CA) (ATEC ’96). USENIX Association,
+     tion for Computing Machinery, New York, NY, USA, 37–54. https:                USA, 21. https://www.usenix.org/conference/usenix-1996-annual-
+     //doi.org/10.1145/3620665.3640401                                             technical-conference/zero-copy-tcp-solaris
+[29] 2016. (GNU C library patch) Initial Enhanced REP MOVSB/STOSB             [49] Alex Markuze, Igor Smolyar, Adam Morrison, and Dan Tsafrir. 2018.
+     (ERMS) support. https://patchwork.ozlabs.org/project/glibc/patch/             DAMN: Overhead-Free IOMMU Protection for Networking. In Pro-
+     20160328204830.GA402@intel.com.                                               ceedings of the Twenty-Third International Conference on Architectural
+[30] Jochen Liedtke. 1993. Improving IPC by kernel design. In Pro-                 Support for Programming Languages and Operating Systems (Williams-
+     ceedings of the Fourteenth ACM Symposium on Operating Systems                 burg, VA, USA) (ASPLOS ’18). Association for Computing Machin-
+     Principles (Asheville, North Carolina, USA) (SOSP ’93). Association           ery, New York, NY, USA, 301–315. https://doi.org/10.1145/3173162.
+     for Computing Machinery, New York, NY, USA, 175–188. https:                   3173175
+     //doi.org/10.1145/168619.168633                                          [50] Deepti Raghavan, Philip Levis, Matei Zaharia, and Irene Zhang.
+[31] 2024. sendfile(2) — Linux manual page. https://man7.org/linux/man-            2021. Breakfast of champions: towards zero-copy serialization
+     pages/man2/sendfile.2.html.                                                   with NIC scatter-gather. In Proceedings of the Workshop on Hot Top-
+[32] 2024. vmsplice(2) — Linux manual page. https://man7.org/linux/man-            ics in Operating Systems (Ann Arbor, Michigan) (HotOS ’21). Asso-
+     pages/man2/vmsplice.2.html.                                                   ciation for Computing Machinery, New York, NY, USA, 199–205.
+[33] Simon Peter, Jialin Li, Irene Zhang, Dan R. K. Ports, Doug Woos,              https://doi.org/10.1145/3458336.3465287
+     Arvind Krishnamurthy, Thomas Anderson, and Timothy Roscoe.               [51] 2020. Tencent Photo Cache traces - SNIA. http://iotta.snia.org/traces/
+     2014. Arrakis: the operating system is the control plane. In Pro-             parallel/27476.
+     ceedings of the 11th USENIX Conference on Operating Systems Design       [52] 2020. Twitter Memcached traces - SNIA. http://iotta.snia.org/traces/
+     and Implementation (Broomfield, CO) (OSDI’14). USENIX Association,            key-value.
+     USA, 1–16. https://www.usenix.org/conference/osdi14/technical-           [53] 2020. Alibaba Block Traces. https://github.com/alibaba/block-traces.
+     sessions/presentation/peter                                              [54] 2024. Kernel Samepage Merging. https://www.kernel.org/doc/html/
+[34] Yuhong Zhong, Haoyu Li, Yu Jian Wu, Ioannis Zarkadas, Jeffrey Tao,            latest/admin-guide/mm/ksm.html.
+     Evan Mesterhazy, Michael Makris, Junfeng Yang, Amy Tai, Ryan             [55] Irene Zhang, Amanda Raybuck, Pratyush Patel, Kirk Olynyk, Jacob
+     Stutsman, and Asaf Cidon. 2022. XRP: In-Kernel Storage Functions              Nelson, Omar S. Navarro Leija, Ashlie Martinez, Jing Liu, Anna Ko-
+     with eBPF. In 16th USENIX Symposium on Operating Systems Design               rnfeld Simpson, Sujay Jayakar, Pedro Henrique Penna, Max De-
+     and Implementation (OSDI 22). USENIX Association, Carlsbad, CA,               moulin, Piali Choudhury, and Anirudh Badam. 2021. The Demik-
+     375–393. https://www.usenix.org/conference/osdi22/presentation/               ernel Datapath OS Architecture for Microsecond-Scale Datacenter
+     zhong                                                                         Systems. In Proceedings of the ACM SIGOPS 28th Symposium on Op-
+[35] 2024. HarmonyOS 5.0.0 Release Notes. https://developer.huawei.com/            erating Systems Principles (Virtual Event, Germany) (SOSP ’21). As-
+     consumer/en/doc/atomic-releases/atomic-releasenotes-500.                      sociation for Computing Machinery, New York, NY, USA, 195–211.
+[36] 2024. Protocol Buffers Documentation. https://protobuf.dev.                   https://doi.org/10.1145/3477132.3483569
+[37] 2025. Deep Dive into Android IPC/Binder Framework at Android             [56] 2025. Intel Data Streaming Accelerator (Intel DSA). https:
+     Builders Summit 2013. https://events.static.linuxfound.org/images/            //www.intel.com/content/www/us/en/products/docs/accelerator-
+     stories/slides/abs2013_gargentas.pdf.                                         engines/data-streaming-accelerator.html.
+[38] 2024. zlib - A Massively Spiffy Yet Delicately Unobtrusive Compres-      [57] Vivek Seshadri, Yoongu Kim, Chris Fallin, Donghyuk Lee, Rachata
+     sion Library. https://github.com/openssl/openssl.                             Ausavarungnirun, Gennady Pekhimenko, Yixin Luo, Onur Mutlu,
+[39] 2024. OpenSSL - TLS/SSL and crypto library. https://github.com/               Phillip B. Gibbons, Michael A. Kozuch, and Todd C. Mowry. 2013.
+     openssl/openssl.                                                              RowClone: fast and energy-efficient in-DRAM bulk data copy and
+[40] 2025. Libpng is the official PNG reference library. http://www.libpng.        initialization. In Proceedings of the 46th Annual IEEE/ACM Interna-
+     org/pub/png/libpng.html.                                                      tional Symposium on Microarchitecture (Davis, California) (MICRO-46).
+[41] 2024. ffmpeg - A complete, cross-platform solution to record, convert         Association for Computing Machinery, New York, NY, USA, 185–197.
+     and stream audio and video. https://ffmpeg.org.                               https://doi.org/10.1145/2540708.2540725
+[42] 2010. The new linux ’perf’ tools. http://oldvger.kernel.org/~acme/       [58] 2024. NAPI Document. https://docs.kernel.org/networking/napi.
+     perf/lk2010-perf-paper.pdf.                                                   html.
+[43] 2024. F-Stack: High Performance Network Framework Based On               [59] 2022. io_uring: add napi busy polling support. https://lwn.net/
+     DPDK. http://www.f-stack.org/.                                                Articles/915657/.
+[60] 2024. cgroups - Linux control groups. http://man7.org/linux/man-         [81] 2024. OFED Documentation Rev 4.9-2.2.4.0 LTS - Checksum Of-
+     pages/man7/cgroups.7.html.                                                    fload. https://docs.nvidia.com/networking/display/mlnxofedv492240/
+[61] 2025. Kubernetes: Production-Grade Container Orchestration. https:            checksum+offload.
+     //kubernetes.io.                                                         [82] Andrew Baumann, Jonathan Appavoo, Orran Krieger, and Timothy
+[62] Chandandeep Singh Pabla. 2009. Completely fair scheduler. Linux J.            Roscoe. 2019. A fork() in the road. In Proceedings of the Workshop
+     2009, 184, Article 4 (Aug. 2009). https://dl.acm.org/doi/fullHtml/10.         on Hot Topics in Operating Systems (Bertinoro, Italy) (HotOS ’19).
+     5555/1594371.1594375                                                          Association for Computing Machinery, New York, NY, USA, 14–22.
+[63] 2025. Linux Virtual Memory Area (VMA). https://litux.nl/mirror/               https://doi.org/10.1145/3317550.3321435
+     kerneldevelopment/0672327201/ch14lev1sec2.html.                          [83] Diwaker Gupta, Sangmin Lee, Michael Vrable, Stefan Savage, Alex C.
+[64] 2019. Explicit pinning of user-space pages. https://lwn.net/Articles/         Snoeren, George Varghese, Geoffrey M. Voelker, and Amin Vahdat.
+     807108/.                                                                      2008. Difference engine: harnessing memory redundancy in virtual
+[65] 2024. DPDK. https://www.dpdk.org/.                                            machines. In Proceedings of the 8th USENIX Conference on Operating
+[66] 2021. Storage Performance Development Kit. https://spdk.io/.                  Systems Design and Implementation (San Diego, California) (OSDI’08).
+[67] Anuj Kalia, Michael Kaminsky, and David Andersen. 2019. Datacen-              USENIX Association, USA, 309–322. https://doi.org/10.5555/1855741.
+     ter RPCs can be General and Fast. In 16th USENIX Symposium on                 1855763
+     Networked Systems Design and Implementation (NSDI 19). USENIX            [84] 2024. Parcel. https://developer.android.com/reference/android/os/
+     Association, Boston, MA, 1–16. https://www.usenix.org/conference/             Parcel.
+     nsdi19/presentation/kalia                                                [85] 2016. Intel Xeon Processor E5-2650 v4. https://www.intel.com/
+[68] Eli Cortez, Anand Bonde, Alexandre Muzio, Mark Russinovich, Mar-              content/www/us/en/products/sku/91767/intel-xeon-processor-
+     cus Fontoura, and Ricardo Bianchini. 2017. Resource Central: Under-           e52650-v4-30m-cache-2-20-ghz/specifications.html.
+     standing and Predicting Workloads for Improved Resource Manage-          [86] 2023.          Linus Torvalds Cleans Up The x86 Mem-
+     ment in Large Cloud Platforms. In Proceedings of the 26th Symposium           ory Copy Code For Linux 6.4.                    https://git.kernel.org/
+     on Operating Systems Principles (Shanghai, China) (SOSP ’17). As-             pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=
+     sociation for Computing Machinery, New York, NY, USA, 153–167.                a5624566431de76b17862383d9ae254d9606cba9.
+     https://doi.org/10.1145/3132747.3132772                                  [87] Zhe Zhou, Yanxiang Bi, Junpeng Wan, Yangfan Zhou, and Zhou Li.
+[69] Huangshi Tian, Suyi Li, Ao Wang, Wei Wang, Tianlong Wu, and                   2023. Userspace Bypass: Accelerating Syscall-intensive Applications.
+     Haoran Yang. 2022. Owl: performance-aware scheduling for resource-            In 17th USENIX Symposium on Operating Systems Design and Im-
+     efficient function-as-a-service cloud. In Proceedings of the 13th Sym-        plementation (OSDI 23). USENIX Association, Boston, MA, 33–49.
+     posium on Cloud Computing (San Francisco, California) (SoCC ’22).             https://www.usenix.org/conference/osdi23/presentation/zhou-zhe
+     Association for Computing Machinery, New York, NY, USA, 78–93.           [88] 2018. Zero-copy TCP receive. https://lwn.net/Articles/752188/.
+     https://doi.org/10.1145/3542929.3563470                                  [89] 2021. Header-Data Split Architecture. https://learn.microsoft.com/en-
+[70] 2024. memcached - a distributed memory object caching system.                 us/windows-hardware/drivers/network/header-data-split-
+     https://www.memcached.org.                                                    architecture.
+[71] 2024. Apache HTTP Server - the Number One HTTP Server On The             [90] 2024. Redis Benchmark Documentation. https://redis.io/docs/
+     Internet. https://httpd.apache.org.                                           management/optimization/benchmarks/.
+[72] Konstantin Serebryany, Derek Bruening, Alexander Potapenko, and          [91] 2020. Intel Xeon Gold 6238R Processor. https://www.intel.com/
+     Dmitry Vyukov. 2012. AddressSanitizer: a fast address sanity checker.         content/www/us/en/products/sku/199345/intel-xeon-gold-6238r-
+     In Proceedings of the 2012 USENIX Conference on Annual Technical              processor-38-5m-cache-2-20-ghz/specifications.html.
+     Conference (Boston, MA) (USENIX ATC’12). USENIX Association, USA,        [92] 2024. Knative is an Open-Source Enterprise-level solution to build
+     28. https://www.usenix.org/conference/atc12/technical-sessions/               Serverless and Event Driven Applications. https://knative.dev/docs/.
+     presentation/serebryany                                                  [93] 2024. gRPC Documentation. https://grpc.io/docs/.
+[73] Konstantin Serebryany and Timur Iskhodzhanov. 2009. ThreadSani-          [94] 2024. zlib replacement with optimizations for "next generation"
+     tizer: data race detection in practice. In Proceedings of the Workshop        systems. https://github.com/zlib-ng/zlib-ng.
+     on Binary Instrumentation and Applications (New York, New York,          [95] 2006. Add memcpy_uncached_read, a memcpy that tries to reduce
+     USA) (WBIA ’09). Association for Computing Machinery, New York,               cache pressure. https://lwn.net/Articles/213971/.
+     NY, USA, 62–71. https://doi.org/10.1145/1791194.1791203                  [96] 2022. DPDK non-temporal memcpy. https://mails.dpdk.org/archives/
+[74] 2025. Valgrind Memcheck: a memory error detector. https://valgrind.           dev/2022-August/247795.html.
+     org/docs/manual/mc-manual.html.                                          [97] Rishabh Iyer, Katerina Argyraki, and George Candea. 2024. Auto-
+[75] 2015. AddressSanitizer Manual of the Poisoning APIs. https://github.          matically Reasoning About How Systems Code Uses the CPU Cache.
+     com/google/sanitizers/wiki/AddressSanitizerManualPoisoning.                   In 18th USENIX Symposium on Operating Systems Design and Imple-
+[76] 2024. Kernel Address Sanitizer (KASAN) — The Linux Kernel docu-               mentation (OSDI 24). USENIX Association, Santa Clara, CA, 581–598.
+     mentation. https://www.kernel.org/doc/html/latest/dev-tools/kasan.            https://www.usenix.org/conference/osdi24/presentation/iyer
+     html.                                                                    [98] Aleksey Pesterev, Nickolai Zeldovich, and Robert T. Morris. 2010.
+[77] Zhiyuan Guo, Zijian He, and Yiying Zhang. 2023. Mira: A Program-              Locating cache performance bottlenecks using data profiling. In Pro-
+     Behavior-Guided Far Memory System. In Proceedings of the 29th                 ceedings of the 5th European Conference on Computer Systems (Paris,
+     Symposium on Operating Systems Principles (Koblenz, Germany) (SOSP            France) (EuroSys ’10). Association for Computing Machinery, New
+     ’23). Association for Computing Machinery, New York, NY, USA,                 York, NY, USA, 335–348. https://doi.org/10.1145/1755913.1755947
+     692–708. https://doi.org/10.1145/3600006.3613157                         [99] Tanvir Ahmed Khan, Ian Neal, Gilles Pokam, Barzan Mozafari, and
+[78] 2024. Multi-Level Intermediate Representation Overview. https:                Baris Kasikci. 2021. DMon: Efficient Detection and Correction of Data
+     //mlir.llvm.org/docs/Tutorials/DataFlowAnalysis/.                             Locality Problems Using Selective Profiling. In 15th USENIX Sym-
+[79] 2024. Passes - MLIR. https://mlir.llvm.org/docs/Passes/.                      posium on Operating Systems Design and Implementation (OSDI 21).
+[80] 2024. Checksum Offloads. https://www.kernel.org/doc/html/v5.8/                USENIX Association, 163–181. https://www.usenix.org/conference/
+     networking/checksum-offloads.html.                                            osdi21/presentation/khan
+[100] Aditya K Kamath and Simon Peter. 2024. 𝑀𝐶 2 : Lazy MemCopy at                   Implementation (Broomfield, CO) (OSDI’14). USENIX Association,
+      the Memory Controller. In 2024 ACM/IEEE 51st Annual International               USA, 49–65. https://www.usenix.org/conference/osdi14/technical-
+      Symposium on Computer Architecture (ISCA). 1112–1128. https://doi.              sessions/presentation/belay
+      org/10.1109/ISCA59077.2024.00084                                          [112] Kenichi Yasukata, Michio Honda, Douglas Santry, and Lars Eg-
+[101] Jialiang Zhang, Michael Swift, and Jing (Jane) Li. 2022. Software-              gert. 2016. StackMap: Low-Latency Networking with the OS
+      defined address mapping: a case on 3D memory. In Proceedings of the             Stack and Dedicated NICs. In 2016 USENIX Annual Technical Con-
+      27th ACM International Conference on Architectural Support for Pro-             ference (USENIX ATC 16). USENIX Association, Denver, CO, 43–
+      gramming Languages and Operating Systems (Lausanne, Switzerland)                56. https://www.usenix.org/conference/atc16/technical-sessions/
+      (ASPLOS ’22). Association for Computing Machinery, New York, NY,                presentation/yasukata
+      USA, 70–83. https://doi.org/10.1145/3503222.3507774                       [113] Sangjin Han, Scott Marshall, Byung-Gon Chun, and Sylvia Ratnasamy.
+[102] 2022. NVIDIA H100 Tensor Core GPU Architecture. https://resources.              2012. MegaPipe: a new programming interface for scalable network
+      nvidia.com/en-us-hopper-architecture/nvidia-h100-tensor-c.                      I/O. In Proceedings of the 10th USENIX Conference on Operating Systems
+[103] Heng Liao, Jiajin Tu, Jing Xia, Hu Liu, Xiping Zhou, Honghui Yuan,              Design and Implementation (Hollywood, CA, USA) (OSDI’12). USENIX
+      and Yuxing Hu. 2021. Ascend: a Scalable and Unified Architecture for            Association, USA, 135–148. https://www.usenix.org/conference/
+      Ubiquitous Deep Neural Network Computing : Industry Track Paper.                osdi12/technical-sessions/presentation/han.
+      In 2021 IEEE International Symposium on High-Performance Computer         [114] Yang Zhan, Alexander Conway, Yizheng Jiao, Nirjhar Mukherjee,
+      Architecture (HPCA). 789–801. https://doi.org/10.1109/HPCA51647.                Ian Groombridge, Michael A. Bender, Martin Farach-Colton, William
+      2021.00071                                                                      Jannen, Rob Johnson, Donald E. Porter, and Jun Yuan. 2020. How to
+[104] Gernot Heiser, Ivan Velickovic, Peter Chubb, Alwin Joshy, Anuraag               Copy Files. In 18th USENIX Conference on File and Storage Technologies
+      Ganesh, Bill Nguyen, Cheng Li, Courtney Darville, Guangtao Zhu,                 (FAST 20). USENIX Association, Santa Clara, CA, 75–89. https://www.
+      James Archer, Jingyao Zhou, Krishnan Winter, Lucy Parker, Szymon                usenix.org/conference/fast20/presentation/zhan
+      Duchniewicz, and Tianyi Bai. 2025. Fast, Secure, Adaptable: LionsOS       [115] EunYoung Jeong, Shinae Wood, Muhammad Jamshed, Haewon Jeong,
+      Design, Implementation and Performance. arXiv:2501.06234 [cs.OS]                Sunghwan Ihm, Dongsu Han, and KyoungSoo Park. 2014. mTCP: a
+      https://arxiv.org/abs/2501.06234                                                Highly Scalable User-level TCP Stack for Multicore Systems. In 11th
+[105] Livio Soares and Michael Stumm. 2011. Exception-less system calls for           USENIX Symposium on Networked Systems Design and Implementation
+      event-driven servers. In Proceedings of the 2011 USENIX Conference on           (NSDI 14). 489–502.
+      USENIX Annual Technical Conference (Portland, OR) (USENIX ATC’11).        [116] Deepti Raghavan, Shreya Ravi, Gina Yuan, Pratiksha Thaker, Sanjari
+      USENIX Association, USA, 10. https://www.usenix.org/conference/                 Srivastava, Micah Murray, Pedro Henrique Penna, Amy Ousterhout,
+      usenixatc11/exception-less-system-calls-event-driven-servers                    Philip Levis, Matei Zaharia, and Irene Zhang. 2023. Cornflakes: Zero-
+[106] Austin T. Clements, M. Frans Kaashoek, Nickolai Zeldovich, Robert T.            Copy Serialization for Microsecond-Scale Networking. In Proceedings
+      Morris, and Eddie Kohler. 2015. The Scalable Commutativity Rule:                of the 29th Symposium on Operating Systems Principles (Koblenz, Ger-
+      Designing Scalable Software for Multicore Processors. ACM Trans.                many) (SOSP ’23). Association for Computing Machinery, New York,
+      Comput. Syst. 32, 4, Article 10 (Jan. 2015), 47 pages. https://doi.org/         NY, USA, 200–215. https://doi.org/10.1145/3600006.3613137
+      10.1145/2699681                                                           [117] Dinglan Peng, Congyu Liu, Tapti Palit, Pedro Fonseca, Anjo Vahldiek-
+[107] Tim Harris, Martin Abadi, Rebecca Isaacs, and Ross McIlroy. 2011.               Oberwagner, and Mona Vij. 2023. 𝜇Switch: Fast Kernel Context
+      AC: composable asynchronous IO for native languages. In Proceedings             Isolation with Implicit Context Switches. In 2023 IEEE Symposium on
+      of the 2011 ACM International Conference on Object Oriented Program-            Security and Privacy (SP). IEEE, 2956–2973.
+      ming Systems Languages and Applications (Portland, Oregon, USA)           [118] Jingrong Chen, Yongji Wu, Shihan Lin, Yechen Xu, Xinhao Kong,
+      (OOPSLA ’11). Association for Computing Machinery, New York, NY,                Thomas Anderson, Matthew Lentz, Xiaowei Yang, and Danyang Zhuo.
+      USA, 903–920. https://doi.org/10.1145/2048066.2048134                           2023. Remote Procedure Call as a Managed System Service. In 20th
+[108] Andrew Baumann, Paul Barham, Pierre-Evariste Dagand, Tim Harris,                USENIX Symposium on Networked Systems Design and Implementation
+      Rebecca Isaacs, Simon Peter, Timothy Roscoe, Adrian Schüpbach, and              (NSDI 23). USENIX Association, Boston, MA, 141–159. https://www.
+      Akhilesh Singhania. 2009. The Multikernel: A New OS Architecture                usenix.org/conference/nsdi23/presentation/chen-jingrong
+      for Scalable Multicore Systems. In Proceedings of the ACM SIGOPS          [119] Amy Ousterhout, Joshua Fried, Jonathan Behrens, Adam Belay, and
+      22nd Symposium on Operating Systems Principles (Big Sky, Montana,               Hari Balakrishnan. 2019. Shenango: Achieving High CPU Efficiency
+      USA) (SOSP ’09). Association for Computing Machinery, New York,                 for Latency-sensitive Datacenter Workloads. In 16th USENIX Sym-
+      NY, USA, 29–44. https://doi.org/10.1145/1629575.1629579                         posium on Networked Systems Design and Implementation (NSDI 19).
+[109] Aishwarya Ganesan, Ramnatthan Alagappan, Andrea C. Arpaci-                      USENIX Association, Boston, MA, 361–378. https://www.usenix.org/
+      Dusseau, and Remzi H. Arpaci-Dusseau. 2021. Exploiting Nil-                     conference/nsdi19/presentation/ousterhout
+      Externality for Fast Replicated Storage. In Proceedings of the ACM        [120] Joshua Fried, Zhenyuan Ruan, Amy Ousterhout, and Adam Belay.
+      SIGOPS 28th Symposium on Operating Systems Principles (Virtual                  2020. Caladan: Mitigating Interference at Microsecond Timescales.
+      Event, Germany) (SOSP ’21). Association for Computing Machin-                   In 14th USENIX Symposium on Operating Systems Design and Imple-
+      ery, New York, NY, USA, 440–456. https://doi.org/10.1145/3477132.               mentation (OSDI 20). USENIX Association, 281–297. https://www.
+      3483543                                                                         usenix.org/conference/osdi20/presentation/fried
+[110] Xuhao Luo, Shreesha G. Bhat, Jiyu Hu, Ramnatthan Alagappan, and           [121] Jing Liu, Andrea C. Arpaci-Dusseau, Remzi H. Arpaci-Dusseau, and
+      Aishwarya Ganesan. 2024. LazyLog: A New Shared Log Abstraction                  Sudarsun Kannan. 2019. File Systems as Processes. In 11th USENIX
+      for Low-Latency Applications. In Proceedings of the ACM SIGOPS                  Workshop on Hot Topics in Storage and File Systems (HotStorage
+      30th Symposium on Operating Systems Principles (Austin, TX, USA)                19). USENIX Association, Renton, WA. https://www.usenix.org/
+      (SOSP ’24). Association for Computing Machinery, New York, NY,                  conference/hotstorage19/presentation/liu
+      USA, 296–312. https://doi.org/10.1145/3694715.3695983                     [122] Emmett Witchel, Josh Cates, and Krste Asanović. 2002. Mondrian
+[111] Adam Belay, George Prekas, Ana Klimovic, Samuel Grossman, Chris-                memory protection. In Proceedings of the 10th International Conference
+      tos Kozyrakis, and Edouard Bugnion. 2014. IX: a protected dataplane             on Architectural Support for Programming Languages and Operating
+      operating system for high throughput and low latency. In Proceed-               Systems (San Jose, California) (ASPLOS X). Association for Computing
+      ings of the 11th USENIX Conference on Operating Systems Design and              Machinery, New York, NY, USA, 304–316. https://doi.org/10.1145/
+      605397.605429
+[123] Emmett Witchel, Junghwan Rhee, and Krste Asanović. 2005. Mondrix:
+      Memory Isolation for Linux Using Mondriaan Memory Protection. In
+      Proceedings of the Twentieth ACM Symposium on Operating Systems
+      Principles (Brighton, United Kingdom) (SOSP ’05). ACM, New York,
+      NY, USA, 31–44. https://doi.org/10.1145/1095810.1095814
+[124] Robert N.M. Watson, Jonathan Woodruff, Peter G. Neumann, Si-
+      mon W. Moore, Jonathan Anderson, David Chisnall, Nirav Dave,
+      Brooks Davis, Khilan Gudka, Ben Laurie, Steven J. Murdoch, Robert
+      Norton, Michael Roe, Stacey Son, and Munraj Vadera. 2015. CHERI:
+      A Hybrid Capability-System Architecture for Scalable Software Com-
+      partmentalization. In 2015 IEEE Symposium on Security and Privacy.
+      20–37. https://doi.org/10.1109/SP.2015.9
+[125] Nils Asmussen, Marcus Völp, Benedikt Nöthen, Hermann Härtig,
+      and Gerhard Fettweis. 2016. M3: A Hardware/Operating-System
+      Co-Design to Tame Heterogeneous Manycores. In Proceedings of the
+      Twenty-First International Conference on Architectural Support for
+      Programming Languages and Operating Systems (Atlanta, Georgia,
+      USA) (ASPLOS ’16). ACM, New York, NY, USA, 189–203. https:
+      //doi.org/10.1145/2872362.2872371
+[126] Hongjin Liang, Xinyu Feng, and Ming Fu. 2012. A rely-guarantee-
+      based simulation for verifying concurrent program transformations.
+      In Proceedings of the 39th Annual ACM SIGPLAN-SIGACT Sympo-
+      sium on Principles of Programming Languages (Philadelphia, PA, USA)
+      (POPL ’12). Association for Computing Machinery, New York, NY,
+      USA, 455–468. https://doi.org/10.1145/2103656.2103711
+

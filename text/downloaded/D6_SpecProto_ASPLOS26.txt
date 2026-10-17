@@ -1,0 +1,2239 @@
+SpecProto: A Parallelizing Compiler for Speculative
+Decoding of Large Protocol Buffers Data
+Zhijie Wang
+
+Chales Hong
+
+Dhruv Parmar
+
+University of California, Riverside
+Riverside, CA, USA
+zwang711@ucr.edu
+
+University of California, Riverside
+Riverside, CA, USA
+chong039@ucr.edu
+
+University of California, Riverside
+Riverside, CA, USA
+dparm003@ucr.edu
+
+Shengbo Ma
+
+Zhijia Zhao
+
+Qidong Zhao
+
+University of California, Riverside
+Riverside, CA, USA
+sma081@ucr.edu
+
+University of California, Riverside
+Riverside, CA, USA
+zhijia@cs.ucr.edu
+
+Google
+Sunnyvale, CA, USA
+qidongzhao@google.com
+
+Xu Liu
+Google
+Sunnyvale, CA, USA
+xliuprof@google.com
+
+Abstract
+
+for Speculative Decoding of Large Protocol Buffers Data. In Proceedings of the 31st ACM International Conference on Architectural
+Support for Programming Languages and Operating Systems, Volume
+2 (ASPLOS ’26), March 22–26, 2026, Pittsburgh, PA, USA. ACM, New
+York, NY, USA, 15 pages. https://doi.org/10.1145/3779212.3790225
+
+Protobuf is a widely used data serialization format, especially
+in cloud environments. However, existing compilers generate
+only serial decoders, limiting scalability for large datasets.
+While parallel parsing has been studied for textual formats
+(e.g., XML), parallel decoding of binary formats like Protobuf
+remains unexplored, which present unique opportunities.
+We propose two techniques to enable parallel Protobuf
+decoding. First, we leverage the length-prefixed encoding of
+Protobuf to “skim” the binary and identify decoding tasks. To
+address inefficiencies caused by many small or imbalanced
+fields, we further introduce speculative parallelization, which
+partitions a binary into even segments and predicts decoding
+states across boundaries. We implement these techniques in
+SpecProto, a parallelizing compiler that generates parallel
+decoders for a given Protobuf schema. Experiments on realworld and synthetic datasets show that SpecProto achieves
+significant speedups by leveraging multiple CPU cores.
+
+1
+
+Introduction
+
+Protocol Buffers (Protobuf) [7] is a language-neutral and
+platform-neutral binary data format for serializing structured
+data. It has been widely adopted in cloud environments for
+inter-server communications [12] and data storage, such as
+Google’s Dremel/BigQuery [20], and serves as the foundation
+of gRPC, a leading standard for remote procedure calls.
+Binary vs. Textural Serialization. Unlike textual data
+formats, such as JSON and XML, that embed attribute names
+in the serialized data (e.g., "name":"Alex"), Protobuf avoids
+this overhead by enforcing a predefined schema—messages,
+which are stored in a .proto file. As illustrated in Figure 1,
+given a .proto file, the Protobuf compiler generates a pair
+of encoder and decoder in a specified language, for data
+serialization and deserialization. Study shows that Protobuf
+messages can be up to 10× smaller than equivalent JSON
+messages [28] and can perform up to 6× faster than JSON in
+Java-to-Java server communications [15].
+Besides Protobuf, some other binary serialization formats
+include Apache Thrift [29], MessagePack [21], BSON [23],
+and Apache Avro [3]. While this work focuses on Protobuf,
+some of the issues and ideas could apply to other binary
+formats.
+
+CCS Concepts: • Computing methodologies → Parallel algorithms; • Computer systems organization →
+Multicore architectures.
+Keywords: Protocol Buffers, Parallel Decoding, Binary Data
+Processing, Multicore Systems, Speculative Parallelization
+ACM Reference Format:
+Zhijie Wang, Chales Hong, Dhruv Parmar, Shengbo Ma, Zhijia Zhao,
+Qidong Zhao, and Xu Liu. 2026. SpecProto: A Parallelizing Compiler
+
+This work is licensed under a Creative Commons Attribution 4.0 International License.
+ASPLOS ’26, Pittsburgh, PA, USA
+© 2026 Copyright held by the owner/author(s).
+ACM ISBN 979-8-4007-2359-9/2026/03
+https://doi.org/10.1145/3779212.3790225
+
+Scalability Concern in Protobuf Decoding. The decoding efficiency of Protobuf has become increasingly critical
+amid surging data transmission and storage demands. However, the state-of-the-art Protobuf compilers, including the
+one from Google, only generate sequential decoders, limiting
+
+1848
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+Protobuf Schema (.proto)
+message Person {
+string name = 1;
+uint32 age = 2;
+repeated Address address = 3;
+}
+message Address {
+string city = 1;
+uint32 zip = 2;
+repeated uint64 location_ids = 3;
+}
+
+Zhijie Wang et al.
+
+parallelizing binary deserialization while preserving its core
+compatibility. Next, we present the two key properties and
+their enabled parallelization techniques.
+
+In-Memory Data
+
+Proto
+Compiler
+
+Encoder
+Decoder
+
+P1: Length-Prefixed Encoding. Unlike textual formats,
+Protobuf encodes the length information to delimit fields
+with variable lengths, such as strings, bytes, or embedded
+messages. As shown in Figure 2, a length-delimited field
+comprises three parts: tag, length, and value. A tag defines
+the field’s wire type while the length indicates the number
+of bytes the field takes. For example, the field name’s tag is
+followed by “04”, which means the next four bytes “41 6C 65
+78” are the field value—the ASCII codes for string "Alex".
+
+Protobuf Binary
+Data
+
+Figure 1. Protobuf Workflow.
+
+their scalability on multicore CPUs, resulting in performance
+bottlenecks for large datasets. For example, Go pprof [30]
+stores profile data in Protobuf reaching sizes of gigabytes.
+Without the ability to harness multiple cores, processing
+such large datasets faces significant performance limitations,
+which has drawn complaints from developers [31].
+
+Skimming-based Parallelization. Our first attempt is
+to leverage the encoded lengths, which makes it possible to
+“skip” a field value without examining its bytes and bits in
+detail (impossible for JSON or XML). This feature allows us
+to quickly skim the Protobuf binary to identify the top-level
+fields without decoding them, such as name, age and address
+in Figure 2. After that, the extracted fields are decoded in
+parallel. With proper pre-memory allocation, their results
+can be automatically merged. While reasonable in principle,
+this approach has two significant drawbacks.
+
+Parallelization Challenges. The main reason Protobuf
+has traditionally adhered to a serial decoding design is the
+inherent dependencies in data encoding. When encoding an
+in-memory object, its fields are packed sequentially into a
+contiguous memory block. Figure 2 shows the encoding of
+a Person object according to the schema in Figure 1. Due to
+the presence of variable-length fields (e.g., varint, string, or
+submessages), determining the starting byte of any given
+field (except for the first one) appears impossible without
+decoding the entire message sequentially.
+One may modify the encoding strategy to facilitate parallel
+decoding [4]. However, this change comes with a significant
+drawback: the loss of compatibility, which undermines the
+viability of Protobuf for inter-server communication.
+Prior studies have explored the parallelization of textual
+data processing, including XML parsing and querying [10,
+19, 24] and JSONPath querying [9]. While these studies offer
+valuable insights, Protobuf, as a binary serialization format,
+presents distinct opportunities and challenges.
+Specifically, existing techniques for parallelizing textual
+data rely on explicit structural characters (e.g., braces, brackets, or quotes) to recover parsing context or guide speculation [8, 9, 11]. Such characters are absent in Protobuf’s binary
+format. Instead, Protobuf decoding must recover both field
+boundaries and field types directly from raw bytes. Moreover,
+due to Protobuf’s encoding scheme, the same binary tag may
+correspond to multiple field types across different messages,
+introducing type ambiguities that are unique to schemaenforced binary formats. As a result, prior approaches for
+textual data cannot be directly applied.
+
+• Serial bottleneck. The first phase—skimming, remains
+serial and could become a performance bottleneck
+when the message contains repeated fields—similar
+to an array, it may include many field instances.
+• Load imbalance. When the message contains only a
+few fields or if their sizes vary significantly, decoding
+them in parallel may suffer from load imbalance.
+To address these limitations, we propose an alternative
+parallelization strategy that removes the need of skimming.
+by taking advantage of another property of Protobuf.
+P2: Schema-Enforced Encoding. Unlike JSON and XML,
+which are known to be “schemaless”, Protobuf (and some
+other binary formats) strictly follows a schema for encoding
+and decoding. As illustrated in Figure 1, the schema defines
+the structures of messages, specifying the type and number
+(ID) of each field within the message and its submessages.
+Speculative Parallelization. Our second attempt aims to
+speculatively start decoding at “intermediate points” within
+the Protobuf binary. This may seem extremely challenging,
+given that all information is encoded as raw bits (0s and 1s).
+However, by leveraging the Protobuf schema specification,
+we find it is possible to speculate the decoding state with high
+accuracy, thus enabling effective speculative parallelism.
+We break down the speculative decoding problem into
+two subproblems: (1) tag speculation and (2) type speculation.
+Tag Speculation. Given an arbitrary “intermediate point”
+in the binary, the speculative decoder first locates a tag as
+its starting point for decoding. Not every byte could be part
+of a tag. Only bytes or byte sequences encoded according to
+
+1.1 Contributions of This Work
+In this work, we leverage two key properties of Protobuf—
+shared by other binary serialization formats—to parallelize
+its decoding. To our best knowledge, this is the first work on
+
+1849
+
+SpecProto: A Parallelizing Compiler for Speculative Decoding of Large Protocol Buffers Data
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+Protobuf Binary Data
+32 bytes
+0A 04 41 6C 65 78 10 14 1A 0C 0A 02 4C 41 10 91 BF 05 1A 02 1A 08 1A 08 0A 03 4E 59 43 10 91 4E
+tag
+
+4 bytes Alex
+
+2 bytes LA
+20
+
+field wire type
+name
+age VARINT
+LEN
+00001 010 00010 000
+
+90001
+
+2 bytes [26, 8]
+
+12 bytes
+0A 02 4C 41 10 91 BF 05 1A 02 1A 08
+address LEN
+00011 010
+
+zip VARINT location_ids LEN
+city
+LEN
+00001 010 00010 000
+00011 010
+
+Wire Type Encoding
+(last 3 bits of a tag)
+
+...
+0
+
+VARINT (int32, int64, uint32,
+uint64, sint32, sint64, bool, enum)
+
+1/5
+
+I64/I32 (fixed64/fixed32,
+sfixed64/sfixed32, double/float)
+
+Equivalent JSON Data
+110 bytes 2
+{ "name": "Alex", "age": 20, "address": [ {"city": "LA", "zip": 90001, "location_ids": [26, 8]}, {"city": "NYC", "zip": 10001} ] }
+
+LEN (string, bytes, embedded
+messages, packed repeated
+fields)
+
+Figure 2. Example Protobuf message in hexadecimal format. (Its schema is defined in Figure 1; an equivalent JSON string is shown at
+the bottom; Each field is encoded using a tag: field name and its wire type; For the LEN-type field, its length in bytes is also encoded.)
+
+challenges in multi-language development environments.
+To meet this need, language-agnostic serialization formats—
+both textual and binary—have been proposed.
+Textual data formats, such as JSON, are widely used for
+their human readability, which facilitates debugging and
+manual editing. However, due to the lack of a strict schema,
+each attribute in these textual formats must carry its name
+information, like "city":"LA" in JSON and <city>LA</city>
+in XML, which not only increases the size of serialized data,
+but also slows down data decoding.
+Binary data formats, like Protobuf, address the limitations
+of textual data formats by requiring predefined schemas.
+This schema-based approach eliminates the need of field
+names, resulting in more compact data representations and
+improved decoding speed. Binary formats are particularly
+suited for applications where data size and decoding time are
+critical, such as high-performance microservices, real-time
+systems, and data-intensive distributed applications.
+
+the schema (the .proto file) are valid. Based on this insight,
+we derive an automaton that can automatically search for
+valid tags. However, a significant challenge remains—fake
+tags—bytes that coincidentally align with valid tags. We will
+address this together with the type speculation.
+Type Speculation. After locating a tag, the next step is
+decoding the field value according to its type. However, the
+mapping between fields and field numbers is not always
+unique. In fact, it is common for submessages to reuse field
+numbers of their ancestors, leading to type ambiguity. To
+address this ambiguity as well as the fake tags, we compile
+the schema into an type transition automaton (TTA), which
+captures the following relations between the types of different
+fields. During speculative decoding, we leverage the TTA
+to infer the feasible types. To ensure the correctness, after
+parallel speculative decoding, we include a validation and
+merging phase. In cases of misspeculation, the corresponding
+binary chunks get (partially) re-decoded.
+With the above speculation techniques, we can simply
+partition the Protobuf binary into equal-size chunks, process
+them in parallel, and merge the results.
+
+2.2 Protocol Buffer
+Protobuf was originally developed by Google and became its
+most widely used data format [7]. Figure 1 illustrates its basic
+workflow. Users begin by defining a schema (i.e., messages) in
+a .proto file. This schema is then compiled using the Proto
+compiler, which produces an encoder and a decoder in a
+specified language. For C++, the compiler generates a class
+for each defined message, providing simple accessors for
+its fields and methods to serialize the structure into a byte
+sequence and deserialize it back into its original form.
+Figure 2 illustrates a Person message with an embedded
+Address message. A unique field number is assigned to each
+field of a message for encoding the field. The field type
+and number are encoded into a VARINT, called a tag, based
+on the formula (field_number << 3)|wire_type, where the
+wire_type (see the table in Figure 2) dictates how to decode
+the subsequent value. For example, when wire_type = 0, the
+following value is of VARINT type; when wire_type = 2, the
+next value has a variable length and the length is encoded
+first followed by the bytes of its value. In addition, a field can
+be repeated—it may appear multiple times in the binary data
+(see Address in Person in Figure 2). A repeated field would be
+
+Evaluation. We prototyed a Protobuf compiler, SpecProto,
+that integrates both parallelization techniques. We evaluated
+its performance on datasets from real-world applications
+and synthetic schemas. Results show that skimming-based
+and speculative parallelization yield highly efficient parallel
+decoders, achieving average speedups of 3.8× and 4.9× over
+serial decoding on a 16-core CPU, respectively.
+
+2
+
+Background
+
+In this section, we provide more background information on
+data serialization and Protocol Buffers.
+2.1 Data Serialization and Deserialization
+When in-memory objects are transmitted over a network or
+stored in a file, they are first serialized into a byte sequence.
+Later, when needed, they are retrieved and reconstructed
+into their in-memory representation—deserialization [14].
+It is common to utilize built-in libraries from programming
+languages, such as java.io.Serializable for such purposes.
+However, these libraries are language-specific, thus posing
+
+1850
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+Zhijie Wang et al.
+
+Protobuf Binary Data
+0 1 2 3 4 5 6 7 8 9 10 11 ... 22 23 24 25 26 27 28 29 30 31
+0A 04 41 6C 65 78 10 14 1A 0C 0A 02 ... 1A 08 0A 03 4E 59 43 10 91 4E
+tag: 10
+tag: 16 tag: 26
+tag: 26
+len: 4
+len: 1
+len: 12
+len: 8 field_num: 3
+(1) field_num: 1 field_num: 2 field_num: 3
+start: 24
+start: 10
+Build start: 2
+start: 7
+end: 32
+end:
+22
+tasks end: 6
+end: 8
+task4
+
+task1
+
+task2
+
+Algorithm 1: Skimming-based Parallel Decoding
+function Skim(𝑑𝑎𝑡𝑎):
+Initialize 𝑡𝑎𝑠𝑘𝑠 /* tasks grouped by 𝑓 𝑖𝑒𝑙𝑑_𝑛𝑢𝑚 */
+3
+𝑖𝑛𝑑𝑒𝑥 ← 0
+4
+while 𝑖𝑛𝑑𝑒𝑥 < length(𝑑𝑎𝑡𝑎) do
+5
+𝑡𝑎𝑔 ← ReadTag(𝑑𝑎𝑡𝑎, 𝑖𝑛𝑑𝑒𝑥)
+6
+𝑓 𝑖𝑒𝑙𝑑_𝑛𝑢𝑚 ← 𝑡𝑎𝑔 ≫ 3 /* decode field number */
+7
+𝑤𝑖𝑟𝑒_𝑡𝑦𝑝𝑒 ← 𝑡𝑎𝑔 & 7 /* decode wire type */
+8
+switch 𝑤𝑖𝑟𝑒_𝑡𝑦𝑝𝑒 : /* find field length */
+9
+case 0 : 𝑙𝑒𝑛 ← ReadVarintLen(𝑑𝑎𝑡𝑎, 𝑖𝑛𝑑𝑒𝑥)
+10
+case 1 : 𝑙𝑒𝑛 ← 8
+11
+case 2 : 𝑙𝑒𝑛 ← ReadLen(𝑑𝑎𝑡𝑎, 𝑖𝑛𝑑𝑒𝑥)
+12
+case 5 : 𝑙𝑒𝑛 ← 4
+13
+append (𝑖𝑛𝑑𝑒𝑥, 𝑖𝑛𝑑𝑒𝑥 + 𝑙𝑒𝑛) to 𝑡𝑎𝑠𝑘𝑠 [𝑓 𝑖𝑒𝑙𝑑_𝑛𝑢𝑚]
+14
+𝑖𝑛𝑑𝑒𝑥 ← 𝑖𝑛𝑑𝑒𝑥 + 𝑙𝑒𝑛 /* skip the field value */
+15
+return 𝑡𝑎𝑠𝑘𝑠
+16 /* Generated for each message. Here is for Person. */
+17 function ParallelDecode(𝑑𝑎𝑡𝑎, 𝑡𝑎𝑠𝑘𝑠):
+18
+parallel for 𝑓 𝑖𝑒𝑙𝑑_𝑛𝑢𝑚, 𝑓 𝑖𝑒𝑙𝑑_𝑡𝑎𝑠𝑘𝑠 in 𝑡𝑎𝑠𝑘𝑠 do
+19
+switch 𝑓 𝑖𝑒𝑙𝑑_𝑛𝑢𝑚 :
+20
+case 1 : /* decode the bytes into a name */
+21
+𝑛𝑎𝑚𝑒 ←
+ReadString(𝑑𝑎𝑡𝑎, last(𝑓 𝑖𝑒𝑙𝑑_𝑡𝑎𝑠𝑘𝑠))
+22
+case 2 : /* decode the bytes into an age */
+23
+𝑎𝑔𝑒 ← ReadVarint(𝑑𝑎𝑡𝑎, last(𝑓 𝑖𝑒𝑙𝑑_𝑡𝑎𝑠𝑘𝑠))
+24
+case 3 : /* decode the bytes into addresses */
+25
+𝑎𝑑𝑑𝑟𝑒𝑠𝑠 ← AllocMem(length(𝑓 𝑖𝑒𝑙𝑑_𝑡𝑎𝑠𝑘𝑠))
+26
+parallel for 𝑖, 𝑡𝑎𝑠𝑘 in 𝑓 𝑖𝑒𝑙𝑑_𝑡𝑎𝑠𝑘𝑠 do
+27
+𝑎𝑑𝑑𝑟𝑒𝑠𝑠 [𝑖] ← new Address()
+28
+𝑎𝑑𝑑𝑟𝑒𝑠𝑠 [𝑖].Parse(𝑑𝑎𝑡𝑎, 𝑡𝑎𝑠𝑘)
+1
+
+2
+
+task3
+
+(2) Allocate mem. for repeated fields
+
+(3) Exec. tasks in parallel
+"Alex"
+
+20 Address{"LA", 90001, [26, 8]} Address{"NYC", 10001}
+
+Figure 3. Illustration of Skimming-based Decoding.
+decoded into a list. Note that fields do not obey any specific
+order during the encoding.
+
+3
+
+Skimming-based Parallelization
+
+In this section, we present our first attempt to parallelize
+Protobuf decoding, by taking advantages of the encoded field
+lengths to quickly skim the binary message.
+In practice, large Protobuf messages are often composed
+of many repeated LEN-type fields. As discussed in Section 1,
+LEN-type fields use length-prefix encoding. Based on this, we
+propose a two-pass parallelization approach. In the first pass,
+the binary data is quickly skimmed to locate the boundaries
+of LEN-type fields in the message without decoding any field
+values. In the second pass, the identified fields are decoded
+in parallel. Figure 3 illustrates this parallel decoding process,
+with more details explained in Algorithm 1.
+Step 1: Skimming. The first pass is handled by the Skim()
+function. Given the binary data, it begins by reading the tag
+(Line 5) and then decodes it according to Protobuf’s field
+encoding logic, resulting in the field number and wire type.
+The function then calculates the length of the field value
+based on the wire type (Lines 8-12). Next, it records the start
+and end positions of the field value, which defines a decoding
+task, and groups them by field number (Line 13). Then, it
+jumps over the field value based on its length and proceeds
+to the next tag, until it reaches the end of the binary.
+
+sequential decoding, like the Bit Manipulation Instruction
+Set 2 (BMI2) to accelerate VARINT parsing [18].
+Note that a similar skimming approach can also be applied
+to parsing textual data formats, like XML and JSON, however,
+the skimming overhead would be significantly higher, as
+textual data lacks length encoding. Thus, skimming must
+examine the text character by character, creating a serious
+issue that may outweigh the parallelization benefits [19].
+Limitations. Two critical assumptions must hold to make
+skimming-based parallelization effective. First, the binary
+message should contain a moderate number of fields—too
+many fields can slow down skimming, exacerbating the serial
+bottleneck, while too few may not yield enough decoding
+tasks to fully utilize the CPU cores. Second, the field sizes
+should be relatively balanced to prevent any single task from
+disproportionately dominating the total parallel decoding
+time. To address the above limitations, we next introduce an
+alternative approach that offers more flexible parallelism.
+
+Step 2: Memory Allocation. Once these decoding tasks
+(field values) are collected, memory must be allocated to store
+the results of the subsequent parallel decoding. To deal with
+the memory allocation for repeated fields, we group tasks by
+field such that the size of each field group corresponds to the
+final size of the decoded list, and the order of tasks within a
+field group determines their indices in the decoded list.
+Step 3: Parallel Decoding. Finally, the whole collection
+of decoding tasks is processed by ParallelDecode(), which
+is a method of the Person class. ParallelDecode() sets the
+fields of the class by calling each field’s corresponding (serial)
+decoding function, such as ReadString() and address.Parse().
+This allows seamless integration of existing optimizations for
+
+4
+
+Speculative Parallelization
+
+Speculative parallelization has proven effective in processing
+textual data, such as matching regular expression [34] and
+
+1851
+
+SpecProto: A Parallelizing Compiler for Speculative Decoding of Large Protocol Buffers Data
+
+Protobuf Binary Data
+
+Chunk 1
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+Chunk 2
+
+Chunk 2
+
+05 1A 02 1A 08 1A 08 0A 03 4E 59 43 10 91 4E
+
+0A 04 41 6C 65 78 10 ... 05 1A 02 1A 08 1A 08 0A 03 4E 59 43 10 91 4E
+name
+LEN
+tag 0 0 0 0 1 0 1 0
+
+Alex
+
+10
+“0A”
+
+Tag Pool
+
+a tag? if so, to which type
+does it correspond?
+
+not in Tag Pool
+
+“10”
+
+“0A”
+
+“1A”
+
+“10”
+“1A”
+
+Figure 4. The Challenge of Speculative Parallelization.
+XML/JSON querying [8, 9, 24]. However, speculating the
+decoding state from a raw bitstream is more challenging as it
+lacks structural characters (e.g., “{” or “:”) that provide clear
+cues in human-readable textual data.
+
+26
+
+tag detected
+
+(a) Tag Detection Process
+
+16
+
+(b) Tag Pool DFA
+
+Figure 5. Tag Speculation
+
+from the partitioning position, as illustrated in Figure 5-(a).
+As tags may consist of multiple bytes, a more structured
+realization of this idea is compiling the tag pool into an
+automaton, as shown in Figure 5-(b).
+
+A Motivational Example. Figure 4 illustrates a binary
+message split into two chunks. The first chunk starts with
+byte “0A”, which, by tag encoding, denotes a LEN-type field
+with field number 1. This corresponds to the top-level field
+name, providing a clear initial decoding state.
+However, initial decoding state for the second chunk is
+less obvious: is its first byte (“05”) the start of a valid tag? If
+so, to which field does it correspond? This ambiguity arises
+because preceding fields might have variable lengths, causing
+arbitrary partitioning boundaries to potentially fall in the
+middle of a field. Moreover, correctly speculating the first tag
+and type alone does not guarantee that the decoding state for
+subsequent fields will become clear. As decoding proceeds
+further into the chunk, similar ambiguities can repeatedly
+occur, requiring ongoing speculation.
+In the following, we will demonstrate that it is possible to
+effectively speculate on the decoding state(s) by leveraging
+structural information embedded in the .proto file. For better
+illustration, we decouple the decoding-state speculation into
+tag speculation and type speculation.
+
+4.1.1 Tag Pool DFA. Deterministic finite automaton (DFA)
+is a classic way for identifying string patterns in textual data.
+In this work, we draw an analogy between binary tags and
+words in textual content. Specifically, we treat each byte in
+an encoded Protobuf message as a character in an alphabet,
+allowing us to interpret tags from the tag pool as the “words”
+to be matched within this byte stream. We refer to this DFA
+for matching tags in a tag pool as the Tag Pool DFA.
+Definition 4.2. Given a Protobuf schema S, its Tag Pool
+DFA is a five-tuple 𝐷 = (𝑄, Σ, 𝛿, 𝑞 0, 𝐹 ) where:
+• 𝑄 is a finite set of states, representing the matching
+progress of valid tags defined in T (S).
+• Σ is the input alphabet consisting of all possible values
+of individual bytes (0x01 to 0xFF).
+• 𝛿 : 𝑄 × Σ → 𝑄 is the deterministic transition function
+mapping a state and an input byte to the next state.
+• 𝑞 0 ∈ 𝑄 is the initial state—no input yet matched.
+• 𝐹 ⊆ 𝑄 is the set of accepting states, each indicating a
+complete match of a valid tag in T (S).
+
+4.1 Tag Speculation
+Recall the question in decoding the second chunk in Figure 4:
+Could “05” represent a valid tag? In theory, any byte value
+between 0x01 and 0xFF could appear as part of a valid tag.
+However, given the schema defined in Figure 1, “05” cannot
+be part of a valid tag. To systematically answer this question,
+we need to find out what tags are possible for a given schema.
+According to Protobuf encoding, each field has a unique
+field number, which, combined with a wire type, forms a
+binary-encoded identifier—a tag. Given a Protobuf schema,
+we can infer all of its valid tags, referred to as its tag pool.
+
+By transitioning through DFA states based on each input
+byte, valid tags can be efficiently detected. For example, the
+tag pool DFA in Figure 5-(b) can recognize “05” as an invalid
+tag, while correctly identifying the next byte “1A” as valid.
+Algorithm 2 outlines the process of generating a tag pool
+DFA for a given Protobuf schema S. The construction starts
+by first encoding each field’s valid tag (determined by its
+field number and wire type) into VARINT format, and then
+inserts each encoded tag into the DFA.
+
+Definition 4.1. Given a Protobuf schema S, its tag pool
+T (S) refers to the set of all unique tags that may appear in
+the encoded message, as determined by the schema.
+
+4.1.2 Fake Tags and Tag Speculation. It is critical to
+note that the tags identified by the tag pool DFA are valid
+tags but not necessarily actual tags because the field values
+may contain bytes that resemble valid tags.
+
+Considering the example in Figure 2, we have T (𝑃𝑒𝑟𝑠𝑜𝑛) =
+{“0A”, “10”, “1A”}. Note that in general a tag may consist of
+multiple bytes for larger Protobuf schemas.
+A straightforward way to finding a valid tag is directly
+scanning the binary sequence using this tag pool starting
+
+Definition 4.3. In the process of tag identification, a byte
+or sequence of bytes that resembles a valid tag from the tag
+pool but is not an actual one in the binary is a fake tag.
+
+1852
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+Zhijie Wang et al.
+
+Chunk 2
+
+reused across different message types. In this case,
+address and location_ids both use field number 3.
+• Field Type vs. Wire Type: Protobuf employs a coarsegrained wire type system that lacks the full richness of
+field types (e.g., both repeated Address and repeated
+uint64 are mapped to the LEN wire type).
+The first factor is the root cause of the ambiguity, while the
+second increases the likelihood of such ambiguity occurring
+in practice. Next, we define this ambiguity formally.
+
+05 1A 02 1A 08 1A 08 0A 03 4E 59 43 10 91 4E
+
+Schema
+
+tag 26 detected: a LEN-type field with field number 3
+
+message Person { ... repeated Address address = 3; }
+message Address { ... repeated uint64 location_ids = 3; }
+not a valid Address
+type: Address?
+05 1A 02 1A 08 1A 08 0A 03 4E 59 43 10 91 4E
+type: uint64 array?
+
+a valid Address
+
+05 1A 02 1A 08 1A 08 0A 03 4E 59 43 10 91 4E
+a valid uint64 array
+
+Definition 4.4. Schema S is tag-field ambiguous if there
+exist two fields 𝑓1 and 𝑓2 of two different messages that are
+encoded using the same tag.
+
+Figure 6. Illustration of Tag-Field Ambiguity
+
+We address tag-field ambiguity in two phases. First, we
+focus on a special case of it, called tag-type ambiguity, which
+is formally defined below. The remaining aspects of tag-field
+ambiguity are resolved during the validation phase.
+
+Because fake tags may exist, the tags identified by the tag
+pool DFA cannot be guaranteed to be correct. In fact, it is
+very challenging to tell whether an identified tag is fake or
+not due to the missing of full decoding context. To address
+this challenge, we first assume an identified tag is real (i.e.,
+speculation) and defer the fake tag detection (i.e., validation)
+to later phases of the parallel decoding process.
+
+Definition 4.5. Schema S is tag-type ambiguous if there
+exist two fields 𝑓1 and 𝑓2 in different messages that share the
+same tag but have different field types, i.e., 𝑇 (𝑓1 ) ≠ 𝑇 (𝑓2 ).
+Obviously, a tag-type ambiguous schema must be tag-field
+ambiguous; but the converse does not necessarily hold.
+Tag-type ambiguity complicates speculative decoding. As
+demonstrated in Figure 6, an attempt to interpret the tag
+as an Address fails; the correct type is a uint64 array. To
+reduce the likelihood of such failures, we next introduce a
+special automaton to help infer the field type associated with
+a given tag, called type transition automaton.
+
+Algorithm 2: Tag Pool DFA Generation
+function BuildTagPoolDFA(S):
+𝑞 0 ← new DFA state (initial state)
+3
+for field 𝑓 ∈ S do
+4
+𝑡𝑎𝑔 ←
+EncodeVarint(𝑓 .number, wireType(𝑓 .type))
+5
+𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑠𝑡𝑎𝑡𝑒 ← 𝑞 0
+6
+for byte 𝑏 ∈ 𝑡𝑎𝑔 do
+7
+if 𝑏 ∉ 𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑠𝑡𝑎𝑡𝑒.transitions then
+8
+𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑠𝑡𝑎𝑡𝑒.transitions[𝑏] ← new DFA
+state
+9
+𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑠𝑡𝑎𝑡𝑒 ← 𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑠𝑡𝑎𝑡𝑒.transitions[𝑏]
+10
+mark 𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑠𝑡𝑎𝑡𝑒 as accepting state
+11
+𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑠𝑡𝑎𝑡𝑒.tag ← 𝑡𝑎𝑔 /* map tag to a state */
+12
+return constructed DFA
+1
+
+2
+
+4.2.2 Type Transition Automaton (TTA). The intuition
+behind this automaton is to capture the “following relation”
+between types in the encoded data. For example, given that
+the last decoded field is an Address, the automaton is able
+to determine which field types could validly follow next. A
+formal definition is given below.
+Definition 4.6. The type transition automaton (TTA) of a
+schema S is defined as a 4-tuple 𝑀 = (𝑄, Σ, 𝛿, 𝑞 0 ) where:
+• 𝑄 is a finite set of type states. Each type state, except
+for 𝑞 0 , represents a unique field type specified in S.
+• Σ is the input alphabet, consisting of all valid tags
+derived from the schema, that is, the tag pool T (S).
+• 𝛿 : 𝑄 × Σ → 2𝑄 is the transition function, which maps
+a type and a tag to a set of possible successor types.
+• 𝑞 0 ∈ 𝑄 is the initial state, representing cases where no
+type information is yet known.
+
+After identifying a valid tag, we then move to the more
+complex problem—determining the field type.
+4.2 Type Speculation
+Given a tag, we can deterministically decode its field number
+and wire type based on Protobuf’s tag encoding scheme. For
+example, tag “1A” decodes to field number 3 with a wire
+type of LEN. However, mapping this decoded information
+to specific message fields may be non-deterministic.
+
+Example Usage. Consider the TTA in Figure 7-(a) and the
+type speculation scenario in Figure 6. If the previous type is
+unknown and the tag is “1A”, this field could be Address or
+uint64 array. In contrast, if the previous field type is uint64
+array and the tag is “1A’, then this field must be Address.
+Before discussing the TTA construction, we first introduce
+another relevant concept, called type graph.
+
+4.2.1 Tag-Field Ambiguity. Figure 6 depicts an example
+where tag “1A” can be decoded into either an address of a
+Person or the location_ids of an Address. Two key factors
+contribute to this phenomenon:
+• Field Number Reuse: Field numbers are only unique
+within the scope of a single message and are frequently
+
+1853
+
+SpecProto: A Parallelizing Compiler for Speculative Decoding of Large Protocol Buffers Data
+
+10
+10
+
+10
+
+Algorithm 3: TTA Construction
+
+10
+
+string
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+10
+
+16
+
+uint32
+
+16
+
+16
+
+26
+
+26
+1616
+
+26
+
+26
+26
+
+Address
+
+26
+26
+26
+
+(a) Type Transition Automaton
+
+function BuildTTA(S):
+𝑞 0 ← new NFA state (initial state)
+3
+initialize 𝑇𝑇 𝐴 /* 𝑇𝑇 𝐴[𝑆𝑇 ] [𝑡𝑎𝑔] stores the list of
+successor states for each state 𝑆𝑇 via a given tag */
+4
+𝑜𝑢𝑡𝑒𝑑𝑔𝑒𝑠 ← BuildTypeGraph(S)
+5
+for field 𝑓 ∈ S do
+6
+/* add a transition from 𝑞 0 to its type */
+7
+add 𝑓 .type to 𝑇𝑇 𝐴[𝑞 0 ] [𝑓 .tag]
+8
+/* add derived transitions recursively via DFS */
+9
+reset 𝑣𝑖𝑠𝑖𝑡𝑒𝑑 to empty
+10
+DFS(𝑓 .type, 𝑓 .type)
+11
+return 𝑇𝑇 𝐴
+12 /* Construct the type graph for guiding TTA construction */
+13 function BuildTypeGraph(S):
+14
+initialize 𝑒𝑑𝑔𝑒𝑠 /* 𝑒𝑑𝑔𝑒𝑠 [𝑇 ] lists out-neighbors of type 𝑇
+*/
+15
+for message 𝑚 ∈ S do
+16
+for field 𝑓 ∈ 𝑚.fields do
+17
+add 𝑚.name to 𝑒𝑑𝑔𝑒𝑠 [𝑓 .type]
+18
+return 𝑒𝑑𝑔𝑒𝑠
+19 /* DFS on type graph to insert transitions into the TTA */
+20 function DFS(𝑠𝑡𝑎𝑟𝑡, 𝑢):
+21
+if 𝑢 is root ∨ 𝑢 ∈ 𝑣𝑖𝑠𝑖𝑡𝑒𝑑 then
+22
+return
+23
+add 𝑢 to 𝑣𝑖𝑠𝑖𝑡𝑒𝑑
+24
+for type 𝑇 ∈ 𝑜𝑢𝑡𝑒𝑑𝑔𝑒𝑠 [𝑢] do
+25
+/* T is a message type; T.fields store its fields */
+26
+for field 𝑓 ′ ∈ 𝑇 .fields do
+27
+if 𝑓 ′ .type = 𝑢 ∧ 𝑢 = 𝑠𝑡𝑎𝑟𝑡 ∧ 𝑢 is not repeated
+submessage then
+28
+continue
+29
+add 𝑓 ′ .type to 𝑇𝑇 𝐴[𝑠𝑡𝑎𝑟𝑡] [𝑓 ′ .tag]
+30
+DFS(𝑠𝑡𝑎𝑟𝑡, 𝑇 )
+1
+
+Address
+
+uint64
+array
+
+2
+
+Person
+
+uint32
+
+uint64
+array
+
+string
+
+(b) Type Graph
+
+Figure 7. Example TTA and Type Graph (states and nodes in
+TTA and type graph are referred to as type states and type nodes.)
+Definition 4.7. The type graph of a schema S is a directed
+graph where nodes represent message or field types in S,
+and directed edges denote their “composition relation”. The
+top-level message of S is called the root of the type graph.
+Figure 7-(b) shows a type graph, where Person serves as
+the root. Since only message types can be composed of other
+types, all edges of a type graph point to message-type nodes.
+Example Usage. Type graph can guide TTA construction.
+In Figure 7-(b), nodes Address, int32, and string all point
+to Person, which is the root. This implies that fields of type
+int32 or string can directly follow an Address. On the other
+hand, if Person is not the root, say Person and Pet both point
+to PetOwner, then a Pet field could also follow an Address.
+TTA Construction. Algorithm 3 describes the construction of TTA for a schema S. It first builds the type graph,
+then iterates over fields in S to capture valid transitions.
+For each field 𝑓 in S, the algorithm adds a transition from
+the initial state 𝑞 0 to its corresponding type state (Line 7),
+indicating that this is a possible type of the first field after
+a partition point. Next, it starts a fresh DFS traversal over
+the type graph (i.e., 𝑜𝑢𝑡𝑒𝑑𝑔𝑒𝑠) from the type node of field 𝑓
+(Lines 9–10). The DFS function takes two inputs: the 𝑠𝑡𝑎𝑟𝑡
+type node and the current type node 𝑢 (Line 20). When the
+current node 𝑢 becomes the root (i.e., Person in our example)
+or has been visited already, the DFS returns; otherwise, the
+algorithm marks 𝑢 as visited (Line 23) and starts to visit the
+out-neighbors of the current type node. Then, for each field
+𝑓 ′ of an out-neighbor, the algorithm inserts an edge from
+𝑠𝑡𝑎𝑟𝑡 to 𝑓 ’s type node in the TTA (Lines 26–29). An exception
+occurs when 𝑢 is not a repeated submessage: in this case, a
+type node 𝑢 does not immediately point to itself in the TTA
+(Lines 27–28). For example, in Figure 7-(a), uint64 array does
+not form a self-loop. However, a type node may still point
+to itself through traversal of other message types in DFS.
+Finally, the algorithm starts a recursive call to DFS with the
+same 𝑠𝑡𝑎𝑟𝑡 node, but now the current node 𝑢 becomes the
+out-neighbor (Line 30). The above process repeats until all
+fields of schema S have been processed in a similar recursive
+way. The final output would be a TTA.
+
+The reason edges are recursively added according to the
+type graph is to accommodate the hierarchical structure of
+fields in the schema. For instance, an Address might directly
+follow an uint64 array because uint64 array may represent
+the end of a preceding Address, and thus an edge needs to
+be added between the two type nodes.
+With the above type inference technique, we next explain
+the type speculation process, referred to as backtracking.
+4.2.3 Backtracking. TTA is a non-deterministic—it may
+yield multiple possible field types. This uncertainty arises at
+each decoding step. To manage the accumulated ambiguity
+across fields, we record the candidate types of previous fields
+and backtrack to explore alternative possibilities if decoding
+fails after all options are exhausted. Additionally, we cannot
+avoid backtracking by converting NFA to DFA because, in
+an equivalent DFA, a state may correspond to multiple types
+(e.g., uint64 and Address). As a result, we still need to try
+
+1854
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+Zhijie Wang et al.
+a "valid" uint64 array
+05 1A 02 1A 08 1A 08 0A 03 4E 59 43 10 91
+
+Algorithm 4: Backtracking
+/* Initially, 𝑖𝑛𝑑𝑒𝑥 = DetectTag() and 𝑝𝑟𝑖𝑜𝑟 _𝑡𝑦𝑝𝑒 = 𝑞 0 */
+function SpecDecode(𝑐ℎ𝑢𝑛𝑘, 𝑖𝑛𝑑𝑒𝑥, 𝑝𝑟𝑖𝑜𝑟 _𝑡𝑦𝑝𝑒, results,
+TTA):
+3
+𝑡𝑎𝑔 ← ReadTag(𝑐ℎ𝑢𝑛𝑘, 𝑖𝑛𝑑𝑒𝑥)
+4
+𝑝𝑜𝑠𝑠𝑖𝑏𝑙𝑒_𝑡𝑦𝑝𝑒𝑠 ← TTA.next(𝑝𝑟𝑖𝑜𝑟 _𝑡𝑦𝑝𝑒, 𝑡𝑎𝑔)
+5
+for 𝑡𝑦𝑝𝑒 ∈ 𝑝𝑜𝑠𝑠𝑖𝑏𝑙𝑒_𝑡𝑦𝑝𝑒𝑠 do
+6
+𝑟𝑒𝑠𝑢𝑙𝑡 ← ParseField(𝑡𝑦𝑝𝑒, 𝑐ℎ𝑢𝑛𝑘, 𝑖𝑛𝑑𝑒𝑥)
+7
+if 𝑟𝑒𝑠𝑢𝑙𝑡 is invalid then /* speculative decoding
+failed */
+8
+continue
+9
+append 𝑟𝑒𝑠𝑢𝑙𝑡 to results
+10
+𝑖 ← 𝑟𝑒𝑠𝑢𝑙𝑡 .next_index
+11
+if 𝑖 exceeds 𝑐ℎ𝑢𝑛𝑘’s size then
+12
+return success
+13
+/* speculatively decode the next field */
+14
+if SpecDecode(𝑐ℎ𝑢𝑛𝑘, 𝑖, 𝑡𝑦𝑝𝑒, results, TTA) succeeds
+then
+15
+return success
+16
+else
+17
+remove the last item from results
+18
+return failure
+1
+
+a "valid" tag
+
+2
+
+not a valid tag
+
+Figure 8. Fake Tag Detection
+(1) Tag Speculation
+
+START
+
+(2) Type Speculation
+NO
+
+Success?
+NO
+
+YES
+
+End of Chunk?
+
+NO
+
+YES
+
+Types Exhausted?
+
+END
+
+YES
+(Fake Tag)
+
+Figure 9. Workflow of Speculative Decoding
+
+previous interpretation was wrong. With no other candidate
+types for “1A”, the algorithm identifies “1A” as a fake tag.
+When a fake tag is detected, tag speculation is restarted
+from the second byte of the fake tag or from the following
+byte if the tag is a single byte. Figure 9 illustrates the complete
+speculative decoding workflow over an input chunk.
+
+each of these types one by one and track which types have
+not yet been tried.
+Algorithm 4 describes the backtracking process. First, the
+inputs to the decoding function include a binary chunk, a
+starting index, the type of the previous field, a data structure
+for storing decoding results, and the TTA. It first extracts a
+tag, then determines the possible types based on the prior
+type and the tag using TTA (Lines 3–4). It then iterates over
+these possible types, attempting to decode the field for each
+one. If decoding fails (e.g., type mismatch), the algorithm
+continues with the next candidate (Lines 7–8); otherwise, it
+appends the result to results and updates 𝑖 to the next index
+in the chunk (Lines 9-10). If 𝑖 exceeds the chunk size, the
+function returns success, indicating the entire chunk has
+been decoded; otherwise, it recursively processes the next
+field with updated parameters. If the recursive call succeeds,
+success is propagated upward; otherwise, the last inserted
+result is removed and the function backtracks to explore
+other candidates (Lines 14–17).
+Initially, the starting index is set to the index of the first
+byte of a tag, detected by a tag pool DFA, and the prior type
+is set to the initial state 𝑞 0 of TTA.
+
+4.2.4 Optimizations. We next discuss some opportunities
+to boost the effectiveness of speculative decoding in practice.
+O1: Type Prioritization. During type speculation phase,
+if multiple candidate types are possible, we prioritize them
+based on the following two heuristics:
+• Prioritizing Submessage Types: Compared to more
+generic types (such as string or uint64), submessages
+impose stricter constraints on byte sequence structure.
+Selecting them increases the likelihood of detecting
+misspeculation earlier if the choice is incorrect.
+• Prioritizing Self-Transitions: If the last recognized
+field is a submessage T and T is among the candidate
+types, we prioritize T. This is based on the observation
+that repeated submessage fields often dominate the
+data and occur contiguously in the input. Favoring the
+same state improves speculation accuracy.
+O2: Maximum-Cost Constraint. When a chunk begins
+in the middle of a large string field or a field containing a
+long sequence of raw bytes, the backtracking algorithm could
+spend a large portion of its time speculating tags and trying
+various candidate types. The speculation cost can accumulate
+quickly, degrading the overall performance. To address this,
+we impose an upper bound on the accumulated number of
+bytes accessed during speculative decoding for each chunk
+(e.g., 1.1× of the chunk size). Processing of the remaining
+chunk bytes will be deferred until the merge phase.
+
+Fake Tag Detection. After exhausting all possible types
+via backtracking, if decoding still fails, then the chosen start
+tag is fake (assuming no data corruption). Figure 8 shows
+an example where the byte “1A” is speculatively treated as
+a tag. The algorithm first tries decoding it as an Address,
+which fails, then as a uint64 array, which seems successful.
+However, the next byte “91” is invalid as a tag, revealing the
+
+1855
+
+SpecProto: A Parallelizing Compiler for Speculative Decoding of Large Protocol Buffers Data
+(1) locate
+
+Protobuf Binary Data
+
+field_num: 3
+start: 18
+end: 22
+truncation info
+
+Chunk 2
+
+Chunk 1
+
+8 9 ... 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+0A 04 41 6C 65 78 10 14 1A 0C ... 05 1A 02 1A 08 1A 08 0A 03 4E 59 43 10 91 4E
+"Alex"
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+20
+
+start: 18
+Address{"LA", 90001, ?} field_num: 3 end: 22
+start: 18
+field_num: 3
+partially parsed field
+end: 22
+type: uint64 array
+truncation info
+value: [26, 8]
+
+start: 22
+end: 32
+field_num: 3
+type: Address
+value: {"NYC", 10001}
+
+Address{"LA", 90001, ?}
+partially parsed field
+
+(2) validate
+1. start at position 18?
+2. a field with number 3
+has uint64 array type?
+(3) merge
+
+start: 18
+end: 22
+field_num: 3
+type: uint64 array
+value: [26, 8]
+spec. parsed field
+
+Address{"LA", 90001, [26, 8]}
+
+speculatively parsed field
+
+(a) Data Structures
+
+(b) Merge Process
+
+(1) locate
+(2) validate
+Success
+
+(3) merge
+
+Failure
+
+(4) redo
+
+Loop continues until
+end of chunk
+
+(c) Merge Workflow
+
+Figure 10. Validation-Driven Merge
+4.3 Validation-Driven Merge
+After independent parsing of chunks, speculative results
+need to be validated and merged to form the final parsing
+result. Figure 10 illustrates this process.
+
+In Figure 10-(b), both fields start at Byte 18 and Address
+has a uint64 array field, therefore, 𝐹𝑠𝑝𝑒𝑐 [0] is valid.
+• Merge or Redo: If validation succeeds, the value of
+speculatively parse field (𝐹𝑠𝑝𝑒𝑐 [0]) is merged into the
+results of Chunk 𝑖; otherwise, the algorithm re-parses
+from the failure point (e.g., Byte 18 in Figure 10-(b)).
+
+Data Structures. First, we record speculatively parsed
+fields as well as the necessary parsing details for merging:
+
+If Chunk 𝑖 + 1 has more speculative parsed fields, repeat the
+validate–merge/redo steps, until end of the chunk.
+When nested truncations occur, the algorithm processes
+truncation entries recursively from the leaf nodes upward,
+ensuring correct hierarchical merging. Algorithm 5 presents
+the detailed pseudocode for the merge algorithm.
+
+• Speculatively Parsed Fields. For each speculatively
+parsed field, we record its start and end positions, field
+number, inferred type, and parsed value.
+• Truncation Information: When a field is parsed partially due to truncation, we call it a tail field. In this
+case, we record its field number and the range of the tobe-decoded part: (𝑠𝑡𝑎𝑟𝑡, 𝑒𝑛𝑑), which can be calculated
+based on the decoded field length.
+
+Partial Redo. In practice, we find that usually only a small
+portion of data is incorrectly parsed, and these parsing errors
+typically do not affect other fields. To avoid re-parsing the
+entire chunk, we only re-parse the binary as necessary—until
+a successful decoding of a field.
+
+Figure 10-(a) shows two speculatively parsed fields for
+Chunk 2: a uint64 array and an Address, and the truncation
+information for Chunk 1. In particular, Byte 8 (“1A”) indicates
+that the tail field has a field number 3 and Byte 9 (“0C”) shows
+that it consists of 12 bytes, ranging from Bytes 10–21. The
+thread responsible for the first chunk actually parses up to
+Byte 17, because Bytes 15–17 correspond to a VARINT, and
+parsing stops only after this VARINT is parsed.
+Note that when nested fields are truncated, we need to
+record multiple truncation information entries.
+
+5
+
+Implementation
+
+Based on our proposed techniques, we prototyped a proto
+compiler in Python, called SpecProto. SpecProto generates
+a parallel decoder in C++ for a standard Protobuf schema.
+Given a Protobuf binary data file, the decoder returns an
+in-memory object corresponding to the original message. It
+supports two parallelization modes: the speculative mode
+(see Section 4) and the non-speculative mode which uses the
+skimming-based parallelization (see Section 3).
+SpecProto uses Jinja [26] as its templating engine for code
+generation. Given a schema and a parallelization mode, it
+produces a header and an implementation file containing
+the schema-specific parallel decoding logic. Each message
+in the schema corresponds to a C++ class. Scalar fields are
+stored using C++ primitive types, string fields are stored
+as std::string, repeated fields are stored in std::vector,
+and submessages are represented as pointers to instances
+of their respective types. In practice, users may modify the
+templates used in SpecProto to adopt custom data structures
+to accommodate their specific use cases.
+
+Merge Algorithm. Given two consecutive chunks 𝑖 and
+𝑖 + 1, and assuming chunk 𝑖 has already been merged with
+the preceding chunks, the basic merge process consists of:
+(i) locate, (ii) validate, and (iii) either merge or redo.
+• Locate the tail field 𝐹 tail of Chunk 𝑖, such as the field
+Address, truncated at Byte 18 in Figure 10-(b).
+• Validate 𝐹 tail ’s truncation information against the first
+speculatively parse field 𝐹𝑠𝑝𝑒𝑐 [0] of Chunk 𝑖 + 1. It
+succeeds only if the following conditions are met.
+𝐹 tail .start = 𝐹𝑠𝑝𝑒𝑐 [0].start ∧
+(𝐹 tail .𝑡𝑦𝑝𝑒 = 𝐹𝑠𝑝𝑒𝑐 [0].𝑡𝑦𝑝𝑒 || ∃ field 𝑓 ∈ 𝐹 tail .𝑡𝑦𝑝𝑒 s.t.
+𝑓 .𝑡𝑦𝑝𝑒 = 𝐹𝑠𝑝𝑒𝑐 [0].𝑡𝑦𝑝𝑒 when 𝐹 tail .𝑡𝑦𝑝𝑒 is a message)
+
+1856
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+Zhijie Wang et al.
+
+Algorithm 5: Merge Algorithm with Partial Redo
+
+For parallel execution, SpecProto leverages OpenMP [25],
+which exhibits similar performance to an implementation
+using std::thread in our experimental setup. SpecProto uses
+mmap to map the input binary file into memory for efficient
+data access and mimalloc [22] for high-performance memory
+allocation.
+
+/* Generated for each message. Here is for Person. */
+function Merge(𝑐ℎ𝑢𝑛𝑘, 𝑖𝑛𝑑𝑒𝑥, 𝑒𝑛𝑑, 𝑡𝑟𝑢𝑛𝑐𝑠, 𝑠𝑝𝑒𝑐𝑠):
+3
+if 𝑡𝑟𝑢𝑛𝑐𝑠 is not empty then
+4
+𝑡𝑟𝑢𝑛𝑐 ← pop first from 𝑡𝑟𝑢𝑛𝑐𝑠 /* locate */
+5
+switch 𝑡𝑟𝑢𝑛𝑐.field_num :
+6
+case ... :
+1
+
+2
+
+7
+8
+9
+
+10
+11
+12
+13
+14
+15
+
+16
+17
+18
+19
+20
+21
+22
+23
+
+24
+25
+26
+27
+
+6
+
+case 3 : /* the last address is partially parsed */
+𝑎𝑑𝑑𝑟𝑒𝑠𝑠 ← the last address
+𝑎𝑑𝑑𝑟𝑒𝑠𝑠.Merge(𝑐ℎ𝑢𝑛𝑘,
+𝑡𝑟𝑢𝑛𝑐.start, 𝑡𝑟𝑢𝑛𝑐.end, 𝑡𝑟𝑢𝑛𝑐𝑠, 𝑠𝑝𝑒𝑐𝑠)
+if the current message is still partially parsed then
+AddNewTrunc(𝑡𝑟𝑢𝑛𝑐𝑠, ...) /* for the next merge */
+return
+while 𝑖𝑛𝑑𝑒𝑥 < 𝑒𝑛𝑑 do
+𝑠𝑝𝑒𝑐 ← first spec from 𝑠𝑝𝑒𝑐𝑠
+if 𝑠𝑝𝑒𝑐 exists ∧ 𝑖𝑛𝑑𝑒𝑥 = 𝑠𝑝𝑒𝑐.start ∧
+TypeCheck(spec.field_num, spec.type) then /*
+validate */
+switch 𝑠𝑝𝑒𝑐.field_num :
+case ... :
+
+Evaluation
+
+In this section, we evaluate the performance of the parallel
+decoders generated by SpecProto. Note that their correctness
+has also been thoroughly tested and verified.
+6.1 Methodology
+We evaluate both the speculative and non-speculative modes
+of SpecProto and compare their performance against serial
+decoding, which serves as our baseline. For reference, our
+baseline runs about 2–4× faster than the standard protoc
+compiler (Protocol Buffers v23.4, proto3) [7], which offers
+more features, including arena allocation for memory management, unknown fields preservation, advanced language
+features (e.g., map and oneof), UTF-8 validation, and has a
+significantly larger codebase. We believe that most of these
+features are orthogonal to our parallelization techniques.
+One exception is unknown fields preservation in the speculative mode, since the speculative mode examines valids
+tags during the decoding phase.
+For the schemas under our evaluation, the encoders and
+decoders (which share code) generated by protoc have an
+average size of 13442 lines. In comparison, our sequential
+decoder has an average size of 1574 lines, and our parallel
+decoders have average sizes of 6503 lines (spec) and 2558
+lines (non-spec).
+
+case 3 :
+append 𝑠𝑝𝑒𝑐.value to address /* merge */
+𝑖𝑛𝑑𝑒𝑥 ← 𝑠𝑝𝑒𝑐.end
+pop first from 𝑠𝑝𝑒𝑐𝑠
+else /* redo */
+ParseOnce(chunk, index, end) /* parse one field
+and write to the current Person message */
+if the new field is partially parsed then
+AddNewTrunc(𝑡𝑟𝑢𝑛𝑐𝑠, ...)
+return
+PopInvalidSpec(𝑠𝑝𝑒𝑐𝑠) /* discard wrong specs */
+
+Table 1. Dataset Statistics (#msg and #field represent the
+number of messages and fields defined in the schema; 𝑅𝑡𝑎𝑔 is
+the tag density: tagBytes/totalBytes; 𝑑 is the message depth)
+
+When speculation mode is enabled, SpecProto generates
+the tag-pool DFA and TTA, stored in the implementation file,
+along with the speculative decoding workflow. The DFA and
+TTA are shared among worker threads. For the root message,
+a corresponding speculative decoding method is generated,
+which executes the three steps described earlier: partitioning,
+speculative decoding, and merging with validation. Each
+message implements a merge method to combine the results
+of speculative decoding. This is necessary because when a
+submessage is partially truncated, its merge method must be
+invoked to complete the partial decoding. For all messages,
+a sequential parsing method is generated. In particular, the
+first thread uses the sequential parsing method for the root
+message to parse a partial message. All threads except for
+the last one may use the sequential parsing method to parse
+a partial message and cause the truncation point.
+In non-speculative mode, a serial parser is generated for
+each message, except for the root message, which employs
+the two-pass parallelization approach.
+
+Data
+
+Size
+
+R𝑡𝑎𝑔
+
+#msg
+
+#field
+
+#tl_field
+
+𝑑
+
+PROF
+MAP
+PRD
+TT
+SYN1
+SYN2
+SYN3
+
+1084MB
+733MB
+846MB
+873MB
+990MB
+1018MB
+851MB
+
+5.1%
+4.0%
+1.4%
+5.9%
+0.2%
+8.6%
+2.5%
+
+8
+11
+4
+8
+6
+6
+61
+
+45
+35
+61
+82
+29
+29
+190
+
+14945918
+4439
+272503
+2
+2018
+3939
+320000
+
+3
+6
+3
+5
+6
+55
+8
+
+Datasets. Table 1 lists the datasets used for evaluation.
+The first one is a native dataset of profiling data (PROF) collected from the Go profiler pprof [30]. The next three datasets
+converted the corresponding JSON datasets, including tweets
+(TT) [32], map directions (MAP) [5], and Walmart products
+(PRD) [33]. In addition, we synthesized three datasets to offer
+a wider range of data characteristics.
+
+1857
+
+SpecProto: A Parallelizing Compiler for Speculative Decoding of Large Protocol Buffers Data
+
+End-to-End Time (s)
+Memory Overhead (GB)
+Baseline
+SpecProto
+Baseline
+SpecProto
+(serial) non-spec spec (serial) non-spec spec
+4.93
+0.84
+0.71
+1.50
+0.87
+2.21
+1.99
+
+2.31
+0.17
+0.38
+1.52
+0.13
+0.38
+0.52
+
+1.33
+0.16
+0.15
+0.32
+0.22
+0.39
+0.32
+
+5.87
+1.89
+2.05
+2.74
+2.42
+3.40
+3.85
+
+7.06
+1.92
+2.11
+2.74
+2.47
+3.42
+3.90
+
+6.58
+2.02
+2.10
+2.86
+2.49
+3.56
+3.93
+
+Experiment Environment. Experiments were run on a
+server node with two Intel Xeon E5-2683 v4 processors and
+512 GB RAM. Unless otherwise specified, all parallel executions use a single socket with 16 threads. This server runs
+Rocky 8 and uses G++ 9.2.1. All programs are compiled with
+-O3. The timing results reported are the average of five runs.
+
+8
+7
+6
+5
+4
+3
+2
+1
+0
+
+Baseline
+
+PROF
+
+MAP
+
+SpecProto (non-spec)
+
+PRD
+
+TT
+SYN1
+Datasets
+
+SpecProto (spec)
+
+SYN2
+
+SYN3
+
+Geo
+
+Figure 11. Speedups Compared to the Baseline.
+Percentage (%)
+
+PROF
+MAP
+PRD
+TT
+SYN1
+SYN2
+SYN3
+
+Speedup
+
+Table 2. Overall Decoding Time and Memory Overhead.
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+100
+80
+60
+40
+20
+0
+
+41%
+59%
+PROF
+
+12%
+
+20%
+
+12%
+
+9%
+
+88%
+
+80%
+
+88%
+
+MAP
+
+PRD
+
+TT
+Datasets
+
+95%
+91%
+Speculative Decoding
+Merge
+SYN1 SYN2 SYN3
+
+9%
+
+91%
+
+Figure 12. Time Breakdown (SpecProto-spec).
+
+6.2 Overall Performance
+Execution time. Table 2 reports the end-to-end decoding
+time of evaluated methods while Figure 11 visualizes the
+speedups relative to the baseline. The results show that both
+non-spec and spec modes of SpecProto exhibit significant
+speedups over the baseline on almost all datasets, with the
+only exception being non-spec on the TT dataset.
+More specifically, SpecProto non-spec achieves speedups
+ranging from 1× to 6.7× (3.8× on average), while SpecProto
+spec achieves speedups from 3.7× to 6.2× (4.9× on average).
+We will study the causes of speedup variations in Section 6.3.
+
+Top-Level Fields. In MAP and SYN2 datasets, the number
+of top-level fields is limited and their sizes are similar, in
+which case spec and non-spec perform similarly. When there
+are a large number of top-level fields (PROF, PRD, and SYN3),
+non-spec quickly loses due to the serial bottleneck in the first
+pass. Additionally, non-spec cannot achieve any speedup on
+the TT dataset because this dataset has only one large field at
+the top level, which means that during the parallel decoding
+phase, only one thread can be used.
+Based on the results of the experiments on two specially
+synthesized datasets, SYN2 (𝑑 = 55) and SYN3 (#msg = 61), we
+did not observe that the deep nesting depth or large number
+of message definitions posed any unique challenges for the
+two parallelization algorithms.
+
+Memory Overhead. The memory cost is important when
+parsing a single large message. Table 2 presents the memory
+footprints of different methods in the parsing process, which
+mainly consists of two parts: the binary data and the parsed
+results. Due to the presence of the VARINT type, the memory
+occupied by the parsed results is often greater than that of
+the original binary data. For most of the datasets, there is no
+significant difference in memory cost among the different
+methods when using 1 to 16 threads. For the PROF dataset,
+SpecProto consumes more memory than the baseline, especially for non-spec. This is because a very large number of
+objects are allocated simultaneously by all threads, which increases memory retained in the allocator’s per-thread caches
+and leads to a higher peak memory overhead.
+
+6.4
+
+Speculation Cost and Benefit Breakdown
+Table 3. Speculation Cost Breakdown (in Bytes)
+
+6.3 Impacts of Input Structure
+Tag Density. For tag-dense datasets (R𝑡𝑎𝑔 >1%), spec often
+performs better than non-spec, because spec only requires a
+single scan—better locality, and its threads are assigned with
+almost balance loads. However, for tag-sparse datasets (e.g.,
+SYN1), non-spec wins because the lower tag density makes
+spec less effective at speculating tags.
+
+Data
+
+Input
+
+Processed (Ratio)
+
+Redo
+
+PROF
+MAP
+PRD
+TT
+SYN1
+SYN2
+SYN3
+
+1,084,030,512
+732,708,874
+846,331,241
+872,839,280
+989,559,705
+1,018,213,954
+851,184,808
+
+1,093,203,293 (101%)
+732,715,106 (100%)
+846,347,028 (100%)
+872,843,607 (100%)
+1,002,971,341 (101%)
+1,018,214,449 (100%)
+854,376,731 (100%)
+
+9
+0
+0
+160
+86
+101
+8525
+
+Figure 12 shows the breakdown of time spent on speculative decoding versus merging. For all datasets except PROF,
+the merging cost is negligible thanks to the lightweight redos
+(presented shortly). In the case of PROF, the merge process is
+more expensive due to the presence of a large object list (size
+
+1858
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+Baseline
+SpecProto without Type Prioritization
+SpecProto
+
+4.9 6.2
+
+2
+
+Time (s)
+
+Time (s)
+
+3
+
+Zhijie Wang et al.
+
+1
+0
+
+PROF
+
+MAP
+
+PRD
+
+TT
+SYN1
+Datasets
+
+SYN2
+
+SYN3
+
+Speedup
+
+T=1
+T=2
+
+PROF
+
+T=4
+
+MAP
+
+T=8
+
+PRD
+
+T=16
+
+6.2
+
+6.1
+
+TT
+SYN1
+Datasets
+
+SYN2
+
+SYN3
+
+SpecProto
+
+50
+
+100
+
+200
+400
+Size (MB)
+
+800
+
+1600
+
+Figure 15. Scalability over Message Size (SpecProto-spec).
+
+Figure 13. Benefits of Type Prioritization (SpecProto-spec).
+
+6
+5
+4
+3
+2
+1
+0
+
+0.6
+0.5
+0.4
+0.3
+0.2
+0.1
+0.0
+
+6.5 Scalability
+Figure 14 shows the speedup of spec with varying numbers
+of threads. We observe that performance gains from more
+threads gradually diminish, due to the memory-intensive
+nature of the parsing process. Separately, when using 8
+threads on the SYN1 dataset, one of the chunks experienced a
+misspeculation that triggered substantial overhead, slowing
+down the overall execution time.
+Figure 15 illustrates how spec scales with increasing binary size using the TT dataset. The results indicate that spec
+exhibits near-linear scaling.
+
+Figure 14. Scalability over Threads (SpecProto-spec).
+
+7
+
+> 107 )—sequentially merging them takes time. One possible
+optimization is to pre-merge the parsed fields within each
+chunk during the parallel decoding.
+Table 3 reports the number of bytes re-parsed during the
+merge phase. For all datasets, the redo cost is negligible. A
+detailed breakdown of the redo cost indicates that all such
+costs arise when, during the merge phase, the speculatively
+parsed field type does not match the required type, leading to
+a redo. One relatively trivial case is when types such as bool,
+int32, or uint64 fail to match; a possible optimization would
+be to handle such types explicitly using type casting to avoid
+redo. Another case occurs when a string is mismatched with
+an int array, or when two submessages fail to match, in
+which case re-parsing is required. The latter accounts for the
+majority of the redo cost in the SYN3 dataset.
+The experiments on our tested datasets demonstrate only
+limited misspeculation and its potential cost. In the worst
+case, if there are many fake tags, or if the string or bytes fields
+overlap substantially with submessage data, the chances of
+misspeculation can increase significantly.
+
+Related Work
+
+In this section, we review prior work on parallel processing
+of serialized data and discuss how our techniques may extend
+to other binary serialization formats.
+Parallel Processing of Textual Data. Extensive research
+has explored parallel querying over raw textual data formats
+such as JSON, XML, and CSV, with most solutions built on
+formal querying models like NFAs or DFAs. For instance, to
+enable parallel XPath querying, Ogden et al. [24] proposed
+parallel pushdown transducers (PPT), which evaluate all
+possible query states simultaneously when processing an
+XML partition. Jiang and Zhao [10] improved PPT efficiency
+by pruning infeasible states using the XML schema.
+Prior works on accelerating JSON processing has largely
+focused on exploiting bit-wise and byte-wise parallelism.
+For example, Mison [17] builds bitmap index for large JSON
+records, while Pison [8] improves the indexing scalability by
+employing multiple cores. simdjson [16] employs bitwise and
+SIMD operations to validate and tokenize JSON data prior
+to building a parse tree. JPstream [9] leverages speculative
+streaming to evaluate a JSONPath query in parallel. Finally,
+JSONSki [11] utilizes bit-parallelism to fast-forward over
+irrelevant data during streaming query matching.
+While not directly applicable, the “divide and conquer” and
+state speculation strategies from the above works inspired
+the approaches proposed in this work.
+
+Benefits of Type Prioritization. Figure 13 compares the
+execution time with and without type prioritization. The
+results indicate that this optimization is critical for most
+datasets. Without the heuristics for candidate type selection,
+it would take backtracking many more attempts to find the
+correct type. Furthermore, in the merge phase, validation
+failures led to expensive redos. A good type prioritization
+heuristics can help determine a tag’s type more quickly and
+reduce the likelihood of validation failure.
+
+Acceleration of Protobuf. Existing research has explored
+hardware-based approaches. Early efforts such as UDP target
+ETL workloads by accelerating data transformation using
+
+1859
+
+SpecProto: A Parallelizing Compiler for Speculative Decoding of Large Protocol Buffers Data
+
+programmable hardware [2]. More recently, Optimus Prime
+proposes a general-purpose accelerator for serialization and
+deserialization by exploiting field-level parallelism within
+message schemas [27]. One study proposes a near-core accelerator that combines specialized execution units with
+optimized memory and layout representations [13]. Another
+offloads Protobuf deserialization to SmartNICs, exploiting
+message-level parallelism across NIC cores and pipelined
+execution with host computation [1].
+In software, Google’s µpb provides a high-performance C
+decoding runtime that uses table-driven parsing and arenabased memory management to reduce per-field dispatch and
+allocation overhead, but it remains largely single-message,
+single-core in nature [6].
+As far as we are aware, no previous research has explored
+parallelizing the decoding of a single serialized binary.
+
+those of the authors and do not necessarily reflect the views
+of the National Science Foundation.
+
+References
+[1] Shiyi Cao, Salvatore Di Girolamo, and Torsten Hoefler. 2022. Accelerating Data Serialization/Deserialization Protocols with In-Network
+Compute. In 2022 IEEE/ACM International Workshop on Exascale MPI
+(ExaMPI). 22–30. doi:10.1109/ExaMPI56604.2022.00008
+[2] Yuanwei Fang, Chen Zou, Aaron J. Elmore, and Andrew A. Chien.
+2017. UDP: a programmable accelerator for extract-transform-load
+workloads and more. In Proceedings of the 50th Annual IEEE/ACM International Symposium on Microarchitecture (Cambridge, Massachusetts)
+(MICRO-50 ’17). Association for Computing Machinery, New York, NY,
+USA, 55–68. doi:10.1145/3123939.3123983
+[3] Apache Software Foundation. 2024. Apache Avro. https://avro.apache.
+org/. Accessed: 2024-10-05.
+[4] Milos Gligoric, Darko Marinov, and Sam Kamin. 2011. CoDeSe: fast
+deserialization via code generation. In Proceedings of the 2011 International Symposium on Software Testing and Analysis (Toronto, Ontario,
+Canada) (ISSTA ’11). Association for Computing Machinery, New York,
+NY, USA, 298–308. doi:10.1145/2001420.2001456
+[5] Google. 2019. Google Map Directions API. https://developers.google.
+com/maps/documentation/directions/start/. Accessed: 2019-07-01.
+[6] Google. 2024. A small protobuf implementation written in C. https:
+//github.com/protocolbuffers/protobuf/tree/main/upb. Accessed: 202410-05.
+[7] Google. 2025. Protocol Buffers. https://github.com/protocolbuffers/
+protobuf. Accessed: 2025-08-20.
+[8] Lin Jiang, Junqiao Qiu, and Zhijia Zhao. 2020. Scalable structural index
+construction for JSON analytics. Proc. VLDB Endow. 14, 4 (Dec. 2020),
+694–707. doi:10.14778/3436905.3436926
+[9] Lin Jiang, Xiaofan Sun, Umar Farooq, and Zhijia Zhao. 2019. Scalable
+Processing of Contemporary Semi-Structured Data on Commodity
+Parallel Processors - A Compilation-based Approach. In Proceedings
+of the Twenty-Fourth International Conference on Architectural Support
+for Programming Languages and Operating Systems (Providence, RI,
+USA) (ASPLOS ’19). Association for Computing Machinery, New York,
+NY, USA, 79–92. doi:10.1145/3297858.3304008
+[10] Lin Jiang and Zhijia Zhao. 2017. Grammar-aware Parallelization for
+Scalable XPath Querying. In Proceedings of the 22nd ACM SIGPLAN
+Symposium on Principles and Practice of Parallel Programming (Austin,
+Texas, USA) (PPoPP ’17). Association for Computing Machinery, New
+York, NY, USA, 371–383. doi:10.1145/3018743.3018772
+[11] Lin Jiang and Zhijia Zhao. 2022. JSONSki: streaming semi-structured
+data with bit-parallel fast-forwarding. In Proceedings of the 27th ACM
+International Conference on Architectural Support for Programming Languages and Operating Systems (Lausanne, Switzerland) (ASPLOS ’22).
+Association for Computing Machinery, New York, NY, USA, 200–211.
+doi:10.1145/3503222.3507719
+[12] Svilen Kanev, Juan Pablo Darago, Kim Hazelwood, Parthasarathy Ranganathan, Tipp Moseley, Gu-Yeon Wei, and David Brooks. 2015. Profiling a warehouse-scale computer. SIGARCH Comput. Archit. News
+43, 3S (June 2015), 158–169. doi:10.1145/2872887.2750392
+[13] Sagar Karandikar, Chris Leary, Chris Kennelly, Jerry Zhao, Dinesh
+Parimi, Borivoje Nikolic, Krste Asanovic, and Parthasarathy Ranganathan. 2021. A Hardware Accelerator for Protocol Buffers. In
+MICRO-54: 54th Annual IEEE/ACM International Symposium on Microarchitecture (Virtual Event, Greece) (MICRO ’21). Association for
+Computing Machinery, New York, NY, USA, 462–478. doi:10.1145/
+3466752.3480051
+[14] Martin Kleppmann. 2017. Encoding and Evolution. In Designing
+Data-Intensive Applications: The Big Ideas Behind Reliable, Scalable, and
+Maintainable Systems. O’Reilly Media, 112–121.
+
+Possible Extension to Other Binary Formats. Given the
+similarities among binary data formats, some of our parallel
+decoding ideas proposed for Protobuf could be extended
+to other formats. For instance, Thrift is also schema-based,
+like Protobuf, with explicit field types and identifiers. Our
+speculative decoding method can be directly applied to Thrift
+by identifying the type and field ID, speculatively decoding
+fields, validating the speculation, and merging the correct
+parses. Our skimming-based decoding cannot be applied to
+Thrift, as it does not encode the byte length in the binary
+data for types such as lists and structs.
+For schema-less formats such as MessagePack and BSON,
+our skimming-based decoding method is applicable, thanks
+to the encoded length information. However, speculative
+decoding requires strict schemas, which often times are not
+available for such types of data formats.
+
+8
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+Conclusion
+
+This work tackles a fundamental issue in Protobuf decoding—
+encoding-induced dependencies that limit parallelism. To
+address this issue, it presents two methods: skimming-based
+and speculative parallelization. Skimming exploits the lengthprefixing design of Protobuf to find independent decoding
+tasks, while speculative parallelization cuts the binary into
+even chunks and leverages schema constraints to infer the
+decoding state for each chunk. Evaluation based on real and
+synthetic datasets shows that both parallelization methods
+deliver substantial speedups on multicore CPUs.
+
+Acknowledgments
+We thank all reviewers for their constructive feedback and
+our shepherd, Dr. Babak Falsafi, for his efforts in helping
+with the paper’s revision. This material is based upon work
+supported by the National Science Foundation under Grants
+No. 1751392 and 2106383. Any opinions, findings, and conclusions or recommendations expressed in this material are
+
+1860
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+Zhijie Wang et al.
+
+[15] Bruno Krebs. 2017. Beating JSON performance with Protobuf. https://
+auth0.com/blog/beating-json-performance-with-protobuf/. Accessed:
+2024-11-01.
+[16] Geoff Langdale and Daniel Lemire. 2019. Parsing gigabytes of JSON
+per second. The VLDB Journal 28, 6 (Oct. 2019), 941–960. doi:10.1007/
+s00778-019-00578-5
+[17] Yinan Li, Nikos R. Katsipoulakis, Badrish Chandramouli, Jonathan
+Goldstein, and Donald Kossmann. 2017. Mison: a fast JSON parser
+for data analytics. Proc. VLDB Endow. 10, 10 (June 2017), 1118–1129.
+doi:10.14778/3115404.3115416
+[18] Gang Liao, Ye Liu, Yonghua Ding, Le Cai, and Jianjun Chen. 2024.
+SFVInt: Simple, Fast and Generic Variable-Length Integer Decoding
+using Bit Manipulation Instructions. In Proceedings of the 20th International Workshop on Data Management on New Hardware (Santiago,
+AA, Chile) (DaMoN ’24). Association for Computing Machinery, New
+York, NY, USA, Article 1, 9 pages. doi:10.1145/3662010.3663439
+[19] Wei Lu, Kenneth Chiu, and Yinfei Pan. 2006. A Parallel Approach
+to XML Parsing. In Proceedings of the 7th IEEE/ACM International
+Conference on Grid Computing (GRID ’06). IEEE Computer Society,
+USA, 223–230. doi:10.1109/ICGRID.2006.311019
+[20] Sergey Melnik, Andrey Gubarev, Jing Jing Long, Geoffrey Romer, Shiva
+Shivakumar, Matt Tolton, Theo Vassilakis, Hossein Ahmadi, Dan Delorey, Slava Min, Mosha Pasumansky, and Jeff Shute. 2020. Dremel: a
+decade of interactive SQL analysis at web scale. Proc. VLDB Endow. 13,
+12 (Aug. 2020), 3461–3472. doi:10.14778/3415478.3415568
+[21] MessagePack Developers. 2024. MessagePack. https://msgpack.org/
+index.html. Accessed: 2024-10-05.
+[22] Microsoft. 2024. mimalloc. https://github.com/microsoft/mimalloc.
+Accessed: 2024-10-10.
+[23] MongoDB. 2024. BSON. https://bsonspec.org/. Accessed: 2024-10-05.
+[24] Peter Ogden, David Thomas, and Peter Pietzuch. 2013. Scalable XML
+query processing using parallel pushdown transducers. Proc. VLDB
+Endow. 6, 14 (sep 2013), 1738–1749. doi:10.14778/2556549.2556558
+[25] OpenMP Architecture Review Board. 2024. OpenMP. https://www.
+openmp.org/. Accessed: 2024-10-10.
+[26] Pallets. 2024. Jinja. https://github.com/pallets/jinja. Accessed: 202411-03.
+[27] Arash Pourhabibi, Siddharth Gupta, Hussein Kassir, Mark Sutherland,
+Zilu Tian, Mario Paulo Drumond, Babak Falsafi, and Christoph Koch.
+2020. Optimus Prime: Accelerating Data Transformation in Servers.
+In Proceedings of the Twenty-Fifth International Conference on Architectural Support for Programming Languages and Operating Systems
+(Lausanne, Switzerland) (ASPLOS ’20). Association for Computing Machinery, New York, NY, USA, 1203–1216. doi:10.1145/3373376.3378501
+[28] Daniel Persson Proos and Niklas Carlsson. 2020. Performance Comparison of Messaging Protocols and Serialization Formats for Digital
+Twins in IoV. 2020 IFIP Networking Conference (Networking) (2020),
+10–18. https://api.semanticscholar.org/CorpusID:220669345
+[29] Mark Slee, Aditya Agarwal, and Marc Kwiatkowski. 2007. Thrift:
+Scalable Cross-Language Services Implementation. Technical Report.
+Facebook. https://thrift.apache.org/static/files/thrift-20070401.pdf
+[30] The Go Authors. 2024. runtime/pprof. https://pkg.go.dev/runtime/
+pprof. Accessed: 2024-09-19.
+[31] TwitchTV. 2019. Serialization and deserialization of large messages can
+be slow #166. https://github.com/twitchtv/twirp/issues/166. Accessed:
+2024-11-06.
+[32] Twitter. 2019. Twitter Developer API. https://developer.twitter.com/
+en/docs/. Accessed: 2019-07-01.
+[33] Walmart. 2019. Product Lookup API. https://developer.walmartlabs.
+com/docs. Accessed: 2019-05-10.
+[34] Zhijia Zhao, Bo Wu, and Xipeng Shen. 2014. Challenging the "embarrassingly sequential": parallelizing finite state machine-based computations through principled speculation. In Proceedings of the 19th
+
+International Conference on Architectural Support for Programming Languages and Operating Systems (Salt Lake City, Utah, USA) (ASPLOS ’14).
+Association for Computing Machinery, New York, NY, USA, 543–558.
+doi:10.1145/2541940.2541989
+
+A
+
+Artifact Appendix
+
+A.1 Abstract
+The source code and evaluation scripts for SpecProto are
+available at https://github.com/AutomataLab/SpecProto. The
+artifact provides a collection of scripts to reproduce the results and figures presented in the paper, including execution
+time (Figure 11), memory overhead (Table 2), speculation
+cost breakdown (Table 3), time breakdown (Figure 12), benefits of type prioritization (Figure 13), scalability over threads
+(Figure 14), and scalability over message size (Figure 15). The
+artifact also provides links to the datasets. It has been tested
+on Linux systems with 16 physical CPU cores and at least 16
+GB of memory. The results produced by the artifact should
+be similar to those reported in the paper.
+A.2
+
+Artifact check-list (meta-information)
+• Algorithm: Parallel Protobuf Decoding
+• Program: SpecProto
+• Compilation: G++ 9.2.1
+• Data set: Links to seven publicly available Protobuf datasets
+• Run-time environment: Developed and tested on Rocky
+Linux 8.
+• Hardware: All experiments ran on a server node with two
+Intel Xeon E5-2683 v4 processors and 512GB RAM.
+• Execution: Command-line execution of compiled binaries
+with specified input files and parameters
+• Metrics: Execution time, memory overhead, processed bytes
+• Output: Logs reporting execution time and memory overhead
+• Experiments: Full reproduction of Figures 11–15 and Tables 2-3 (execution time, memory overhead, cost and time
+breakdown, scalability)
+• How much disk space is required (approximately)?:
+10GB
+• How much time is needed to prepare workflow (approximately)?: 10 minutes (cloning repository, installing
+dependencies)
+• How much time is needed to complete experiments
+(approximately)?: 1-3 hours
+• Publicly available?: Yes
+• Code licenses (if publicly available)?: MIT License
+
+A.3 Description
+A.3.1 How to access. The full artifact, including source
+code, scripts, and documentation, is available on GitHub:
+https://github.com/AutomataLab/SpecProto. Users can clone
+the repository using Git or download it as a ZIP file.
+A.3.2 Hardware dependencies. To reproduce the results
+reported in the paper, we recommend using a machine with
+16 physical CPU cores and at least 16 GB of memory.
+
+1861
+
+SpecProto: A Parallelizing Compiler for Speculative Decoding of Large Protocol Buffers Data
+
+ASPLOS ’26, March 22–26, 2026, Pittsburgh, PA, USA
+
+A.5 Experiment workflow
+Clone the repository and move it to the desired directory.
+Generate and build the code. Execute the compiled binaries
+with the available datasets. README.md provides step-by-step
+instructions for running the experiments.
+
+A.3.3 Software dependencies. We recommend running
+the artifact on Rocky Linux 8, though similar Linux systems
+should also work. We provide a script to install the necessary
+dependencies (e.g., Protobuf).
+A.3.4 Datasets. We include links to the necessary datasets
+in our artifact.
+
+A.6 Evaluation and expected results
+We provide the necessary commands to generate the figures
+and tables presented in the evaluation section. The results
+should be similar to those reported in our paper.
+
+A.4 Installation
+The artifact has been tested with G++ 9.2.1 and CMake 3.26.4.
+Other compatible versions may also work. Compilation and
+execution scripts are provided in the repository. Detailed
+instructions can be found in README.md.
+
+A.7 Experiment customization
+Users can add new datasets and schemas and place them in
+dataset/ and schema/, respectively. Then run the relevant
+commands (see the examples in README.md).
+
+1862
+

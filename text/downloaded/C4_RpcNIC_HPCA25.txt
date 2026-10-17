@@ -1,0 +1,1592 @@
+2025 IEEE International Symposium on High-Performance Computer Architecture (HPCA)
+
+RpcNIC: Enabling Efficient Datacenter RPC
+Offloading on PCIe-attached SmartNICs
+Jie Zhang1,† , Hongjing Huang1,† , Xuzheng Chen1 , Xiang Li1 , Jieru Zhao2 , Ming Liu3 , Zeke Wang1,∗
+Zhejiang University1 , Shanghai Jiao Tong University2 , University of Wisconsin-Madison3
+{carlzhang4, huang hj, chenxuz, lixiang3}@zju.edu.cn, zhao-jieru@sjtu.edu.cn, mgliu@cs.wisc.edu, wangzeke@zju.edu.cn
+
+Abstract—The emerging microservice/serverless-based cloud
+programming paradigm and the rising networking speeds leave
+the RPC stack as the predominant data center tax. Domainspecific hardware acceleration holds the potential to disentangle
+the overhead and save host CPU cycles. However, state-of-theart RPC accelerators integrate RPC logic into the CPU or use
+specialized low-latency interconnects, hardly adopted in commodity servers. To this end, we design and implement RpcNIC, a
+software-hardware co-designed SmartNIC that enables efficient
+RPC layer offloading and reconfigurable RPC kernel offloading.
+RpcNIC connects to the server through the most widely used
+PCIe interconnect. To grapple with the ramifications of PCIeinduced challenges, RpcNIC introduces three techniques: (a)
+a target-aware deserializer that effectively batches cross-PCIe
+writes on the SmartNIC’s SRAM using compacted hardware data
+structures; (b) a memory-affinity CPU-SmartNIC collaborative
+serializer, which trades additional host memory copies for slow
+cross PCIe-transfers; (c) an automatic field update technique that
+transparently codifies the schema based on dynamic reconfigure
+RPC kernels to minimize superfluous PCIe traversals. We prototype RpcNIC using the Xilinx U280 FPGA card. On HyperProtoBench, RpcNIC achieves an average of 2.3× lower RPC layer
+processing time than a comparable RPC accelerator baseline and
+demonstrates 2.6× achievable throughput improvement in the
+end-to-end cloud workload.
+
+I. I NTRODUCTION
+Remote Procedure Call (RPC) is a paramount service block
+of today’s cloud system stacks [20], [37], [46], [69]. It
+abstracts remote computing resources and provides a simple
+and familiar programming model. Developers only prescribe
+type information for each remote procedure, and a compiler
+generates a stub code linked to an application to pass arguments via message. The RPC model has been widely adopted
+in many distributed applications, such as cloud storage [18],
+[86], file systems [43], [89], data analytics [77], consensus
+protocols [87], [88], and machine learning systems [49], [57].
+The RPC stack comprises two key components: (a) RPC
+protocol handling that parses the RPC headers, identifies the
+triggered message and the carried payload, and determines the
+target function; (b) serialization and deserialization, transforming between in-memory data fields and architecture/languageagnostic formats. A recent study from Google Cloud [69]
+reports that the RPC processing occupies ∼7.1% of CPU
+cycles across the entire fleet. Thus, it is important to accelerate
+the RPC execution, reduce this data center tax, and release
+more CPU cycles for revenue-generated applications.
+† Contributes equally
+∗ Corresponding author
+
+Domain-specific hardware acceleration is a promising solution to build performant computing systems in the postMoore’s Law era. However, designing an RPC hardware
+accelerator is very challenging because the RPC stack is
+tightly coupled with the networking stack and application
+layer, whose processing should be efficiently streamlined
+into the data plane. As a result, researchers propose to use
+specialized on-chip interconnects and closely integrate the
+RPC acceleration module in the host CPU chips [36], [38],
+[46], [63], [64]. For example, Cereal [36] introduces a special
+memory access interface to allow low-latency host memory
+accesses from the RPC accelerator. Dagger [46] leverages Intel
+UPI [35] interconnect to facilitate RPC stack processing.
+Unfortunately, none of these proposals can be easily adopted
+on commodity servers due to the lack of interconnect support.
+RPC stack is continuously and rapidly evolving. For example,
+widely used gRPC [20] has 9 major releases over the last
+twelve months. As such, integrating RPC logic into the real
+host CPU lacks enough flexibility. Besides, developing a
+function- and performance-capable interconnect that can be
+integrated into a server system takes many years of engineering
+efforts, such as the ECI bus from the pioneering Enzian
+platform [11]. The emerging Compute Express Link [12] looks
+promising, but its physical layer runs atop PCIe, yielding submicrosecond access latency [48], [73], which cannot satisfy
+the latency requirement of the above accelerators. This leads
+to an interesting question: How to accelerate RPC on top of
+de facto and predominant server interconnect, i.e., PCIe?
+In this paper, we design and implement RpcNIC, a softwarehardware co-designed PCIe-attached SmartNIC for reconfigurable RPC offloading. RpcNIC’ hardware part comprises
+three building blocks: (1) a target-aware deserializer that takes
+RPC requests, deserializes the messages, and forwards the
+results to the host or SmartNIC memory; (2) a memory-affinity
+serializer, which fetches computed data from both the host
+and SmartNIC memory, performs serialization, and fabricates
+the response; (3) programable computing units, dynamically
+offloading RPC computing kernels. In sum, RpcNIC is a lowprofile immediately deployable PCIe-attached SmartNIC with
+a software abstraction to load the RPC stack and related
+computing kernels on demand.
+Building RpcNIC is non-trivial because of the high crossPCIe overheads, jeopardizing the interaction performance between the RPC stack and other system layers. First, the RPC
+deserialization process needs to write deserialized results in
+
+a field-by-field scheme, whose throughput is bounded by the
+number of PCIe transactions. For example, our empirical evaluation using HyperProtoBench [38] shows that this limitation
+can degrade the attainable deserialization throughput by 2.8×
+in geometric mean. RpcNIC proposes a target-aware deserializer that temporarily batches the deserialized fields within one
+RPC message in the SmartNIC’s SRAM and performs crossPCIe writes only when necessary. We realize this by designing
+two compacted hardware data structures (schema table and
+temp buffer) and revamping the deserialization process.
+Second, the RPC serialization process is hindered by the
+high PCIe latency. A nested RPC message or dereference
+field (strings/bytes/repeated/sub-messages) would require multiple memory accesses in a pointer-chasing manner since the
+memory location of the sub-fields can only be known after
+the parent’s content is fetched. The sub-microsecond latency
+of PCIe would significantly increase the overall serialization
+time (∼4.6× compared with an on-chip SmartNIC). RpcNIC
+designs a memory-affinity CPU-SmartNIC collaborative serializer that trades additional host memory copies for slow crossPCIe transfer. We introduce a lightweight pre-serialization
+phase to materialize the data layout on the host memory and
+facilitate the SmartNIC-side serialization execution. Besides,
+we leverage the memcpy (memory copy) engines [34], [45]
+residing in modern CPUs [33] to alleviate host CPU usage for
+large fields’ copy.
+Third, computation partition between host and RPC kernels
+within the RPC handler would cause suboptimal data placement and incur superfluous PCIe traversals. People eagerly
+co-locate domain-specific logic along with the RPC stack
+to maximize the hardware specialization benefits [19], [39],
+[54], [66], [86]. However, unlike on-chip cache-coherent interconnects, dynamic splitting computation logic across the
+host and SmartNIC over PCIe is inflexible and cause inferior
+data placement. Therefore, RpcNIC develops an automatic
+field update technique that transparently codifies the schema
+based on host/RPC kernel layout. As such, the SmartNIC
+deserializer can place the fields in suitable locations to avoid
+PCIe traversals.
+We built RpcNIC over an Xilinx Alevo U280 FPGA and
+evaluated it in several real-world scenarios. In a cloud image
+compression application, RpcNIC increases the achievable
+throughput by 2.6× and reduces the average (99th percentile)
+latency by 2.6× (1.9×) compared with an RPC accelerator
+baseline. Using Google’s HyperProtoBench [38], RpcNIC
+reduces the data serialization time by 4.3× in geometric mean.
+RpcNIC achieves similar performance as prior specialized
+on-chip accelerators from the literature. The source code is
+available at https://github.com/RC4ML/RPCNIC.
+II. BACKGROUND AND M OTIVATION
+A. Remote Procedure Calls
+A typical RPC layer consists of two execution logics: RPC
+protocol handling and de/serialization.
+• RPC protocol handling. In the transmitting path (TX), the
+protocol handling mainly involves creating an RPC header.
+
+In the receiving path (RX), the protocol handling involves
+parsing the RPC header and dispatching the deserialized
+message to an idle CPU core to execute the target caller
+function. This process is usually lightweight compared with
+RPC payload processing;
+• Serialization and deserialization. Object serialization and
+deserialization are heavyweight operations and exist in
+RPC TX/RX, respectively. RPC serialization transforms the
+in-memory fields into architecture and language-agnostic
+formats that can traverse through the network [76]. Deserialization operates conversely.
+Protobuf. We focus on the Protocol Buffer serialization library [21], widely used by many cloud applications.
+• Protobuf message definition. It defines the logical transformation between the in-memory format and the wire
+format. A protobuf message is a collection of fields, usually
+called “schema”. Each message field has a type, name, field
+number, and labels (e.g., “repeated”). Field types can be
+(a) basic scalar types such as integers and strings; or (b)
+a nested user-defined message, also called a sub-message.
+Based on the memory layout, these fields can be further
+classified into two classes. One uses direct addressing,
+meaning that the value is within the memory location of its
+parent message, such as doubles and integers. The other uses
+indirect addressing (dereferences), indicating that their actual value is in a pointer-referenced memory location, such
+as strings, bytes, or sub-messages. In real-world applications
+the RPC message’s depth can reach up to a dozen levels or
+more [38];
+• Varint encoding of protobuf. Data decoding/encoding is
+one of the most time-consuming operations in the de/serialization process [38], especially for small data fields.
+Data encoding widely exists in many popular serialization
+frameworks [5], [21] for message reduction. Protobuf uses
+variable-length integer encoding (known as varint). The
+encoding uses the most significant bit in each byte to
+indicate if the next byte is part of the same integer and the
+remaining 7 bits are used to store the actual value. Protobuf
+uses the tag-length-value format (TLV) [22] for lengthdelimited fields (such as string and sub-message) and tagvalue format (TV) for varints or fixed-length fields (such as
+double). Handling these byte-wise and bit-wise operations
+on general-purpose modern CPUs is costly [38], [64], [76],
+but can be easily accelerated via hardware specialization.
+B. Prior Hardware RPC Acceleration
+Researchers have developed several hardware-accelerated
+RPC solutions [36], [38], [46], [63], [64] to reduce the RPC
+stack processing overheads and save host CPU cycles. For
+example, Cereal [36] introduces a special memory access
+interface, enabling low-latency host memory access from the
+RPC accelerator. Dagger [46] leverages a cache-coherent onchip interconnect (UPI) to facilitate collaborative RPC stack
+processing between an FPGA-based SmartNIC and the host
+CPU. However, Dagger does not support nested structures
+
+Fig. 1: High-level system architecture and request workflow
+of a PCIe-attached RPC-offloaded SmartNIC.
+or pointers, which are heavily used in today’s applications.
+Optimus Prime [63] and Cerebros [64] place an on-chip
+accelerator for handling the de/serialization phase of the RPC
+stack. ProtoACC [38] then develops a near-core de/serialization accelerator for Protobuf using a RISC-V SoC.
+Limitation. As shown in Table I, all existing solutions require
+on-chip design or specialized interconnects for low latency.
+The main challenge of on-chip accelerator solutions is that
+integrating a specialized but not generalized function (e.g.,
+RPC) into the commercial CPUs is very intrusive to the server
+CPU design. Considering that RPCs are evolving rapidly while
+the CPU design cycle takes years, integrating RPCs into the
+CPU chip is very costly and impractical. As a result, none can
+be easily employed on commodity servers and immediately
+deployed at scale. Therefore, we aim to build an immediately deployable PCIe-attached RPC-acclerated SmartNIC
+that offers the same programmability and comparable
+performance as prior on-chip designs.
+C. Challenges
+Integrating a specialized function into the PCIe-attached
+NIC is much easier, takes much less engineering effort, and has
+been proven to be practical in many production systems. For
+example, Google integrates their transport protocol “Falcon”
+into the Intel IPU [23], and AWS integrates storage function
+into their Nitro SmartNIC [4].
+Anathor option is to implement a standalone PCIe-based
+RPC accelerator. However, both the transmitting and receiving paths incur multiple redundant cross-PCIe RPC message
+movements between the RPC accelerator and the NIC. Therefore, we prefer integrating the RPC accelerator in the NIC.
+Figure 1 sketches such a high-level PCIe-attached SmartNIC
+design that offloads the RPC stack. When an RPC request
+arrives at the SmartNIC ( 1 ), the message is first deserialized
+via the hardware engine, where the deserialized fields are
+written into the host memory ( 2 ). Next, the host ( 3 ) and
+RPC kernel ( 4 and 5 ) are triggered collaboratively to process
+the RPC message. Then, the serialization engine retrieves the
+processing results, performs the serialization task ( 6 ), and
+sends back data through the network ( 7 ). The overall design
+seems straightforward but imposes three unique challenges.
+C1: The limited number of concurrent PCIe transactions
+hinders the deserialization throughput. The deserialization
+engine writes back deserialized results into the host memory
+in a field-by-field manner [38], [64]. However, these writing
+objects are small, incurring numerous DMA writes and smallsized PCIe transactions, quickly saturating the PCIe transaction rate. We built a deserialization accelerator (on the Xilinx
+
+Fig. 2: Normalized serialization time when increasing the
+simulated PCIe latency for different messages.
+U280 FPGA) based on ProtoACC [38], and enforced it to
+put deserialized results into either the host memory (crossing
+PCIe) or the FPGA off-chip memory. Our evaluations on HyperProtoBench [38] show that cross-PCIe deserialization can
+only achieve 5.6× lower throughput compared with writing
+results to the FPGA’s off-chip memory.
+C2: The high PCIe interconnect latency drastically decelerates the serialization performance. As described in §II-A, an
+RPC message can be a deeply nested memory object, causing
+multiple pointer-chasing memory accesses under retrieval during the serialization phase ( 6 ), which is extremely inefficient
+when crossing PCIe (taking sub-microseconds).
+To illustrate this, we implement a protobuf serialization
+accelerator based on ProtoACC [38]. We measure the serialization time when varying interconnect latency through
+the Xilinx Vivado simulator [79]. Figure 2 illustrates the
+normalized serialization time for all messages of Bench2 in
+HyperProtoBench [38]. As expected, when the interconnect
+latency increases from DDR5’s 70ns latency to commercial
+PCIe’s 1250ns, the end-to-end serialization’s time increases by
+3.4× in geometric mean, due to the complex nested message
+structure. The exception is that the two messages (M4 and
+M10) only present a marginal increase. This is because when
+the RPC message becomes large and flat (1.6MB and 0.6MB),
+the serialization performance is dominated by the data transfer
+time and is not sensitive to the interconnect latency.
+C3: Suboptimal data placement causes superfluous PCIe
+accesses from host/RPC kernels. People eagerly offload
+domain-specific logic along with the RPC stack for core
+savings and performance maximization [19], [39], [46], [54],
+[66], [86]. These offloadable kernels are generally parallelfriendly with less data dependency. For example, researchers
+place a data compression engine for the cloud block storage
+application [86]. Ideally, one should divide incoming data and
+place them accordingly, such that the host and the offloaded
+RPC kernels only access their data locally. However, in reality,
+since the offloaded kernels ( 5 ) are only part of the RPC
+handler and the offloaded kernels may dynamically change in
+a multi-tenant environment, it becomes extremely challenging
+to design a clean and optimal partition. A suboptimal data
+placement is very costly for a PCIe SmartNIC considering its
+high latency for cross-PCIe traversals.
+To illustrate this, we develop an RPC-based network function accelerator that co-locates with a PCIe-attached NIC. It
+serves as the cloud gateway [59]. It performs L2/L3 protocol
+processing, network address translation (NAT), and packet
+
+System
+
+Interconnect
+
+Latency
+
+Throughput
+
+Accelerated RPC Stack
+
+Accelerated RPC Kernels
+
+Cereal [36]
+Optimus Prime [63]
+Cerebros [64]
+ProtoACC [38]
+Dagger [46]
+RpcNIC
+
+MAI
+2D mesh NoC
+2D mesh NoC
+TileLink System Bus
+Intel UPI
+PCIe
+
+40 ns
+45 ns
+45 ns
+30 ns
+125 ns
+1250 ns
+
+76.8 GB/s
+64 GB/s
+64 GB/s
+N/A
+19.2 GB/s
+12.8 GB/s
+
+Customized De/Serialization
+Protobuf/Thrift-based De/Serialization
+Thrift-based De/Serialization, RPC protocol
+Protobuf-based De/Serialization
+Customized De/Serialization, RPC protocol,
+Protobuf-based De/Serialization, RPC protocol
+
+N/A
+N/A
+N/A
+N/A
+Yes
+Yes
+
+TABLE I. Hardware specification comparison.
+de/encryption. We explore different computing-driven data
+placement strategies and find out that the worst-case placement
+can decrease the achievable throughput by 2.2× than the bestcase placement.
+
+the SmartNIC off-chip memory (host CPU memory). The
+“Schema Table” is shared by all deserializers and serializers.
+Section III-E describes how this bit is set and how the
+“Schema Table” is constructed;
+
+III. R PC NIC: D ESIGN AND I MPLEMENTATION
+
+• Temp Buffer. Deserialized results used by RPC kernels are
+directly written to the SmartNIC off-chip memory. For others, we use a per-deserializer SRAM buffer (“Temp Buffer”)
+to store the deserialized fields temporarily. The buffer is
+4KB and operates in an append-only mode, simplifying the
+buffer management. The buffer size is configurable. When
+the buffer is full or the current RPC request’s deserialization
+is finished, the deserializer triggers a DMA write and copies
+data to the intended host CPU memory. We call this batching
+mechanism “One-shot DMA write”. Note that this batching
+mechanism would barely increase the deserialization latency, since it only batches the fields within an RPC request
+instead of batching fields from different requests.
+
+A. Overview
+RpcNIC is a software-hardware co-designed PCIe-attached
+SmartNIC that allows offloading RPC layer and user-defined
+RPC kernels. Figure 3 provides the system overview. The hardware part consists of 1) a target-aware deserializer (§III-B) that
+takes RPC requests, deserializes the messages, and forwards
+the results to the host or SmartNIC; 2) a memory-affinity
+serializer (§III-C), which fetches computed data, performs
+serialization, and fabricates the response; 3) programable computing units (§III-D), dynamically offloading RPC computing
+kernels; and 4) a transport layer. RpcNIC adopts a RoCE-based
+transport layer [71], which is entirely offloaded to the NIC just
+like an RDMA NIC. The RPC acceleration logic is in the NIC
+and sits between the transport layer and the PCIe controller.
+When the RPC message is fabricated in the NIC RPC layer,
+the hardware will send the message using an “RDMA Send”
+verb and the remote side uses an “RDMA Recv” verb to
+receive incoming RPC requests. The benefit of putting the RPC
+acceleration and transport layer together in NIC hardware is
+to avoid redundant data movement or PCIe traversals between
+the transport processing and RPC processing.
+We place (1), (2), and (4) in the board static region, while (3)
+in the partial reconfiguration region. Our software stack (§III-E
+and §III-F) of RpcNIC consists of (a) a compiler that takes the
+user-defined RPC message specification and outputs both the
+message structure and hardware-friendly configurations; and
+(b) a rich set of APIs to describe the RPC kernel task.
+B. Target-aware Deserializer
+To address challenge #1 (§II-C), we develop a target-aware
+deserialization engine that forwards deserialized fields to the
+host or SmartNIC memory accordingly. Our deserialization
+logic has 4 independent computing lanes (i.e., deserializers).
+Each deserializer processes RPC requests one by one. Each
+deserializer executes the deserialization logic and converts the
+results into in-memory C++ objects.
+We introduce two hardware data structures (described below) and revamp the deserialization process based on them.
+• Schema Table. It is an SRAM region that stores the
+message structure of incoming RPC messages. For each
+field of an RPC class, we use one bit to indicate its target
+location type for the deserialized results. Fields used by
+the offloaded RPC kernel (host kernel) are forwarded to
+
+Deserialization Procedure. An incoming RPC message is
+assigned to an idle deserializer or buffered when there are
+no idle deserializers. To avoid software allocation overhead,
+we reserve a host CPU memory region and a SmartNIC offchip memory region for the deserializer. These two memory
+regions are divided into 4KB 1 chunks. There is a 16K-entry
+TLB2 to perform host CPU memory address translation on
+the SmartNIC. We use two SRAM-based FIFOs (called freelist FIFOs) to store the free chunks of the host/SmartNIC
+memory region. Allocating/freeing memory is translated to
+poping/pushing a 4KB chunk from/into the FIFO, simplifying
+hardware complexity.
+The deserializer first pre-allocates a host CPU memory
+chunk and a SmartNIC off-chip memory chunk. It then parses
+the RPC header to obtain the RPC message class ID and
+message length and queries the “Schema Table” based on the
+class ID, which returns the schema of this message class. The
+SmartNIC then deserializes the message data in a field-by-field
+manner accordingly. When encountering a dereference submessage, the deserializer pushes the current message schema
+into an SRAM-based stack and deserializes the sub-message
+recursively.
+During the deserialization, each deserialized field has one
+of the two target locations:
+1 4KB chunks lead to a small allocation time (0.68% of the total deserialization time) and a small fragmentation overhead (3.6% in HyperProtoBench).
+The size is configurable at system initialization and the users can choose a
+suitable value that balances both allocation time and memory fragmentation.
+2 We adopt a simple TLB implementation, which can only store pages
+with contiguous virtual addresses. 16K entries only occupy 0.29% of the
+total SRAM resources in our FPGA prototype.
+
+Fig. 3: Software stack and hardware architecture of RpcNIC.
+memory region. At last, the SmartNIC reads data from the
+DMA-safe region, fabricates the RPC response, and sends
+it to the network ( 3 ). As CPU memory access latency is
+very low (∼70ns), this approach can tolerate nested RPC
+messages well. However, it wastes host CPU cycles on
+CPU-inefficient encoding, while wasting PCIe bandwidth
+(GB/s, not transaction rate) drastically in stage 1 ;
+Fig. 4: Compaison of three serialization strategies.
+• Host CPU memory: The deserialized result is assigned a
+CPU memory location from the pre-allocated CPU memory
+chunk. As described above, we would temporarily save it
+in the “Temp Buffer”.
+• SmartNIC off-chip memory: The deserialized data is assigned a SmartNIC memory location from the pre-allocated
+off-chip memory chunk. Then the result would be directly
+written to this location. The corresponding field pointer in
+the parent message would be updated to point to this offchip memory location.
+When the deserializer exhausts the pre-allocated chunks, it
+allocates a new chunk from one of the two free-list FIFOs.
+When exhausting pre-allocated host CPU memory chunks,
+the deserializer additionally uses a DMA write to flash the
+“Temp Buffer” into the corresponding host CPU memory.
+Upon deserialization completion, the SmartNIC then notifies
+the host CPU of an incoming RPC message.
+Summary. Compared with the traditional field-by-field deserialization scheme [38], [63], [64], our target-aware deserializer
+uses effective batching and reduces unnecessary PCIe traffic by
+storing certain fields in the SmartNIC local off-chip memory.
+Besides, we directly store the fields that are not needed by
+the host CPU in the SmartNIC’s off-chip memory, greatly
+reducing unnecessary PCIe transactions.
+C. Memory-affinity Serializer
+We next discuss how to address challenge #2 (§II-C) in
+RpcNIC. There are two general serialization design choices:
+• Option#1: CPU-only Serialization. Figure 4-a depicts the
+process of CPU-only serialization. Upon the compute unit
+(CU) finishing computation, it writes the result back to the
+host CPU memory ( 1 ). The CPU then retrieves all the fields
+and serializes them ( 2 ), writing them into a DMA-safe
+
+• Option #2: SmartNIC-only Serialization. Figure 4-b
+shows how a SmartNIC performs serialization independently. Compared with CPU-only serialization, the difference is that the serialization is fully offloaded to the NIC
+hardware. SmartNIC-only serialization consumes minimal
+host CPU cycles. However, as discussed in §II-C, the high
+cross-PCIe latency would jeopardize the serialization time,
+especially for deeply nested RPC messages.
+Our approach: Memory-affinity CPU-SmartNIC Collaborative Serialization (Option #3). To address the limitations
+of the above two, we distribute the serialization logic across
+the host CPU and SmartNIC, aiming to achieve the best of two
+worlds: minimizing PCIe transfers while consuming the fewest
+host CPU cycles. Our key idea is to add a lightweight CPU
+pre-serialization phase to the host to materialize the data layout
+for fields residing in the host memory, which trades additional
+fast host memory copies for slow PCIe accesses. Figure 4-c
+highlights the process. The compute unit writes results into the
+SmartNIC memory instead of the host memory ( 1 ). Then the
+host CPU retrieves all local fields and pre-serializes them ( 2 )
+without CPU-inefficient encoding. Next, the CPU sends the
+pre-serialized data to the serializer ( 3 ), which encodes these
+data and further serializes fields that reside in the SmartNIC
+memory ( 4 ). At last, the serialization module merges the CPU
+and SmartNIC memory fields and sends the merged result
+out to the network as an RPC response ( 5 ). Modern server
+CPUs [33] are integrated with on-chip memcpy engines (Data
+Stream Accelerator [34], [45]) and the pre-serialization process
+offload the copies of large fields to the memcpy engines to save
+host CPU cycles during the pre-serialization..
+Next, we discuss the detailed serialization procedure:
+Stage 1: CPU Pre-serialization. We maintain a small DMAsafe buffer to store the CPU pre-serialization output. The
+process iterates the to-be-serialized object in a field-by-field
+manner. The process scans each encountered field and writes
+
+the non-contiguous results into the contiguous DMA-safe
+buffer. Upon finishing, the software uses an MMIO write to
+notify the SmartNIC of the address and length of the preserialized data, and other required information to construct an
+RPC header. The pre-serialization has three unique properties
+that can help reduce CPU cycles:
+• Memcpy Offload. The copy of large CPU memory fields
+in the host CPU memory can be offloaded to the memcpy
+engines. The CPU asynchronously invokes the memcpy
+engines to reduce the required CPU cycles at most.
+• Encoding Offload. The pre-serialization process would not
+perform CPU-inefficient encoding, which would be deferred
+to the SmartNIC.
+• Skipping SmartNIC Fields. The pre-serialization only
+pre-serializes fields residing in the host CPU memory. If
+encountering a field residing in the SmartNIC, it only writes
+the pointer value and data length into the DMA-safe buffer.
+Stage 2: SmartNIC Serialization. When the SmartNIC is
+notified after the completion of CPU serialization, the SmartNIC constructs an RPC header in an SRAM region, which is
+called “TX Arena” and is used to store the final RPC message
+that is to be sent to the network. The hardware serializer then
+uses a DMA read to fetch the pre-serialized data from the
+host CPU memory, iterates pre-serialized data, and performs
+varint encoding. The serializer encodes the pre-serialized data
+in a per-512-bit manner. For each 512-bit, the encoding can
+be done within one cycle.
+If a pointer referring to the SmartNIC off-chip memory is
+found, the serializer reads the referred data from the SmartNIC
+off-chip memory, serializes it, and writes the result into the
+“TX Arena”.
+After fetching the data from the SmartNIC off-chip memory,
+the engine serializes it, writes the result to the corresponding
+address in the “TX Arena”, and continues the iteration. When
+the iteration finishes, the RPC header, and the serialization
+results now lie contiguously in the “TX Arena”. The transport
+layer can transmit these data into the network.
+Summary. Our memory-affinity CPU-SmartNIC collaborative
+serializer trades fast host memory copies for slow cross-PCIe
+transfer. It introduces a lightweight pre-serialization phase to
+materialize the data layout and facilitate the SmartNIC-side
+serialization execution. To further reduce CPU overhead during pre-serialization, we leverage memcpy engines to perform
+data copies of large fields.
+D. Compute Unit
+In addition to accelerating the RPC stack itself, RpcNIC
+allows user to program the compute units (CUs) with their
+hardware logic to further offload compute-intensive computations in the RPC requests. We call these offloaded computations as RPC kernels. A compute unit in RpcNIC is a partially
+reconfigurable FPGA block. Each CU has a memory interface
+connected to the SmartNIC off-chip memory.
+CUs interact with the host software uniformly and provide
+a set of APIs (Table II). Each CU has a descriptor ring in
+
+the SmartNIC SRAM and a notification ring in the host CPU
+memory. To activate a CU, the host software has to submit
+a descriptor to the descriptor ring using an MMIO write
+(“submitTask()”). After submission, the address of an available
+entry in the notification ring would be returned to the software.
+Submitting computation tasks is an asynchronous process, and
+the software can poll the returned address to be aware of
+this task’s completion (“poll()”), akin to the BlueFlame [81]
+mechanism in the Mellanox NICs.
+• Descriptor Ring. Entries in the descriptor ring are submitted by the host CPU software, where each entry consists of
+the input address, input length, output address, and output
+buffer size. When a CU becomes idle, it fetches the next
+ready descriptor from the ring, and reads data from the offchip memory using the input address and input length;
+• Notification Ring. When computation finishes, the CU first
+writes the results into the output address. Then the result
+length and the completion signal would be written into the
+corresponding notification entry in the host CPU memory
+using one DMA write.
+In addition to submitting tasks to the CU and polling the
+completion, the user can use “.program()” to reprogram the CU
+with a given FPGA bit file and use “getType()” to check the
+currently supported computation of the compute unit. In the
+current implementation, we create four PR blocks of the same
+size. Equal-size PR blocks expose limitations on flexibility.
+It’s also possible to leverage the techniques proposed in prior
+works [42], [82], [83] to dynamically manage the PR region
+and this could be our future work.
+E. RpcNIC Software Stack
+RpcNIC provides a compiler toolchain and programming
+APIs that enable dynamic and reconfigurable RPC stack and
+computing kernel offloading.
+1) RpcNIC Compiler: Our compiler takes a user-provided
+.proto file that contains the RPC message structure, and
+generates (1) a header file for applications running on the host
+CPU and (2) a schema definition stored in the “Schema Table”
+of the RpcNIC SmartNIC for orchestrating RPC request flow.
+RpcNIC fully supports Protobuf3 [21] format. Programmers
+first define the RPC message format in the .proto file and
+specify a field with labels such as “optional” and “repeated”.
+In RpcNIC, the user can additionally specify a dereference
+field (string/bytes/repeated/sub-message) with a custom label
+“Acc”3 . The compiler first scans the .proto file, recording
+the structures of each message and attribute of each field. Then
+the compiler generates a header file and a schema definition
+based on the scanned results.
+The header file mainly consists of generated RPC message
+classes including de/serialization functions and three unique
+member functions (i.e., “moveToNIC”, “moveToCPU”, and
+“isInNIC”) for each dereference field (Table III). “isInNIC”
+checks whether the pointer refers to the SmartNIC off-chip
+memory. “moveToNIC” moves data from the pointed CPU
+3 “Acc” represents the SmartNIC’s off-chip memory.
+
+Member Function
+
+.program()
+.getType()
+.submitTask()
+.poll()
+
+Parameter
+
+Description
+
+The file location of the bitstream
+(bitFilePath), the programmed RPC
+kernel (kernelType)
+N/A
+Address of input to the CU (inputAddr),
+input size in bytes (inputSize), address of
+output result (outputAddr), output size in
+bytes (outputBufSize)
+The completion signal of the compute unit
+(taskEvent)
+
+Program the compute unit with the provided bit file; the compute unit is labeled as “kernelType”.
+Return the string of the labeled “kernelType”.
+Submit a new task to the compute unit, and an asynchronous task event will be returned. The
+CU would fetch inputSize bytes from the SmartNIC memory address inputAddr. When the engine
+completes, it writes the result into the SmartNIC memory address outputAddr.
+Busy polling the taskEvent until it completes.
+
+TABLE II. Member functions of compute units in RpcNIC.
+Member Function
+
+Description
+
+.isInNIC()
+.moveToNIC()
+
+Check whether the data is in the SmartNIC memory.
+Move data to the SmartNIC memory, and the field’s
+pointer will be updated to this new location.
+Move data to the host CPU memory, and the field’s
+pointer will be updated to this new location.
+
+.moveToCPU()
+
+TABLE III. Dereference fields functions in RpcNIC.
+memory to the SmartNIC off-chip memory while “moveToCPU” operates reversely.
+The schema definition stores the RPC message structure and
+the attributes of each field. The schema definition is stored
+in the SmartNIC “Schema Table”. During the deserialization,
+the deserializer selectively puts the deserialized field in the
+host/SmartNIC memory based on whether the field has an
+“NIC” label.
+2) RpcNIC Programming Interface: We take an RPC-based
+compression accelerator as an example. Listing 1 shows the
+pseudo implementation. The RPC request message (User)
+and response message (Photo) are defined in Figure 3. This
+application is representative as it involves a lightweight host
+kernel (authorization) and a compute-intensive RPC kernel
+(compression). The authorization only involves lightweight
+processing and usually has many data dependencies. The
+compression is compute-intensive, easy to parallelize, and does
+not have data dependencies.
+Next, we show how to realize the application using the provided programming interfaces assuming that the compression
+bit file is ready and has been programmed in the CU. When an
+RPC request arrives, the software first checks whether the user
+is authorized (L1). After authorization, the software checks
+whether the CU can perform compression (L4).
+• If so (L5-10), the application first ensures that the raw avatar
+data of the request is put in the SmartNIC memory (L5).
+Otherwise, it moves the data to SmartNIC memory (L6). It
+then invokes the compute unit to execute the compression
+RPC kernel (L8), poll the result (L9), and set the size in
+the RPC response (L10);
+• Otherwise (L13-16), we first ensure that the raw avatar data
+is in the CPU memory (L13). If not, we move the data to
+the host memory (L14). We then perform CPU compression
+and set the compressed image size (L16).
+Finally, the RPC response is fabricated (L18). RpcNIC allows
+developers to focus on high-level application logic instead of
+dealing with the RPC layer and host-SmartNIC interactions.
+
+Algorithm 1: R PC NIC PROGRAMMING EXAMPLE
+Define : req: RPC request,
+res: RPC response,
+cu: compute unit
+1 if isIdAuthorized(req.id) == false then
+/* Host kernel, omitted
+2 end
+3 reqData = req.avatar.image;
+4 if cu.getType() == ”compress” then
+5
+if reqData.isInNIC() == false then
+6
+reqData.moveToNIC();
+7
+end
+8
+e = cu.submitTask(...);
+9
+poll(e);
+10
+res.size = e.size;
+11 end
+12 else
+13
+if reqData.isInNIC() == true then
+14
+reqData.moveToCPU();
+15
+end
+16
+res.size = compressOnCPU(...);
+17 end
+18 return res;
+
+*/
+
+F. Automatic Field Updating
+At default, developers manually assign “Acc” labels for data
+fields, indicating that they are likely to be used by a compute
+unit in the SmartNIC. This approach works well for pre-known
+request traffic because one can profile the data access pattern
+and devise an optional data placement scheme. However, such
+an assumption is no longer held in the cloud setting [55],
+[86], where computing demand varies continuously. Thus,
+developers would reprogram the computing unit and determine
+which RPC kernels would benefit the most from hardware
+acceleration, completely breaking the established data partition
+layout and causing unnecessary PCIe traversals across two
+computing domains.
+We instead propose an automatic field updating mechanism
+that allows modifying message schema at runtime. Specifically, it automatically adds/removes the “Acc” label for all
+dereference fields at runtime when calling “moveToNIC” and
+“moveToCPU” member functions.
+When “moveToNIC” or “moveToCPU” is invoked, not only
+an MMIO would be issued to notify the SmartNIC to move the
+field’s content across PCIe, but also the corresponding entry
+in the “Schema Table” would be updated. If “moveToNIC” is
+called, it indicates that the field should be added with a “Acc”
+label, while “moveToCPU” would remove the “Acc” label of
+this field. In this way, when the next same RPC arrives, the
+
+deserializer can use the updated “Schema Table” to deserialize
+RPC messages, thus avoiding redundant data movement within
+subsequent RPC requests.
+Limitation. If a field is needed by both the CPU and the
+RpcNIC compute unit, the field must be fetched over the PCIe
+bus. This is unavoidable in the current design as the CPU
+and PCIe device are not in a coherent domain. However, we
+believe this is relatively rare as users should try to ensure that
+the offloaded function is a standalone logic and does not reuse
+the CPU-side data.
+Summary. Automatic field updating poses three benefits. First,
+it frees users from the tedious task of manual and explicit
+assignment of “Acc” labels in .proto file. Second, our .proto
+file can be completely the same as Protobuf3. As such, existing
+applications can easily adopt RpcNIC without modification of
+.proto files. Third, it can accommodate partial reconfiguration’s
+dynamic offloading. When the RPC kernels change from
+CPU execution to compute unit execution or reversely, the
+deserializers can place the corresponding fields correctly after
+one incorrect placement.
+IV. E VALUATION
+Our evaluations aim to answer the following questions:
+• How effective is the target-aware deserializer (§IV-B)?
+• How effective is the memory-affinity serializer (§IV-C)?
+• How does the performance of RpcNIC compare to that of
+an SoC SmartNIC (§IV-D), Dagger (§IV-E), and an on-chip
+accelerator (§IV-F)?
+• How can automatic field updating address the data layout
+problem under compute reconfiguration (§IV-G)?
+• How much performance acceleration can RpcNIC achieve
+for RPC-based workloads (§IV-H)?
+• How many resources do the SmartNIC use (§IV-I)?
+A. Experimental Setup
+Hardware Testbed. Our hardware testbed consists of two
+servers, each having two 16-core Xeon Silver 4514Y CPUs
+running at 2.0GHz, 512 GiB (8x64 GiB) 4800 MHz DDR5
+memory, and a 60 MiB LLC. Each core has a memcpy
+engine (Intel DSA [34], [45]). Each server is equipped with
+a Mellanox Dual-port ConnectX-5 100 Gb NIC (×16) and
+a Xilinx U280 (×16) [78] FPGA which features an 8 GiB
+off-chip high bandwidth memory (HBM).
+CPU Baseline. We implement the baseline “CPU-only” (2K
+LoCs of C++) that runs the entire RPC stack and all computations on the CPU. It uses the DPDK-based eRPC [37] library
+and adopts Protobuf3 [21] as the de/serialization format. It is
+well-optimized under optimization methods such as zero-copy,
+huge page, kernel-bypass, and polling mode driver.
+ProtoACC-OnChip Baseline. As no on-chip RPC accelerator
+hardware exists, we implement the “ProtoACC-OnChip” simulation baseline based on ProtoACC [38]. We mainly modify
+the frequency to 250 MHz /2 GHz and set the memory
+access latency to 70 nanoseconds (same level as our host CPU
+memory latency).
+
+(a) All messages
+
+(b) Messages with small fields (≤1KB)
+
+Fig. 5: Throughput speedup of one-shot DMA write.
+ProtocACC-PCIe Baseline. We implement baseline
+“ProtocACC-PCIe” (3K LoCs of C++ and 3.7K LoCs
+of Chisel3) and prototype it on U280 FPGA hardware.
+It offloads the entire RPC stack and computation kernels
+to the hardware. The FPGA performs the de/serialization
+logic following ProtoAcc [38], the difference is that our
+implementation uses PCIe interconnect. The serialization
+presedure is similar to the “SmartNIC-only” approach
+as introduced in § III-C. The RPC protocol is close to
+eRPC [37] and the transport layer adopts a modified version
+of Strom [71]. The RPC/transport logic runs at 250 MHz.
+BF3 Baseline. We implement baseline “BF3” that offloads the
+RPC layer to SoC SmartNIC Bluefield-3 [58]. The software
+stack is the same as the CPU baseline.
+RpcNIC Implementation. We prototype RpcNIC in the U280
+FPGA (3K LoCs of C++ and 3.5K LoCs of Chisel3). The
+RPC protocol is similar to eRPC [37]. The transport layer
+adopts a modified version of StRoM [71]. It features targetaware deserialization and memory-affinity CPU-SmartNIC coserialization. The RPC/transport logic runs at 250 MHz.
+B. Target-aware Deserializer
+We first examine the performance of our target-aware deserializer. We set all RPC data fields’ destinations to the host memory and compare RpcNIC with the conventional field-by-field
+one. Figure 5 reports the deserialization throughput improvement of “one-shot DMA write” over “field-by-field” when
+running HyperProtoBench [38] (including six workloads, each
+containing 10 messages) for messages with different average
+field sizes. On average, RpcNIC outperforms the field-by-field
+solution by 2.2×. For messages with small-sized fields (less
+than 1KB), RpcNIC achieves a higher speedup (3.1×) because
+the field-by-field solution suffers from inefficient DMA that
+transfers numerous small objects. Instead, our one-shot DMA
+write scheme can combine small DMA writes into one large
+contiguous DMA write, yielding higher PCIe link utilization.
+C. Memory-affinity Serializer
+We validate the effectiveness of the memory-affinity CPUSmartNIC collaborative serialization scheme by measuring
+the CPU cycle savings and serialization time. We use HyperProtoBench [38] and five representative microservices in
+DeathStarBench [17] as workloads.
+Effect of Encoding/memcpy Offload. Figure 6 demonstrates
+the normalized host CPU cycles with/without encoding/memcpy offloading for “memory-affinity” CPU-SmartNIC coserialization. The memcpy offload can reduce the host CPU cycles by an average of 55% (23%) in HyperProtoBench (Death-
+
+(a) HyperProtoBench
+
+(b) DeathStarBench
+
+Fig. 6: Normalized CPU cycles of memory-affinity serializer
+with/without memcpy and encoding offload.
+
+Fig. 7: Serialization time comparisons.
+StarBench). Memcpy offload together with encoding offload
+can save the host CPU cycles by an average of 74% (74%) in
+HyperProtoBench (DeathStarBench). RpcNIC greatly reduces
+the host CPU cycles, indicating the effectiveness of “memoryaffinity” CPU-SmartNIC co-serialization. RpcNIC trades a few
+CPU cycles for the large decrease in the overall serialization
+time. The pre-serialization uses a geometric mean of 22%
+CPU cycles compared with performing serialization in CPUs,
+while the geometric mean of the overall serialization time is
+decreased by 57%.
+Serialization Performance. We then use HyperProtoBench
+to measure the end-to-end serialization time. We measure the
+serialization time of three design choices in Figure 4. As
+shown in Figure 7, “Memory-affinity” serialization spends the
+least time while “CPU-only” spends the most time. “Memoryaffinity” outperforms “ProtoACC-PCIe” by 2.3× in geometric mean, because “memory-affinity” leverages the CPU or
+memcpy engine to perform pre-serialization for fields residing
+in the host CPU memory, instead through high-latency PCIe
+interconnect. “Memory-affinity” outperforms “CPU-only” by
+4.3× in geometric mean, because pure software implementation of serialization incurs significant CPU overhead.
+D. Comparison to SoC SmartNIC/DPU
+In this section, we evaluate how RpcNIC optimizations can
+improve the performance when offloading RPC to a SoC-based
+SmartNIC, i.e., Nvidia Bluefield-3. “BF3” naively offloads the
+entire RPC to BF3, “BF3-MemoryAffinity” uses the host CPU
+to perform a pre-serialization process and uses BF3 cores to
+
+(a) Serialization
+
+(b) Deserialization
+
+Fig. 8: Serialization time comparison and deserialization
+speedup of “BF3-Oneshot” over “BF3”.
+
+Fig. 9: Serialization time of applying ProtoACC/RpcNIC serialization approach to Dagger.
+perform encoding/decoding. “BF3-DSA” is similar to “BF3MemoryAffinity” and leverages the DSA memcpy engines
+during the host pre-serialization. “BF3-Oneshot” offloads the
+entire RPC to BF3 and coalesces small DMA requests into a
+large request during the deserialization.
+Figure 8a shows the normalized serialization time on six
+benches of HyperProtoBench. We have three observations.
+First, applying pre-serialization optimization to the BF3 can
+reduce the serialization time by 1.58× on average. Second,
+applying memcpy offload optimization in the pre-serialization
+phase can additionally reduce the serialization time by 1.18×
+on average. The main reason for the speedup is that the
+pre-serialization can greatly reduce the high-latency crossPCIe travesals and the memcpy offload can free host CPUs
+from copying large data fields. These results indicate applying RpcNIC optimizations to SoC-based SmartNIC/DPU
+can effectively reduce the overall serialization time. Third,
+RpcNIC still outperforms well-optimized BF3 implementation,
+this is mainly because RpcNIC uses hardware to perform CPUinefficient encoding, while BF3 does this in the Arm cores.
+Figure 8b shows the deserialization throughput improvement of “BF3-Oneshot” over “BF3”. Averagely applying oneshot DMA write optimization to BF3 can improve the deserialization throughput by 1.78×, because one-shot DMA write
+can coalesce small DMA writes into a single large DMA
+write, improving PCIe transaction rate utilization. RpcNIC
+averagely achieves 5.9× higher deserialization throughput than
+“BF3-Oneshot”. This is mainly because RpcNIC additionally
+offloads memory management and decoding to hardware.
+The above experiments indicate that RpcNIC optimizations
+can also works well on a SoC-based SmartNIC.
+E. Comparison to Dagger
+Dagger does not support (de)serialization of structured and
+nested formats and naively adopting a hardware (de)serializer
+to Dagger would also suffer from long latency issue (FPGA’s
+access over UPI incurs 400ns one-way latency, still much
+higher than CPU’s memory access time). However, we can
+apply the optimizations proposed by RpcNIC to Dagger to
+improve RPC offloading performance for structured and nested
+RPC messages. We perform a cycle-accurate experiment
+that simulates integrating ProtoACC/RpcNIC (de)serialization
+methods into Dagger, called Dagger-ProtoACC and DaggerRpcNIC, respectively. Both are clocked at 2 GHz.
+Figure 9 shows the serialization time for two implementations. Dagger-RpcNIC averagely reduces the serialization time
+by 2.9×, because applying RpcNIC serialization methods to
+
+(a) RX time.
+
+(b) TX time.
+(a) CU is preempted by other apps.
+
+Fig. 10: Time spent on the RPC layer.
+Dagger can eliminate many cross-UPI traversals, where UPI
+has slightly lower latency than PCIe but still much higher than
+the normal memory access.
+For deserialization, RpcNIC’s one-shot DMA write mechanism can be easily adopted by Dagger to batch data
+writes within one RPC request, thus improving deserialization
+throughput at the cost of slightly increased deserialization
+latency. We do not present a throughput simulation, because
+how the PCIe/UPI transaction rate varies according to the
+data size is not known and we do not have real UPI-based
+hardware. However, Dagger paper has an inter-RPC batching
+mechanism and the authors claim that it can help improve data
+transfer efficiency. As such, we believe the intra-RPC batching
+(one-shot DMA write) can increase Dagger deserialization
+efficiency. Unlike throughput, the deserialization latency can
+be accurately simulated with one-way UPI latency (400ns)
+provided in the Dagger paper. Our evaluation on HyperProtoBench shows that adopting the one-shot DMA will only
+slightly increase the deserialization latency (geometric mean
+latency increases by 1.048x), which is acceptable considering
+the potential throughput benefits.
+F. Comparison to On-chip Accelerator
+In this section, we compare the de/serialization time
+for RpcNIC and “ProtoACC-OnChip”, using the HyperProtoBench. RpcNIC runs on our hardware platform while
+‘ProtoACC-OnChip” reports Xilinx Vivado simulation results
+as there is no real hardware. For RpcNIC at 250 Mhz, we
+report the measured RPC TX/RX time measured in the real
+hardware. The TX time is measured from when the CPU issues
+send RPC command to when the serialized data enters the
+NIC transport layer. The RX time is measured from when the
+data leaves the NIC transport layer to when the deserialized
+data arrives at the host CPU memory. For RpcNIC at 2 GHz,
+we first simulate the time spent on the accelerator. Then we
+manually add a PCIe transfer time and the time spent on the
+host CPU, both of which are measured when running 250 MHz
+real RpcNIC hardware. For the on-chip accelerator simulation
+result, we first measure the simulated time spent on the RPC
+layer. Since the on-chip accelerator does not sit in the NIC,
+we then add an extra traversal time between the NIC and CPU
+memory.
+Figure 10 shows the time consumed in the RPC layer, in
+receiving path (RX) and transmitting path (TX), respectively.
+We have two observations.
+First, when clocked at the same frequency, RpcNIC barely
+increases RX time compared to “ProtoACC-OnChip”. This
+
+(b) CU is reprogrammed by compression.
+
+Fig. 11: Per-RPC execution time under kernel reconfiguration
+for the image compression example.
+is because deserialization does not require pointer-chasing
+memory access, as such our PCIe-based deserializer would not
+incur performance degradation compared with a low-latency
+on-chip deserializer accelerator.
+Second, given that PCIe’s latency (1250ns) is 17.9× higher
+than the memory latency (70ns) setting of “ProtoACCOnChip”, “ProtoACC-OnChip” only achieves 1.4×/1.24×
+lower TX time on average over RpcNIC when clocked at
+250 MHz/2 GHz, respectively. This is mainly because RpcNIC
+enables the CPU pre-serialization to trade fast CPU memory
+copies for slow PCIe access. What’s more, when offloading an
+RPC kernel in RpcNIC, skipping SmartNIC fields can effectively reduce the TX time, further narrowing the serialization
+time gap.
+In sum, RpcNIC enables a PCIe-attached SmartNIC to
+achieve nearly the same deserialization performance and close
+serialization performance, compared to an on-chip de/serialization accelerator.
+G. Automatic Field Updating
+In this section, we evaluate automatic field updating using
+the image compression example in Listing 1. The SmartNIC
+is configured with one compression compute unit, which is
+reconfigured to an unavailable state at runtime. It simulates the
+scenario when other applications have preempted the compute
+unit. When the compute unit is unavailable, the compression
+would switch to host CPU execution.
+At the beginning of Figure 11a, the large data field is
+put at SmartNIC memory and the compression is originally
+performed at the SmartNIC. After the 3rd request finishes, we
+set the compute unit as unavailable for the image compression
+service. The 4th request would suffer high execution latency
+since the large “image” field is put at the SmartNIC memory
+after serialization, CPU software has to manually move this
+field to CPU memory before performing compression on
+the CPU. Without automatic field updating, the execution
+time would remain high. With automatic field updating, all
+following requests’ execution time would drop by several
+microseconds, because the explicit movement of the “image”
+field would update the schema table in the SmartNIC. This
+lets the deserializer put this field into the CPU memory next
+time, avoiding the CPU’s explicit memory movement.
+Similarly, Figure 11b shows the situation that the CU is
+unavailable at the beginning and is available until the 4th
+
+(a) Throughput.
+
+(b) Average latency.
+
+Fig. 12: Performanc comparison of three approaches when
+running an RPC-based image compression service.
+request. With automatic field updating, the deserialization
+module can adapt to the dynamic change of compute units
+and put the field in the correct memory (CPU or SmartNIC
+memory). Besides, it eliminates the need for users to manually
+specify where fields should be placed after deserialization,
+saving a lot of hassle. As such, the automatic field updating
+mechanism yields high programmability.
+H. End-to-end Application Performance
+We evaluate RpcNIC using a practical cloud workload,
+which provides a high-performance and secure compression
+service. Our workload mainly comprises three tasks for each
+RPC request: request authorization, compute-intensive compression, and encryption/decryption. For the “CPU-only” baseline, all three tasks run on the host CPU. For “ProtoACCPCIe” and RpcNIC, compression and encryption/decryption
+run on the SmartNIC hardware, while the request authorization task is still conducted on the host CPU. The request
+authorization task is not offloaded because it usually only
+involves lightweight computation and changes frequently Both
+“ProtoACC-PCIe” and RpcNIC are able to process the offloaded tasks at line-rate (100 Gbps).
+Figure 12a shows the achieved throughput using the different numbers of host CPU cores. We observe that RpcNIC’s
+achievable throughput is 2.6× higher than the “ProtoACCPCIe” baseline and 31.8 × higher than the “CPU-only” baseline. “CPU-only” performs worst because running computeintensive compression, encryption/decryption, and RPC stack
+in the software is very inefficient compared with offloading
+them to hardware. RpcNIC outperforms “ProtoACC-PCIe”
+mainly because RpcNIC effectively offloads the RPC stack
+to a PCIe-attached SmartNIC with the proposed schemes. We
+also observe that skipping SmartNIC fields in the host CPU
+pre-serialization can save 65% CPU cycles. This is because
+RpcNIC allows the KB-level large field to always reside in
+the SmartNIC memory and the hardware is responsible for its
+serialization.
+Figures 12b shows the average latency of three implementations. We observe that RpcNIC can achieve 2.6 ×
+(9.6 ×) lower average latency than the “ProtoACC-PCIe”
+(“CPU-only”) solution under the same throughput. RpcNIC
+outperforms the “ProtoACC-PCIe” baseline mainly because
+target-aware deserialization avoids much redundant data movement and memory-affinity serialization can greatly reduce the
+serialization time over the high-latency PCIe interconnect.
+
+Fig. 13: End-to-end execution time.
+TABLE IV. FPGA resource consumption.
+Name
+ProtoACC-PCIe
+RpcNIC
+Serializer
+Deserializer
+
+LUTs (K)
+221 (17%)
+170 (13%)
+30 (2.2%)
+15 (1.1%)
+
+REGs (K)
+237(9%)
+207 (8%)
+11 (0.41%)
+7.8 (0.3%)
+
+BRAMs
+592 (29%)
+552 (27%)
+55 (2.7%)
+6 (0.3%)
+
+To prove that RpcNIC can fit small-size RPCs, we perform an end-to-end comparison of five representative services
+(UniqueId, User, UrlShorten, SocialGraph, and ComposePost)
+in the widely-used DeathStarBench microservice suit. Figure 13 shows the end-to-end execution time. We observe that
+the geometric mean execution time of RpcNIC is 1.57×/1.34×
+lower than the software baseline “CPU-only”/“ProtoACCPCIe”. This indicates that RpcNIC can also accelerate RPCs
+with a small message size.
+I. Hardware Resource Usage
+Table IV shows the FPGA resource consumption of
+“ProtoACC-PCIe” and RpcNIC. The resources of the offloaded
+RPC kernel are not reported as it is application-specific. RpcNIC is resource-frugal thanks to the compacted hardware data
+structures (schema table and temp buffer) and the streamlined
+serialization and serialization process.
+V. D ISCUSSION
+How to Accommodate Differnt/evloving Formats. Currently,
+RpcNIC focuses on the widely used Protobuf format. But it is
+relatively easy to extend RpcNIC to support other formats such
+as Thrift [5]. In the following, we present two modifications.
+From the hardware perspective, we mainly need to modify the
+deserializer/serializer module and add transformation logic for
+Thrift fields. From the software perspective, we need to modify
+the compiler, adding parsing logic for “.thrift” files (which is
+similar to “.proto” files in Protobuf).
+(De)serialization-free Formats. Formats [24], [40] such as
+Cap’n Proto [40] are proposed to avoid the (de)serialization
+overheads during runtime. These formats sacrifice object mutability. However, the RPC message size is usually not known
+when it is created, so they need to allocate a large fixed buffer
+for each message which wastes memory space. Besides, the
+zero elements or unset fields would still occupy the space
+in the wire, incurring a larger transfer size than traditional
+formats like protobuf. To avoid these limitations, these formats
+also need additional designs to balance the (de)serialization
+overhead and waste of memory space/transfer size. Take Cap’n
+Proto as an example, to avoid memory waste, it allows a
+message to be split across multiple non-contiguous memory
+segments. Users can dynamically allocate more segments and
+use inter-segment pointers to link these segments together.
+To reduce the transfer size, Cap’n Proto adopts an operation
+
+called packing to compress these zero bytes in the wire format
+in serialization and unpack these zeros in deserialization.
+The packing/unpacking operations involve many bit-wise/bytewise operations, and these CPU-inefficient operations incur
+similar overheads to that of encoding/decoding in traditional
+formats. We believe RpcNIC’s optimizations can mitigate the
+inefficiency introduced by the multiple segments and CPUinefficient packing/unpacking. During serialization, we could
+add a CPU pre-process that copies incontiguous segments
+into a contiguous buffer, and the copy of large segments can
+be offloaded to CPU’s on-chip memcpy engines, while the
+packing can be later executed in the NIC hardware. During
+deserialization, we could refer to the key idea of RpcNIC’s
+one-shot DMA write and decoding offloading. The unpacking
+operations can be offloaded to the NIC hardware and the
+DMA writes of different segments of one RPC message can
+be batched together to improve DMA transfer efficiency. In
+summary, it is easy to generalize RpcNIC to other formats.
+CXL. RPCAcc’s idea still works well on top of a coherent
+fabric like CXL. Although the CXL coherence allows the
+host to access the accelerator memory using load/store (or
+reversely), the latency is still several times that of local
+memory access. We believe the key ideas of RpcNIC still
+hold: 1) putting the deserialized fields accordingly and letting
+CPU/SmartNIC access their local memory as much as possible
+during the RPC process; 2) doing intra-RPC batching during
+the deserialization to improve transfer efficiency; 3) letting
+CPU/SmartNIC serialize the fields in their local memory; 4)
+offloading bit-wise/byte-wise decoding/encoding and memory
+management to hardware. A coherent fabric like CXL will
+enhance RpcNIC in two main aspects. First, we can replace the
+costly MMIO-based mechanism with coherent memory access
+to implement the CPU-NIC interface. As such, the transaction
+rate for small RPC requests would not be bottlenecked by the
+low MMIO throughput. Second, it can avoid explicit crossPCIe data movement at runtime. Our current implementation
+has to move the field explicitly, when the deserialized field is
+not in proper memory (CPU memory or SmartNIC memory).
+With CXL, both the CPU and SmartNIC can access the
+memory of each other using load/store instructions. CXL will
+enhance RpcNIC in two main aspects. First, we can replace the
+costly MMIO-based mechanism with coherent memory access
+to implement the CPU-NIC interface. As such, the transaction
+rate for small RPC requests would not be bottlenecked by
+low MMIO throughput. Second, it can avoid explicit crossPCIe data movement at runtime. In the current implementation,
+when the deserialized field is not in proper memory (CPU
+memory or SmartNIC memory), the users have to move the
+field explicitly. With CXL, both the CPU and SmartNIC can
+access the memory of each other using load/store instructions.
+VI. R ELATED W ORKS
+Software-based RPC Acceleration. Cornflakes [65] leverages
+the scatter-gather capability to let NIC directly read the noncontiguous data from the host memory during the serialization.
+However, it requires that the data resides in the pinned DMAsafe region, which greatly harms memory utilization, espe-
+
+cially in the cloud scenario. Besides, its serialization format
+does not contain encoding and is not compatible with existing
+applications.
+Hardware-based RPC Acceleration. Prior works [36], [38],
+[46], [63], [64] offload the RPC stack or de/serialization to
+hardware to alleviate the CPU pressure. Cereal [36] adopts a
+special memory access interface to provide low-latency host
+memory access for the accelerator. Optimus Prime [63] and
+Cerebros [64] place an on-chip accelerator for de/serialization
+(entire RPC stack). ProtoACC [38] proposes a novel near-core
+hardware accelerator for Protobuf. In contrast, RpcNIC focuses
+on optimizing RPC in a PCIe-attached SmartNIC, which is
+much more widely used in the modern cloud.
+New Network Architecture. The nanoPU [32] is a new NICCPU co-design for RPC acceleration. It adds a fast path from
+the NIC directly to the CPU register file to achieve ultra-low
+latency packet access (∼70ns). RAMBDA [80] uses RDMA
+NICs and a standalone cache-coherent accelerator to accelerate
+data center applications. RpcNIC focus on the accelerations
+of RPC and de/serialization. NetDIMM [2] integrates a fullblown NIC into the buffer device of a DIMM for fast data
+remote data access. FlexDriver [13] allows the accelerator to
+control the NIC execution directly for high scalability.
+Offloading to SmartNIC. Many prior works [3], [6]–[10],
+[14], [16], [26], [26]–[31], [41], [47], [50]–[53], [56], [60],
+[62], [68], [70], [72], [74], [75], [84]–[86] offload host tasks to
+SmartNICs to alleviate the host CPU pressure. None of these
+works tackle the problem of RPC tax. In contrast, RpcNIC
+offloads the RPC stack and computing kernels.
+Header-payload Data Split. Researchers have studied the
+header-payload split extensively [1], [15], [25], [44], [61],
+[67]. IDIO [1] selectively disables Direct Cache Access (DCA)
+for the payload of received packets while always keeping DCA
+enabled for packet headers. SplitRPC [44] splits data using
+a fixed offset without de/serialization. In contrast, RpcNIC
+splits deserialized RPC messages according to RPC’s fields
+and forwards them to either host CPU or SmartNIC memory.
+VII. C ONCLUSION
+This paper presents RpcNIC, a hardware-software codesigned SmartNIC allowing efficient RPC layer offloading
+and reconfigurable RPC kernel offloading. To tackle the ramifications of introducing PCIe, RpcNIC introduces three techniques: a target-aware deserializer, a memory-affinity CPUSmartNIC collaborative serializer, and a runtime automatic
+field updating scheme. RpcNIC is an immediately deployed
+solution and provides the software abstraction to load the RPC
+stack and compute kernels on demand.
+Acknowledgement. The work is supported by the following
+grants: the National Key R&D Program of China (Grant No.
+2022ZD0119301), the National Natural Science Foundation
+of China under the grant number (62472384, 62441236,
+U24A20326). Zeke Wang is the corresponding author.
+
+R EFERENCES
+[1] M. Alian, S. Agarwal, J. Shin, N. Patel, Y. Yuan, D. Kim, R. Wang, and
+N. S. Kim, “Idio: Network-driven, inbound network data orchestration
+on server processors,” in MICRO, 2022.
+[2] M. Alian and N. S. Kim, “Netdimm: Low-latency near-memory network
+interface architecture,” in MICRO, 2019.
+[3] G. Alonso, C. Binnig, I. Pandis, K. Salem, J. Skrzypczak, R. Stutsman,
+L. Thostrup, T. Wang, Z. Wang, and T. Ziegler, “Dpi: The data
+processing interface for modern networks,” in CIDR, 2018.
+[4] Amazon, “AWS Nitro System,” https://aws.amazon.com/cn/ec2/nitro/,
+2023.
+[5] Apache, “Apache Thrift,” https://thrift.apache.org/, 2021.
+[6] M. Bonola, G. Belocchi, A. Tulumello, M. S. Brunella, G. Siracusano,
+G. Bianchi, and R. Bifulco, “Faster software packet processing on fpga
+nics with ebpf program warping,” in ATC, 2022.
+[7] M. S. Brunella, G. Belocchi, M. Bonola, S. Pontarelli, G. Siracusano,
+G. Bianchi, A. Cammarano, A. Palumbo, L. Petrucci, and R. Bifulco,
+“hxdp: Efficient software packet processing on fpga nics,” Communications of the ACM, 2022.
+[8] X. Chen, L. Yu, V. Liu, and Q. Zhang, “Cowbird: Freeing cpus to
+compute by offloading the disaggregation of memory,” in SIGCOMM,
+2023.
+[9] X. Chen, J. Zhang, T. Fu, Y. Shen, S. Ma, K. Qian, L. Zhu, C. Shi,
+Y. Zhang, M. Liu, and Z. Wang, in Demystifying Datapath Accelerator
+Enhanced Off-path SmartNIC, 2024.
+[10] S. Choi, M. Shahbaz, B. Prabhakar, and M. Rosenblum, “λ-nic: Interactive serverless compute on programmable smartnics,” in ICDCS, 2020.
+[11] D. Cock, A. Ramdas, D. Schwyn, M. Giardino, A. Turowski, Z. He,
+N. Hossle, D. Korolija, M. Licciardello, K. Martsenko et al., “Enzian:
+an open, general, cpu/fpga platform for systems software research,” in
+ASPLOS, 2022.
+[12] CXL Consortium, “CXL Specification,” https://computeexpresslink.org/
+cxl-specification/, 2024.
+[13] H. Eran, M. Fudim, G. Malka, G. Shalom, N. Cohen, A. Hermony,
+D. Levi, L. Liss, and M. Silberstein, “Flexdriver: A network driver for
+your accelerator,” in ASPLOS, 2022.
+[14] H. Eran, L. Zeno, M. Tork, G. Malka, and M. Silberstein, “Nica: An
+infrastructure for inline acceleration of network applications,” in ATC,
+2019.
+[15] A. Farshin, A. Roozbeh, G. Q. Maguire Jr, and D. Kostić, “Make the
+most out of last level cache in intel processors,” in EuroSys, 2019.
+[16] D. Firestone, A. Putnam, S. Mundkur, D. Chiou, A. Dabagh, M. Andrewartha, H. Angepat, V. Bhanu, A. Caulfield, E. Chung, H. K.
+Chandrappa, S. Chaturmohta, M. Humphrey, J. Lavier, N. Lam, F. Liu,
+K. Ovtcharov, J. Padhye, G. Popuri, S. Raindel, T. Sapre, M. Shaw,
+G. Silva, M. Sivakumar, N. Srivastava, A. Verma, Q. Zuhair, D. Bansal,
+D. Burger, K. Vaid, D. A. Maltz, and A. Greenberg, “Azure accelerated
+networking:smartnics in the public cloud,” in NSDI, 2018.
+[17] Y. Gan, Y. Zhang, D. Cheng, A. Shetty, P. Rathi, N. Katarki, A. Bruno,
+J. Hu, B. Ritchken, B. Jackson, K. Hu, M. Pancholi, Y. He, B. Clancy,
+C. Colen, F. Wen, C. Leung, S. Wang, L. Zaruvinsky, M. Espinosa,
+R. Lin, Z. Liu, J. Padilla, and C. Delimitrou, “An open-source benchmark
+suite for microservices and their hardware-software implications for
+cloud & edge systems,” in ASPLOS, 2019.
+[18] Y. Gao, Q. Li, L. Tang, Y. Xi, P. Zhang, W. Peng, B. Li, Y. Wu, S. Liu,
+L. Yan, F. Feng, Y. Zhuang, F. Liu, P. Liu, X. Liu, Z. Wu, J. Wu,
+Z. Cao, C. Tian, J. Wu, J. Zhu, H. Wang, D. Cai, and J. Wu, “When
+cloud storage meets rdma,” in NSDI, 2021.
+[19] A. Gonzalez, A. Kolli, S. Khan, S. Liu, V. Dadu, S. Karandikar,
+J. Chang, K. Asanovic, and P. Ranganathan, “Profiling hyperscale big
+data processing,” in ISCA, 2023.
+[20] Google, “grpc,” https://grpc.io/, 2022.
+[21] Google, “Protocol Buffers Documentation,” https://protobuf.dev/, 2023.
+[22] Google,
+“Protocol
+Buffers
+Encoding,”
+https://protobuf.dev/
+programming-guides/encoding/, 2023.
+[23] Google, “Falcon: A Reliable and Low Latency Hardware Transport,”
+https://netdevconf.info/0x18/docs/netdev-0x18-paper43-talkslides/Introduction%20to%20Falcon%20Reliable%20Transport.pdf,
+2024.
+[24] Google, “FlatBuffers,” https://github.com/google/flatbuffers, 2024.
+[25] S. Goswami, N. Kodirov, C. Mustard, I. Beschastnikh, and M. Seltzer,
+“Parking packet payload with p4,” in CoNEXT, 2020.
+
+[26] S. Grant, A. Yelam, M. Bland, and A. C. Snoeren, “Smartnic performance isolation with fairnic: Programmable networking for the cloud,”
+in SIGCOMM, 2020.
+[27] Z. Guo, J. Lin, Y. Bai, D. Kim, M. Swift, A. Akella, and M. Liu,
+“Lognic: A high-level performance model for smartnics,” in MICRO,
+2023.
+[28] Z. Guo, H. Zhang, C. Zhao, Y. Bai, M. Swift, and M. Liu, “Leed: A lowpower, fast persistent key-value store on smartnic jbofs,” in SIGCOMM,
+2023.
+[29] Z. Guo, Y. Shan, X. Luo, Y. Huang, and Y. Zhang, “Clio: A hardwaresoftware co-designed disaggregated memory system,” in ASPLOS, 2022.
+[30] Z. He, D. Korolija, Y. Zhu, B. Ramhorst, T. Laan, L. Petrica, M. Blott,
+and G. Alonso, “ACCL+: an FPGA-Based collective engine for distributed applications,” in OSDI 24, 2024.
+[31] H. Huang, Y. Li, J. Sun, X. Zhu, J. Zhang, L. Luo, J. Li, and Z. Wang,
+“P4sgd: Programmable switch enhanced model-parallel training on
+generalized linear models on distributed fpgas,” IEEE Transactions on
+Parallel and Distributed Systems, 2023.
+[32] S. Ibanez, A. Mallery, S. Arslan, T. Jepsen, M. Shahbaz, C. Kim,
+and N. McKeown, “The nanopu: A nanosecond network stack for
+datacenters,” in OSDI, 2021.
+[33] Intel, “Intel Products formerly Sapphire Rapids,” https://ark.intel.com/
+content/www/us/en/ark/products/codename/126212/products-formerlysapphire-rapids.html, 2024.
+[34] Intel, “Intel® Data Streaming Accelerator,” https://www.intel.com/
+content/www/us/en/products/docs/accelerator-engines/data-streamingaccelerator.html, 2024.
+[35] Intel, “Intel® Ultra Path Interconnect,” https://www.intel.com/content/
+www/us/en/silicon-innovations/6-pillars/interconnect.html, 2024.
+[36] J. Jang, S. J. Jung, S. Jeong, J. Heo, H. Shin, T. J. Ham, and J. W. Lee,
+“A specialized architecture for object serialization with applications to
+big data analytics,” in ISCA, 2020.
+[37] A. Kalia, M. Kaminsky, and D. G. Andersen, “Datacenter rpcs can be
+general and fast,” NSDI, 2019.
+[38] S. Karandikar, C. Leary, C. Kennelly, J. Zhao, D. Parimi, B. Nikolic,
+K. Asanovic, and P. Ranganathan, “A hardware accelerator for protocol
+buffers,” in MICRO, 2021.
+[39] S. Karandikar, A. N. Udipi, J. Choi, J. Whangbo, J. Zhao, S. Kanev,
+E. Lim, J. Alakuijala, V. Madduri, Y. S. Shao, B. Nikolic, K. Asanovic,
+and P. Ranganathan, “Cdpu: Co-designing compression and decompression processing units for hyperscale systems,” in ISCA, 2023.
+[40] Kenton Varda, “Cap’n Proto,” https://capnproto.org/, 2024.
+[41] M. Khalilov, S. D. Girolamo, M. Chrapek, R. Nudelman, G. Bloch,
+and T. Hoefler, “Network-offloaded bandwidth-optimal broadcast and
+allgather for distributed ai,” in SC, 2024.
+[42] A. Khawaja, J. Landgraf, R. Prakash, M. Wei, E. Schkufza, and C. J.
+Rossbach, “Sharing, protection, and compatibility for reconfigurable
+fabric with amorphos,” in OSDI, 2018.
+[43] J. Kim, I. Jang, W. Reda, J. Im, M. Canini, D. Kostić, Y. Kwon, S. Peter,
+and E. Witchel, “Linefs: Efficient smartnic offload of a distributed file
+system with pipeline parallelism,” in SOSP, 2021.
+[44] A. Kumar, A. Sivasubramaniam, and T. Zhu, “Splitrpc: A control+ data
+path splitting rpc stack for ml inference serving,” POMACS, 2023.
+[45] R. Kuper, I. Jeong, Y. Yuan, R. Wang, N. Ranganathan, N. Rao, J. Hu,
+S. Kumar, P. Lantz, and N. S. Kim, “A quantitative analysis and
+guidelines of data streaming accelerator in modern intel xeon scalable
+processors,” in ASPLOS, 2024.
+[46] N. Lazarev, S. Xiang, N. Adit, Z. Zhang, and C. Delimitrou, “Dagger:
+efficient and fast rpcs in cloud microservices with near-memory reconfigurable nics,” in ASPLOS, 2021.
+[47] B. Li, K. Tan, L. Luo, Y. Peng, R. Luo, N. Xu, Y. Xiong, P. Cheng,
+and E. Chen, “Clicknp: Highly flexible and high performance network
+processing with reconfigurable hardware,” in SIGCOMM, 2016.
+[48] H. Li, D. S. Berger, L. Hsu, D. Ernst, P. Zardoshti, S. Novakovic,
+M. Shah, S. Rajadnya, S. Lee, I. Agarwal et al., “Pond: Cxl-based
+memory pooling systems for cloud platforms,” in ASPLOS, 2023.
+[49] S. Li, Y. Zhao, R. Varma, O. Salpekar, P. Noordhuis, T. Li, A. Paszke,
+J. Smith, B. Vaughan, P. Damania et al., “Pytorch distributed:
+Experiences on accelerating data parallel training,” arXiv preprint
+arXiv:2006.15704, 2020.
+[50] Y. Liao, J. Wu, W. Lu, X. Li, and G. Yan, “Dpu-direct: Unleashing
+remote accelerators via enhanced rdma for disaggregated datacenters,”
+TC, 2024.
+
+[51] J. Lin, K. Patel, B. E. Stephens, A. Sivaraman, and A. Akella, “Panic:
+A high-performance programmable nic for multi-tenant networks,” in
+OSDI, 2020.
+[52] M. Liu, T. Cui, H. Schuh, A. Krishnamurthy, S. Peter, and K. Gupta,
+“Offloading distributed applications onto smartnics using ipipe,” in
+SIGCOMM, 2019.
+[53] M. Liu, S. Peter, A. Krishnamurthy, and P. M. Phothilimthana,
+“E3:energy-efficient microservices on smartnic-accelerated servers,” in
+ATC, 2019.
+[54] A. Lottarini, A. Ramirez, J. Coburn, M. A. Kim, P. Ranganathan,
+D. Stodolsky, and M. Wachsler, “vbench: Benchmarking video transcoding in the cloud,” in ASPLOS, 2018.
+[55] R. Miao, L. Zhu, S. Ma, K. Qian, S. Zhuang, B. Li, S. Cheng, J. Gao,
+Y. Zhuang, P. Zhang, R. Liu, C. Shi, B. Fu, J. Zhu, J. Wu, D. Cai, and
+H. H. Liu, “From luna to solar: the evolutions of the compute-to-storage
+networks in alibaba cloud,” in SIGCOMM, 2022.
+[56] J. Min, M. Liu, T. Chugh, C. Zhao, A. Wei, I. H. Doh, and A. Krishnamurthy, “Gimbal: enabling multi-tenant storage disaggregation on
+smartnic jbofs,” in SIGCOMM, 2021.
+[57] P. Moritz, R. Nishihara, S. Wang, A. Tumanov, R. Liaw, E. Liang,
+M. Elibol, Z. Yang, W. Paul, M. I. Jordan et al., “Ray: A distributed
+framework for emerging {AI} applications,” in OSDI, 2018.
+[58] Nvidia, “NVIDIA BLUEFIELD-3 DPU,” https://www.nvidia.com/
+content/dam/en-zz/Solutions/Data-Center/documents/datasheet-nvidiabluefield-3-dpu.pdf, 2022.
+[59] T. Pan, K. Liu, X. Wei, Y. Qiao, J. Hu, Z. Li, J. Liang, T. Cheng, W. Su,
+J. Lu et al., “Luoshen: A hyper-converged programmable gateway for
+multi-tenant multi-service edge clouds,” in NSDI, 2024.
+[60] P. M. Phothilimthana, M. Liu, A. Kaufmann, S. Peter, R. Bodik,
+and T. Anderson, “Floem: A programming system for nic-accelerated
+network applications,” in OSDI, 2018.
+[61] B. Pismenny, L. Liss, A. Morrison, and D. Tsafrir, “The benefits of
+general-purpose on-nic memory,” in ASPLOS, 2022.
+[62] S. Pontarelli, R. Bifulco, M. Bonola, C. Cascone, M. Spaziani, V. Bruschi, D. Sanvito, G. Siracusano, A. Capone, M. Honda, F. Huici, and
+G. Bianchi, “Flowblaze: Stateful packet processing in hardware,” in
+NSDI, 2019.
+[63] A. Pourhabibi, S. Gupta, H. Kassir, M. Sutherland, Z. Tian, M. P.
+Drumond, B. Falsafi, and C. Koch, “Optimus prime: Accelerating data
+transformation in servers,” in ASPLOS, 2020.
+[64] A. Pourhabibi, M. Sutherland, A. Daglis, and B. Falsafi, “Cerebros:
+Evading the rpc tax in datacenters,” in MICRO, 2021.
+[65] D. Raghavan, S. Ravi, G. Yuan, P. Thaker, S. Srivastava, M. Murray,
+P. H. Penna, A. Ousterhout, P. Levis, M. Zaharia, and I. Zhang,
+“Cornflakes: Zero-copy serialization for microsecond-scale networking,”
+2023.
+[66] P. Ranganathan, D. Stodolsky, J. Calow, J. Dorfman, M. Guevara, C. W.
+Smullen IV, A. Kuusela, R. Balasubramanian, S. Bhatia, P. Chauhan,
+A. Cheung, I. S. Chong, N. Dasharathi, J. Feng, B. Fosco, S. Foss,
+B. Gelb, S. J. Gwin, Y. Hase, D.-k. He, C. R. Ho, R. W. Huffman Jr.,
+E. Indupalli, I. Jayaram, P. Kongetira, C. M. Kyaw, A. Laursen, Y. Li,
+F. Lou, K. A. Lucke, J. Maaninen, R. Macias, M. Mahony, D. A.
+Munday, S. Muroor, N. Penukonda, E. Perkins-Argueta, D. Persaud,
+A. Ramirez, V.-M. Rautio, Y. Ripley, A. Salek, S. Sekar, S. N. Sokolov,
+R. Springer, D. Stark, M. Tan, M. S. Wachsler, A. C. Walton, D. A.
+Wickeraad, A. Wijaya, and H. K. Wu, “Warehouse-scale video acceleration: co-design and deployment in the wild,” in ASPLOS, 2021.
+[67] A. Sarma, H. Seyedroudbari, H. Gupta, U. Ramachandran, and
+A. Daglis, “Nfslicer: Data movement optimization for shallow network
+functions,” arXiv preprint arXiv:2203.02585, 2022.
+[68] H. N. Schuh, W. Liang, M. Liu, J. Nelson, and A. Krishnamurthy,
+“Xenic: Smartnic-accelerated distributed transactions,” in ASPLOS,
+2021.
+[69] K. Seemakhupt, B. E. Stephens, S. Khan, S. Liu, H. Wassel, S. H.
+Yeganeh, A. C. Snoeren, A. Krishnamurthy, D. E. Culler, and H. M.
+Levy, “A cloud-scale characterization of remote procedure calls,” in
+SOSP, 2023.
+[70] H. Seyedroudbari, S. Vanavasam, and A. Daglis, “Turbo: Smartnicenabled dynamic load balancing of µs-scale rpcs,” in HPCA, 2023.
+[71] D. Sidler, Z. Wang, M. Chiosa, A. Kulkarni, and G. Alonso, “Strom:
+smart remote memory,” in EuroSys, 2020.
+[72] M. Sun, Z. Yang, C. Liao, Y. Li, F. Wu, and Z. Wang, “Luwu:
+An end-to-end in-network out-of-core optimizer for 100b-scale model-
+
+in-network data-parallel training on distributed gpus,” 2024. [Online].
+Available: https://arxiv.org/abs/2409.00918
+[73] Y. Sun, Y. Yuan, Z. Yu, R. Kuper, C. Song, J. Huang, H. Ji, S. Agarwal,
+J. Lou, I. Jeong et al., “Demystifying cxl memory with genuine cxl-ready
+systems and devices,” in Proceedings of the 56th Annual IEEE/ACM
+International Symposium on Microarchitecture, 2023, pp. 105–121.
+[74] Z. Wang, H. Huang, J. Zhang, F. Wu, and G. Alonso, “Fpganic: An
+fpga-based versatile 100gb smartnic for gpus,” in ATC, 2022.
+[75] X. Wei, R. Cheng, Y. Yang, R. Chen, and H. Chen, “Characterizing offpath SmartNIC for accelerating distributed systems,” in OSDI, 2023.
+[76] A. Wolnikowski, S. Ibanez, J. Stone, C. Kim, R. Manohar, and R. Soulé,
+“Zerializer: Towards zero-copy serialization,” in HosOS, 2021.
+[77] M. Wu, S. Wang, H. Chen, and B. Zang, “Zero-change object transmission for distributed big data analytics,” in ATC, 2022.
+[78] Xilinx, “Xilinx ALVEO™ U280,” https://www.xilinx.com/publications/
+product-briefs/alveo-u280-product-brief.pdf, 2021.
+[79] Xilinx, “Xilinx Vivado Design Suite,” https://www.xilinx.com/products/
+design-tools/vivado.html, 2023.
+[80] Y. Yuan, J. Huang, Y. Sun, T. Wang, J. Nelson, D. R. Ports, Y. Wang,
+R. Wang, C. Tai, and N. S. Kim, “Rambda: Rdma-driven acceleration
+framework for memory-intensive µs-scale datacenter applications,” in
+HPCA, 2023.
+[81] R. Zambre, A. Chandramowlishwaran, and P. Balaji, “Scalable communication endpoints for mpi+ threads applications,” in ICPADS, 2018.
+[82] Y. Zha and J. Li, “Virtualizing fpgas in the cloud,” in ASPLOS, 2020.
+[83] Y. Zha and J. Li, “Hetero-vital: A virtualization stack for heterogeneous
+fpga clusters,” in ISCA, 2021.
+[84] J. Zhang, X. Chen, Y. Zhang, and Z. Wang, “Dmrpc: Disaggregated
+memory-aware datacenter rpc for data-intensive applications,” in ICDE,
+2024.
+[85] J. Zhang, H. Huang, X. Xu, X. Li, J. Zhao, M. Liu, and Z. Wang,
+“Rpcacc: A high-performance and reconfigurable pcie-attached rpc
+accelerator,” 2024. [Online]. Available: https://arxiv.org/abs/2411.07632
+[86] J. Zhang, H. Huang, L. Zhu, S. Ma, D. Rong, Y. Hou, M. Sun,
+C. Gu, P. Cheng, C. Shi, and Z. Wang, “Smartds: Middle-tier-centric
+smartnic enabling application-aware message split for disaggregated
+block storage,” in ISCA, 2023.
+[87] S. Zhou and S. Mu, “{Fault-Tolerant} replication with {Pull-Based}
+consensus in {MongoDB},” in NSDI, 2021.
+[88] Y. Zhou, Z. Wang, S. Dharanipragada, and M. Yu, “Electrode: Accelerating distributed protocols with {eBPF},” in NSDI, 2023.
+[89] B. Zhu, Y. Chen, Q. Wang, Y. Lu, and J. Shu, “Octopus+: An rdmaenabled distributed persistent memory file system,” TOS, 2021.
+
+A PPENDIX
+A. Abstract
+This artifact provides the source code of RpcNIC and scripts
+to reproduce the main experimental results. The experiments
+are run on one 4U AMAX server, equipped with two Intel
+Xeon Silver 4214 CPUs@2.2GHz, 256GB DDR4 memory,
+RpcNIC(i.e., a Xilinx Ultra-Scale+ FPGA). RpcNIC is implemented on Xilinx Alveo cards U280 with Vivado 2020.1.
+B. Artifact check-list
+Program: C/C++
+Compilation: g++-11.3.0, gcc-11.3.30
+• Data set: HyperProtoBench
+• Run-time environment: QDMA driver installed
+• Hardware: Xilinx Alveo U280
+• Execution: Running commands as root with sudo
+• Metrics: Serialization latency and throughput, deserialization
+latency and throughput
+• Output: Experiments produce outputs in the console or log files
+• Experiments: a) Throughput speedup of one-shot DMA write
+deserializer, b) Serialization time comparisons between CPUonly, ProtoACC-PCIe, and Memory-affinity serializer
+• Disk space required: 1GB
+• Time needed to prepare workflow: 1 hour
+• Time needed to complete the experiments: 3 hours
+• Publicly available: Yes
+• Code licenses: MIT
+• Data licenses: MIT
+
+wget https://content.mellanox.com/ofed/MLNX_OFED
+-23.04-1.1.3.0/MLNX_OFED_LINUX-23.04-1.1.3.0
+-ubuntu18.04-x86_64.tgz -O mlnx.tgz
+tar -zxvf ./mlnx.tgz
+cd mlnx && sudo ./ofedinstall
+## Install required libs
+sudo apt install libgflags-dev libnuma-dev
+## build all binary programs
+cd RPCNIC && mkdir build_host && cd build_host
+cmake ..
+make -j
+
+•
+•
+
+C. Description
+1) How to access: The codebase can be accessed from
+GitHub https://github.com/RC4ML/RPCNIC.
+2) Hardware dependencies:
+• Xilinx Alveo cards U280
+• Intel CPU
+• 20GB memory and 1GB storage
+3) Software dependencies:
+• Linux OS
+• gcc ≥ 11.3.0
+• cmake ≥ 3.0.0
+• QDMA driver
+• MLNX OFED ≥ 5.4.0
+D. Installation
+Use the following commands to clone the RpcNIC repository, install the necessary tools, download the dataset, and
+build binary programs.
+git clone --recursive
+https://github.com/RC4ML/RPCNIC.git
+## Install QDMA driver
+cd qdma_driver
+make
+sudo insmod /path/to/qdma_driver/src/qdma-pf.ko
+echo ’1024’ | sudo tee -a
+/sys/bus/pci/devices/0000:1a:00.0/qdma/qmax
+sudo dma-ctl qdma1a000 q add idx 0 mode st dir bi
+sudo dma-ctl qdma1a000 q start idx 0 dir bi
+desc_bypass_en pfetch_bypass_en
+## Install MLNX_OFED
+
+E. Experiment workflow
+We provide two machines for artifact evaluation. The FPGA
+machine is equipped with a Xilinx U280 FPGA machine, and
+the second machine is a Vivado machine. The FPGA machine
+is used for the RPCNIC experiment, and the Vivado machine
+is used for deploying bitstream.
+You can refer to our GitHub repo to see how to connect and
+deploy bitstream on FPGA. Please reboot the FPGA machine
+after programming the FPGA. And then you can run the
+RPCNIC experiment on the FPGA machine.
+F. Evaluation and expected results
+We use one-shot DMA write deserializer experiment as an
+example, you can find other evaluations in our GitHub repo.
+1) Run the one-shot DMA write deserializer: Program
+deser one-shot DMA.bit to the FPGA, and after rebooting
+the machine, run the following command to start the experiment:
+sudo ../bin_host/deserialize_hw 0 8
+
+deserialize hw program accepts two arguments: the first
+argument is the number of messages, ranging from [0-9], and
+the second argument is the number of outstanding req, set it
+to 8 is enough.
+To run different BENCH, please edit /src/deserialize hw.cpp, change #define BENCH0 to #define BENCHX,
+and recompile the program. The output will be like this:
+total size:
+data_cnt:
+timer_en:
+timer_cnt:
+timer_cnt:
+speed:
+timer:
+
+91323
+142701027
+1
+149914182
+149914182
+92.9517
+599656
+
+2) Run the field-by-field DMA deserializer: Program
+deser field by field.bit to the FPGA, and after rebooting the
+machine, run the following command like above to start the
+experiment:
+sudo ../bin_host/deserialize_hw 0 8
+
+The output will be like this:
+total size:
+data_cnt:
+timer_en:
+timer_cnt:
+timer_cnt:
+
+91323
+142701027
+1
+149914182
+149914182
+
+speed:
+timer:
+
+92.9517
+599656
+
+3) Calculate the speedup: We can calculate the speedup by
+dividing the speed of the one-shot DMA deserializer by the
+speed of the field-by-field DMA deserializer.
+G. Notes
+• You can change #define BENCH0 to #define BENCHX in
+the source code to run different HyperProtoBench benchmarks.
+• Sometimes the kernel may panic. It will occur if the configuration is not correct. Reboot is needed when encountering
+kernel panic.
+

@@ -1,0 +1,1054 @@
+                                         Taming Serverless Cold Starts Through OS Co-Design
+                                                             Ben Holmes, Baltasar Dinis, Lana Honcharuk, Joshua Fried, Adam Belay
+                                                                                                     MIT CSAIL
+                                                                                                                                                    FaaSnap*           CRIU*       Ideal
+                                         Abstract                                                                           103
+                                         Serverless computing promises fine-grained elasticity and                          102
+
+
+
+
+                                                                                                                Time (ms)
+                                         operational simplicity, fueling widespread interest from both
+                                                                                                                            101
+                                         industry and academia. Yet this promise is undercut by the
+                                                                                                                            100
+                                         cold start problem, where invoking a function after a period
+                                         of inactivity triggers costly initialization before any work can                         hello pyaes html img json    lr   rnn cnn video json img img matmul
+                                                                                                                                                         Python                     Node      Java
+                                         begin. Even with today’s high-speed storage, the prevailing
+                                         view is that achieving sub-millisecond cold starts requires
+arXiv:2509.14292v1 [cs.OS] 17 Sep 2025
+
+
+
+
+                                         keeping state resident in memory.                                         Figure 1. The performance gap in snapshot/restore: Even
+                                            This paper challenges that assumption. Our analysis of                 tuned, state-of-the-art systems remain orders of magnitude
+                                         existing snapshot/restore mechanisms shows that OS-level                  slower than the ideal restore time. Note the logarithmic y-
+                                         limitations, not storage speed, are the real barrier to ultra-            axis.
+                                         fast restores from disk. These limitations force current sys-
+                                         tems to either restore state piecemeal in a costly manner or
+                                         capture too much state, leading to longer restore times and               execution [10] — making them a major source of user-visible
+                                         unpredictable performance. Furthermore, current memory                    latency. Collectively, these overheads undermine the respon-
+                                         primitives exposed by the OS make it difficult to reliably                siveness of serverless platforms.
+                                         fetch data into memory and avoid costly runtime page faults.                 Existing mitigation strategies fall into two broad cate-
+                                            To overcome these barriers, we present Spice, an execu-                gories. Warm-state approaches, such as keeping containers
+                                         tion engine purpose-built for serverless snapshot/restore.                alive for a short window [4, 15], deliver low-latency startup
+                                         Spice integrates directly with the OS to restore kernel state             but consume memory proportional to the number of func-
+                                         without costly replay and introduces dedicated primitives for             tions retained. Recent techniques like fork-based replica-
+                                         restoring memory mappings efficiently and reliably. As a re-              tion [7, 10, 17, 41] reduce this cost by enabling replication of
+                                         sult, Spice delivers near-warm performance on cold restores               a single warm instance across cores or machines. These sys-
+                                         from disk, reducing latency by up to 14.9× over state-of-the-             tems (e.g., leveraging fork locally or using remote memory
+                                         art process-based systems and 10.6× over VM-based systems.                mechanisms such as RDMA or CXL) allow multiple invoca-
+                                         This proves that high performance and memory elasticity                   tions to share memory copy-on-write, reducing total memory
+                                         no longer need to be a trade-off in serverless computing.                 usage while preserving low startup latency. In essence, they
+                                                                                                                   amortize one “parent” process across many children, but still
+                                                                                                                   require at least one copy of each function to remain alive
+                                         1   Introduction                                                          in memory. This model, however, fundamentally assumes
+                                         Serverless computing promises effortless elasticity: devel-               a warm instance is available somewhere on the cluster. For
+                                         opers deploy lightweight functions, while the platform dy-                the many functions in the long tail of an invocation distribu-
+                                         namically provisions resources in response to demand [16].                tion, or during a cold start after a period of inactivity, this
+                                         Freed from managing infrastructure, users benefit from fine-              assumption often does not hold, leaving no fast path for the
+                                         grained billing and scalability, while providers can, in theory,          initial request.
+                                         achieve high utilization by scheduling workloads just-in-                    On the other hand, cold-state approaches don’t rely on
+                                         time. In today’s commercial platforms (e.g., AWS Lambda [1],              warm state present [8, 21, 35, 38]. These approaches often
+                                         Azure Functions [2]), these functions are typically packaged              serialize initialized function state to persistent storage and
+                                         in containers or lightweight VMs, which must be initialized               reload it on demand, offering a natural fit for serverless
+                                         before running user code. However, this vision is funda-                  platforms where functions may be invoked rarely but must
+                                         mentally limited by cold starts: the latency incurred when                start quickly. In principle, these snapshot/restore approaches
+                                         a function is invoked on a machine with no prior cached                   can achieve both elasticity and memory efficiency. In prac-
+                                         state [8, 9, 13, 30, 33, 38, 41].                                         tice, however, restore latencies remain far higher than warm
+                                            Cold start delays stem from multiple sources, including                starts, preventing widespread adoption.
+                                         container setup, language runtime initialization, library load-              To quantify this gap, Figure 1 compares two state-of-the-
+                                         ing, and function-specific startup logic such as JIT compila-             art systems against a pessimistic ideal baseline across several
+                                         tion [20, 34, 40]. These steps often add tens to hundreds of              representative serverless workloads (detailed in Table 1). We
+                                         milliseconds — frequently longer than the function’s actual               use an asterisk(*) to denote that we modified both Faasnap
+                                                                                                            1
+(VM-based) and CRIU (process-based) for optimal perfor-                                          CRIU Init            Syscall Replay                VM State Restore
+                                                                         1000                                                                                      10140
+mance. For Faasnap, we selected the best-performing of its                500                                       8492            15448
+prefetching strategies, and for CRIU, we eliminated several                30                                                4544           4207
+
+
+
+
+                                                                     Time (ms)
+known overheads. Our ideal baseline is calculated as the                         20                                                                1828 1831
+                                                                                                      1232 1122                                                1993
+sum of the time to read the snapshot’s working set from stor-                    10
+                                                                                       993 990 998
+age and the function’s warm execution time, pessimistically                       0
+                                                                                        hello pyaes html img json       lr    rnn cnn video json img mtml img
+assuming no overlap between I/O and computation. Even                                                        Python                                   Node        Java
+against these tuned systems and this pessimistic baseline, a
+significant performance gap remains.                                  Figure 2. Initialization overheads for VM- and process-based
+   This failure is not due to hardware limits, but to a deeper        restore; total syscall counts for replay are shown above the
+mismatch between serverless requirements and the inter-               bars. Process restore costs grow with process complexity due
+faces provided by today’s OSes. Current OS abstractions are           to syscall replay. VM restore costs are flat but still non-trivial,
+optimized for incremental startup, not for the bulk restora-          reflecting fixed hypervisor operations.
+tion of an already-initialized process. This mismatch forces
+existing systems to rely on slow, general-purpose mecha-
+                                                                          • A study of existing snapshot/restore techniques that
+nisms. One of the clearest examples is metadata restoration.
+                                                                             identifies persistent overheads due to mismatches be-
+Lacking dedicated kernel support, process-level tools like
+                                                                             tween the requirements of low-latency restore and
+CRIU [3] must replay the original setup through a long se-
+                                                                             today’s OS interfaces.
+quence of expensive system calls. The alternative — snap-
+                                                                          • A novel OS metadata restoration process that bypasses
+shotting an entire virtual machine [8, 21, 38] — avoids this
+                                                                             costly syscall replay by deserializing process state in a
+replay but captures far more state than necessary, introduc-
+                                                                             single, batched operation from a co-designed snapshot
+ing new overheads including scheduling interference from
+                                                                             format.
+the guest OS. Crucially, both approaches are bottlenecked
+                                                                          • New kernel mechanisms for memory management
+by a second major challenge: restoring memory contents
+                                                                             that enable fast, reliable restore of process memory
+efficiently.
+                                                                             that eliminates page fault overhead during startup.
+   Memory restoration faces two intertwined challenges. The
+                                                                          • The implementation and evaluation of Spice, a pro-
+first is how to proactively populate a process’s memory with
+                                                                             totype engine demonstrating that our approach can
+its working set (the subset of pages needed for execution).
+                                                                             reduce cold restore latency to under 5ms, substantially
+One option is to synchronously load the entire predicted
+                                                                             outperforming state-of-the-art systems.
+working set before execution. While this guarantees the
+pages are resident in memory, it can result in long delays               Our findings reframe the conventional trade-offs in server-
+before execution begins. The alternative is to prefetch asyn-         less design, demonstrating that snapshot/restore is a first-
+chronously, overlapping I/O with the function’s startup rou-          class primitive capable of delivering both low latency and
+tine. This promises lower latency in theory, but is unreliable        high memory efficiency for serverless systems.
+with today’s OS interfaces and doesn’t eliminate stalls due
+to faults. Second, an application’s memory is a composite             2               Background and Motivation
+of shared, file-backed pages and private, modified data. Cur-        This section analyzes the performance of the two predom-
+rent OS interfaces cannot restore this complex structure effi-       inant snapshot/restore strategies introduced in Section 1:
+ciently, forcing a choice between slow, page-by-page updates         process-level restore, exemplified by CRIU [3], and VM-based
+or sacrificing memory sharing altogether. As fast local stor-        snapshots, used by systems like REAP [38], FaaSnap [8], and
+age becomes the norm, it is this two-fold interface mismatch         Sabre [21]. We demonstrate how both approaches are fun-
+— not raw I/O bandwidth — that has become the dominant               damentally constrained by the lack of direct OS support for
+factor in cold start latency.                                        rapid restoration, leading to the two core bottlenecks fore-
+   To resolve this interface mismatch and eliminate these OS-        shadowed earlier: reinstating process metadata and repopu-
+level overheads, we present Spice, a snapshot/restore system         lating memory. Our analysis focuses on these core restora-
+co-designed with a new set of OS primitives for fast mem-            tion costs; we do not measure the overhead of initializing
+ory and metadata restoration. By providing these missing             container primitives like cgroups and network namespaces,
+mechanisms, Spice makes restoring from persistent storage            as techniques for accelerating these are orthogonal and well-
+fundamentally practical. Our evaluation shows that Spice re-         explored [17, 22, 24, 37].
+duces the overhead from restoring from a cold disk to under
+5ms for a range of functions of varying complexity across             2.1             The Challenge of State Reconstruction
+several language runtimes.                                           The fundamental challenge for fast restoration is that mod-
+   This paper makes the following contributions:                     ern operating systems lack a native interface to restore a
+                                                                     process’s kernel-managed state. This state includes a wide
+                                                                 2
+                                         Function           Other Tasks                          bypasses syscall replay entirely, as all kernel data structures
+                                             N
+            50                   N                               N                  N            remain intact. As shown in Figure 2, restore operations are
+            40                                      F   N
+Time (ms)
+
+
+
+                                                                                                 reduced to a small, fixed set of hypervisor actions, such as
+            30                                                                N F
+                                     F                      F                                    reinitializing vCPU state, reattaching devices, and restor-
+            20   N       N                                                              F
+                             F                                            F                      ing other host-managed state. These complete in just a few
+            10       F
+             0                                                                                   milliseconds regardless of guest complexity.
+                 hello   pyaes   html         img       json         lr       rnn   matmul          A major downside, however, is that reviving the whole
+                                                                                    (Java)
+                                                                                                 VM also revives the entire guest kernel and all its runtime ac-
+  Figure 3. Scheduling delay after VM restore with the func-                                     tivity — not just the target function. After a prolonged pause,
+  tion running in SCHED_NORMAL (N) and SCHED_FIFO (F). Even                                      the guest must immediately resume deferred kernel house-
+  with SCHED_FIFO, the function competes with kernel threads                                     keeping and background services. This includes periodic
+  and daemons restored from the guest image.                                                     tasks, daemons, and maintenance threads, all of which are
+                                                                                                 scheduled as soon as the VM becomes active. Figure 3 illus-
+                                                                                                 trates this problem, showing that a function can be delayed
+  array of resources—threads, file descriptors, memory map-                                      by several milliseconds due to contention with guest ker-
+  pings, signal handlers, and more. Not only is there no single                                  nel tasks like RCU reclamation. We found that even raising
+  command to reinstate this entire collection at once, but even                                  the function’s scheduling priority with SCHED_FIFO offers
+  restoring a single resource to its previous condition can re-                                  only partial relief, as critical kernel threads continue to inter-
+  quire a complex sequence of operations.                                                        rupt the function’s execution. This scheduling interference
+     This lack of an efficient restore primitive forces systems                                  significantly impacts end-to-end latency.
+  into one of two extreme approaches: either (1) replaying
+  the system calls that originally created the process, or (2)
+                                                                                                 Takeaway: In the absence of kernel support for reinstating
+  snapshotting and restoring the entire virtual machine it runs
+                                                                                                 process state directly, systems are pushed into two extremes.
+  within. Both strategies push existing abstractions beyond
+                                                                                                 Replay-based restore suffers from syscall and orchestration
+  their intended uses and are responsible for significant cold-
+                                                                                                 overheads, while VM snapshots avoid replay but revive the
+  start overheads.
+                                                                                                 entire guest kernel, whose deferred housekeeping and back-
+     Syscall replay. At one extreme, restore begins from an
+                                                                                                 ground services cause scheduling interference that heavily
+  empty process and attempts to reconstruct every piece of ker-
+                                                                                                 impacts function startup latency. Neither approach achieves
+  nel state — threads, file descriptors, memory mappings, and
+                                                                                                 the millisecond-scale responsiveness required for serverless
+  more — by reissuing the original system calls that created
+                                                                                                 workloads.
+  them. This strategy is expensive: there are often hundreds
+  or thousands of such calls required, as most kernel objects
+  lack dedicated import or restore interfaces to directly set                                    2.2   The Challenge of Rapid Memory Restoration
+  them to their previous state. For example, restoring a sin-                                    While kernel metadata must be reinstated eagerly, mem-
+  gle file descriptor may require a sequence of syscalls: open                                   ory contents can be restored lazily. This is attractive in
+  to create the file, lseek to set its offset, dup to assign the                                 serverless environments where functions often touch only
+  correct descriptor number, and fcntl to reapply flags. Fig-                                    a small portion of their memory. Accordingly, existing sys-
+  ure 2 quantifies this overhead, showing that the latency of                                    tems [8, 21, 38] typically rely on demand paging, bringing
+  process-based restore grows with application complexity,                                       pages into memory only when accessed. However, naive
+  from a simple Python function to a more complex JVM ap-                                        demand paging introduces significant latency, as every miss-
+  plication, as the number of syscalls increases from hundreds                                   ing page triggers a blocking fault. To mitigate this, systems
+  to thousands. Each resource adds to the latency, and since                                     employ prefetching to load the predicted working set into
+  few can be reconstructed lazily, all must be completed before                                  memory before it is accessed.
+  execution resumes.                                                                                However, as Figure 4 shows, current prefetching strategies
+     The orchestration of this process from userspace adds                                       are insufficient. REAP [38] employs synchronous prefetch-
+  further overhead. Tools like CRIU stage snapshot data in                                       ing, which loads all pages before execution and minimizes
+  temporary memory regions at restore time, inject a restorer                                    major page faults but results in a long, fixed delay upfront.
+  binary into otherwise unused space, transfer control to that                                   FaaSnap [8] improves upon REAP’s working set estimation
+  binary, unmap its own code, and finally remap the snapshot                                     and also adds asynchronous prefetching, which attempts to
+  data into the correct virtual addresses. This elaborate dance                                  overlap I/O with execution. Unfortunately, this strategy does
+  avoids even more costly options such as using a second                                         not meaningfully improve end-to-end latencies, and neither
+  process to manipulate the target with ptrace.                                                  strategy resolves the slowdown incurred by minor faults,
+     Full-VM snapshots. At the other extreme, systems re-                                        caused by missing PTEs or writes to copy-on-write (CoW)
+  store entire virtual machines from snapshots. This approach                                    pages.
+                                                                                             3
+   No Interface for Guaranteed Population. The funda-                                     Prefetch (Sync)            Execution        Minor Faults        Major Faults
+                                                                                     25                                                                               300
+mental challenge in pre-warming data is the operating sys-
+                                                                                     20
+
+
+
+
+                                                                         Time (ms)
+
+
+
+
+                                                                                                                                                                         Time (ms)
+tem’s lack of a reliable, non-blocking interface to populate its                                                                                                      200
+                                                                                     15
+page cache. While a synchronous read() call can guarantee
+                                                                                     10
+data is fetched from disk, it does so by stalling the calling                                                                                                         100
+                                                                                      5
+thread until the I/O is complete, which results in delayed                            0   hello pyaes html img json lr       rnn mtml json     cnn video img img 0
+execution. Consequently, systems must rely on asynchro-                                                     Python               Java Node       Python   Java Node
+nous, advisory mechanisms through interfaces madvise().
+However, this is merely a hint, not a command; the kernel                   Figure 4. Impact of prefetching technique on execution la-
+retains full discretion to ignore the request, act on it par-               tency. Synchronous prefetching with read (left bars) delays
+tially, or de-prioritize it based on internal heuristics like               execution, while overlapping prefetching with execution us-
+memory pressure. This unpredictability means the main ap-                   ing madvise (right bars) fails to properly ensure that pages
+plication thread remains vulnerable to major page faults on                 are actually fetched. Neither approach resolves costly minor
+data that was requested but never loaded, ultimately forcing                faults.
+any prefetching strategy into a best-effort approach with no
+performance guarantees.
+                                                                            level, and it exposes no system call that allows mapping a
+   The Lingering Cost of Page Faults. Even when a page
+                                                                            file while selectively overlaying a small set of private pages.
+has been successfully fetched into memory, it is not usable
+                                                                               As a result, restore systems typically fall back on ineffi-
+until the kernel installs a page table entry (PTE) mapping the
+                                                                            cient workarounds. One approach, as implemented in CRIU,
+virtual address to its physical location. This happens lazily
+                                                                            is to map the file and then traverse the private pages, issu-
+and incurs a minor fault on first access, requiring a kernel
+                                                                            ing a series of costly, one-by-one system calls to update the
+trap to update the page table. For large heaps or runtime
+                                                                            corresponding PTEs. Another is to fragment what should
+data structures, thousands of such faults can accumulate
+                                                                            be a single contiguous memory region into many smaller
+quickly. Worse, if a fetched page is written to, it will incur
+                                                                            VMAs in order to isolate modified pages, which inflates ker-
+an additional fault and copy. File-backed pages are mapped
+                                                                            nel metadata and increases memory overhead, and adds to
+copy-on-write (CoW) to preserve shared page cache state.
+                                                                            restore latency [40]. Crucially, both strategies require work
+On the first write, the kernel must allocate a private copy
+                                                                            for every modified range of pages across the application’s
+and copy the original contents—an expensive operation. In
+                                                                            memory, even for regions that are unlikely to be accessed
+real-world measurements, JVM-based functions incur tens
+                                                                            again, making it impossible to apply overlays lazily or restrict
+of thousands of CoW faults during startup, contributing tens
+                                                                            them to the actual working set.
+of milliseconds of delay.
+                                                                               In the context of VM snapshots, the situation is even more
+   In virtualized environments, these fault costs become even
+                                                                            restrictive: shared memory reuse across functions is infea-
+more severe. Each fault—minor or CoW—forces a VM exit
+                                                                            sible because the hypervisor treats guest memory and disk
+to the hypervisor, incurring hundreds of cycles of latency
+                                                                            as opaque blocks of memory. This opacity prevents the host
+before fault handling can even begin. Even moderate levels of
+                                                                            from identifying and reusing file-backed pages that may
+fault activity can translate into long tail latencies for restored
+                                                                            already exist in the host’s page cache.
+functions running inside VMs like Firecracker.
+   Barriers to Efficient Memory Sharing While prefetch-                     Takeaway: Prefetching helps avoid reinstating unused mem-
+ing optimizations are important, an orthogonal and equally                  ory, but today’s kernel interfaces make it difficult to do so
+powerful strategy is to reduce the number of pages that must                efficiently. Taking advantage of cached pages is cumbersome,
+be fetched in the first place. A natural opportunity arises                 asynchronous prefetching is unreliable, and minor and CoW
+from reusing memory pages that are already resident in the                  faults — even after prefetch — add tens of milliseconds of
+OS page cache, such as those belonging to shared libraries                  delay, especially under virtualization. Meaningful improve-
+(e.g., libc) or language runtimes. Figure 5 shows that such                 ment will require new kernel mechanisms for precise, non-
+shared pages can constitute up to 50% of a function’s working               blocking memory restoration.
+set; thus, reusing them could, in principle, halve the volume
+of data that must be restored from a snapshot.                              2.3           Fork is Not a Panacea
+   Existing OS interfaces, however, provide no efficient mech-              Recent work has explored fork-based approaches [7, 10, 17,
+anism for realizing this idea. A process’s memory regions,                  41], which achieve near-zero startup latency by cloning a
+known in Linux as Virtual Memory Areas (VMAs), often con-                   warm process. Within a single machine, these systems lever-
+tain a mixture of unmodified pages (identical to their backing              age the kernel’s existing fork() mechanism to replicate
+file) and modified, private pages (unique to the process). The              process state efficiently. This operation is fast because the
+OS tracks this distinction only at the fine granularity of in-              kernel can duplicate internal data structures in place and
+dividual page table entries (PTEs), not at the coarser VMA                  relies on copy-on-write to defer actual page copies. In this
+                                                                     4
+                       Function         Guest Kernel            Other Apps             Shared                                                                JIF
+                                                                                         VM
+                                                           VM                                                                                             Metadata
+
+
+
+
+                                                                                                                                                libOS
+            60                                                                                                            User
+                                                                             VM
+Megabytes
+
+
+
+                                                                                                                         Function                       Overlay VMAs
+            40                                                  VM   VM
+                                  VM                                              VM                                                                    Private Pages
+                                                      VM
+            20              VM         VM       VM
+                  VM   VM                                                                                                                                Shared Page
+            0                                                                                                         Linux             JIF Loader          Refs
+                  hello pyaes html img json      lr   rnn cnn video json img mtml img
+                                       Python                             Node         Java
+                                                                                                     Unspecialized
+                                                                                                     Container Pool
+ Figure 5. Working set composition for VM-based and
+ process-based restore. VMs include substantial kernel-                                                                 Figure 6. Spice Overview
+ mapped memory and guest-level state, while processes bene-
+ fit from the potential of sharing 17-51% of working set pages
+ through the host page cache with other functions.                                                  itself a first-class, efficient operation. In the next section, we
+                                                                                                    introduce Spice, which addresses these structural problems
+                                                                                                    directly.
+ model, metadata restoration is essentially free: file descrip-
+ tors, mappings, and page tables are inherited wholesale from                                       3    Approach
+ the parent process rather than reconstructed.                                                      Based on the limitations of existing systems, we designed
+    These fork-based approaches are highly effective at rapid,                                      Spice, a new system that leverages novel operating system
+ horizontal scaling from a warm parent. Their design, how-                                          mechanisms for low-latency function restoration. Our design
+ ever, makes a distinction between cloning a running instance                                       is driven by the goal of minimizing end-to-end latency while
+ and restoring that first parent from a cold state. The engi-                                       maximizing resource utilization and flexibility. To achieve
+ neering focus of these systems, particularly for remote fork,                                      this balance, our approach is guided by three design goals
+ is on optimizing high-speed memory replication and cross-                                          commonly considered when optimizing cold starts:
+ node transport. The problem of efficiently instantiating the                                           1. Minimize the critical-path state by lazily deferring any
+ initial parent from persistent storage, therefore, lies outside                                            non-essential initialization.
+ their primary optimization path.                                                                       2. Amortize generic setup costs by performing all function-
+    This creates a crucial trade-off: forks provide rapid scaling                                           agnostic preparation ahead of time.
+ as long as a parent is available, but they do not address the                                          3. Maximize parallelism by overlapping I/O operations
+ cold-start latency of creating that parent. When all instances                                            with computational work during restoration.
+ have exited, these systems must fall back on slower, conven-                                          In line with these principles, we choose to operate on
+ tional methods for instantiation. Our work addresses this                                          process-level snapshots within a container rather than full
+ specific phase, focusing on an efficient cold restore that can                                     VMs, as the container is the standard unit of serverless de-
+ precede the first fork.                                                                            ployment. In addition to reducing the amount of state re-
+                                                                                                    quired to fetch at invocation time (Figure 5), this also pro-
+ 2.4             Summary of Kernel Limitations                                                      vides flexibility: our approach is effective both in bare-metal
+ Our analysis reveals that existing restore strategies, whether                                     deployments and within virtual machines, since the function
+ process- or VM-based, are fundamentally constrained by                                             is ultimately executed as a containerized process in either
+ structural limitations in modern operating systems. The core                                       environment. To amortize setup costs, our design utilizes
+ bottlenecks are twofold: process-based systems are ham-                                            a host-side pool of pre-initialized, unspecialized containers
+ pered by slow metadata reconstruction, requiring thousands                                         that are ready to be specialized, eliminating container setup
+ of expensive system calls to rebuild in-kernel state, while                                        costs from the critical path. Our model assumes fast storage
+ both approaches suffer from inefficient memory restoration,                                        is available to load the snapshot into one of these containers
+ relying on unreliable prefetching and a fault-driven process                                       quickly.
+ to populate page tables. These issues are compounded by                                               To realize these ideas, Spice introduces new OS mecha-
+ platform-specific overheads, such as scheduling interference                                       nisms to address the core challenges of slow metadata re-
+ within VMs and inefficient memory sharing in container                                             construction and inefficient memory restoration. Effectively
+ setups. Even fork-based approaches, which excel at cloning                                         addressing these issues requires first-class OS support, as
+ warm instances, must ultimately rely on these slower meth-                                         existing interfaces are designed for process creation, not
+ ods when a function is not warm in the cluster.                                                    restoration. As a full implementation would demand deep
+    Ultimately, all current designs expose the same underlying                                      changes to the Linux kernel, we built a prototype in Junc-
+ gap: today’s OS interfaces are built for incremental startup,                                      tion [14], a container system that that implements the Linux
+ not the rapid restoration of a complete process state. Closing                                     kernel interface in userspace (similar to gVisor). Its archi-
+ this gap requires new kernel mechanisms that make restore                                          tecture is ideal for rapid prototyping and offers full control
+                                                                                                5
+over the address space layout, which helps avoid the mem-              3.3    High-Performance Memory Management
+ory mapping conflicts that challenge systems like CRIU. Our            While Junction manages most of the application’s kernel
+ultimate goal is to provide a blueprint for these mechanisms,          state, the host kernel still manages page tables and memory
+hoping our results will encourage the Linux kernel com-                mappings. Spice introduces a dedicated memory manage-
+munity to adopt first-class support for high-performance               ment system in the host kernel with two primary areas of
+process restoration. Our prototype design allows us to imple-          improvement.
+ment new metadata interfaces entirely in userspace, while
+our memory management improvements are built as a mod-                 3.3.1 Optimized Prefetching. To solve the problems of
+ule in the host kernel. Figure 6 shows our system’s design,            unreliable, hint-based prefetching and fault-driven page table
+which we now describe in more detail.                                  population, we introduce a new kernel prefetching module.
+                                                                       This module leverages the layout of the JIF, which identifies
+                                                                       the predicted working set and stores all its constituent pages
+3.1   The JIF File Format                                              in a contiguous block. This design is critical for performance,
+To orchestrate the restore process, our approach relies on             as it enables the module to reliably fetch the entire working
+a new snapshot file format co-designed with our system’s               set with a single, high-throughput I/O operation, avoiding
+architecture. Inspired by the Executable and Linkable Format           the overhead of many small reads. After fetching the data, the
+(ELF) that tells an operating system how to load a program,            module pre-populates the corresponding page table entries
+we introduce the Joint Image Format (JIF). The JIF is a struc-         (PTEs), eliminating the thousands of minor faults that plague
+tured binary format that packages all the information needed           existing systems.
+to restore a process — its serialized kernel metadata, memory             The module treats memory differently based on its ex-
+pages, and layout information — into a single, self-contained          pected usage to avoid expensive copy-on-write (CoW) faults:
+file. This unified format is explicitly designed to be parsed                • Pages from the snapshot that were modified during
+efficiently, enabling Spice to handle metadata and memory                      initialization but are not written to during typical
+restoration in parallel.                                                       execution are mapped as Copy-on-Write, allowing
+                                                                               them to be shared safely.
+                                                                             • Pages that are known to be private and written to
+3.2   Efficient Metadata Restoration
+                                                                               during restore to are installed directly into writable
+The metadata section of the JIF is generated by a set of in-                   memory, bypassing the CoW mechanism entirely.
+telligent, per-subsystem serialization mechanisms. Instead
+of treating kernel state as an opaque blob, these interfaces           Leveraging the host’s page cache provides a powerful mech-
+leverage semantic knowledge of each subsystem to create                anism for accelerating frequently invoked functions. By load-
+a maximally compact representation. For example, the net-              ing pages that are mapped copy-on-write—including both
+working and IPC serializers automatically trim empty pipe              shared libraries and private, read-mostly data—into the cache,
+and socket buffers, ensuring that only essential in-flight data        the OS can retain this information even after a container is
+is saved in the snapshot.                                              torn down. This enables subsequent invocations to launch
+   This highly optimized format is key to eliminating the              rapidly from the warm cache, avoiding the significant re-
+overhead of syscall replay. Spice restores state directly from         source overhead of explicitly keeping idle container instances
+this compact binary representation, reconstructing the pro-            alive. This caching benefit does not apply to private, frequently-
+cess without replaying individual system calls. Because Junc-          written pages, whose contents are unique to a single invoca-
+tion is a userspace library operating system (libOS), the entire       tion. Spice is designed to handle this distinction, dynamically
+deserialization of this state happens within the Junction run-         choosing whether to leverage the page cache for reusable
+time, requiring no system calls or kernel transitions. This            data or restore private memory directly for writable pages
+has two key benefits:                                                  based on memory usage patterns.
+     1. No Kernel-Entry Overhead: By handling the entire               3.3.2 Sharing with Overlay VMAs. To maximize mem-
+        metadata restore as a single, batched operation within         ory sharing, we introduce a new kernel structure called an
+        userspace, we avoid the cost of thousands of individual        Overlay VMA (Figure 7). This allows Spice to efficiently re-
+        kernel crossings inherent to the syscall replay model.         store a memory region that is mostly shared but contains a
+     2. Lazy Resolution and I/O Overlap: The userspace re-             sparse set of private, modified pages. The Overlay VMA maps
+        store process can be fully overlapped with the I/O             the shared backing file and uses a compact B-tree, stored in
+        required to read the snapshot. Where possible, we de-          the JIF, as an auxiliary data structure. This B-tree serves as a
+        fer expensive operations. For example, file descriptors        sparse representation of the original page table, indicating
+        are not fully re-opened on restore; instead, they are          which pages are private, modified, or simply zero-filled; this
+        resolved lazily on their first use, avoiding costly file       encoding allows us to completely avoid storing or fetching
+        system traversals during the critical startup path.            zero pages from the snapshot.
+                                                                   6
+                                                                                       Linux VMAs
+                                                                                                      Page     Prefetcher     Page Cache
+                                                                            JIF
+                                                                                                    Table Leaf  Thread
+
+                                                   Shared              Overlay VMAs
+                                                                                                                            Consumable Pages
+
+                                                                       Private Pages                                           Page Pool
+    0xbeef000                       0xbfa0000      Private             Shared Page
+                   lib*.so                                                  Refs
+
+
+
+                Figure 7. An Overlay VMA                                    Figure 8. Spice Detailed Memory Restore Design.
+
+
+                                                                      4.2   Restore Process
+                                                                      To minimize latency, the memory module is designed to
+   When a page fault occurs within an Overlay VMA, the ker-           overlap VMA creation with prefetching. These two critical
+nel consults this B-tree to determine how to handle the fault.        tasks begin the moment a restore is initiated.
+The tree dictates whether the faulting address should be                  Instead of creating and inserting VMAs individually, Spice
+served from the private overlay in the snapshot, the shared           performs a single batch allocation. This process is acceler-
+backing file, or by mapping a new zero page. While our opti-          ated because the pre-computed B-trees for Overlay VMAs
+mized prefetching aims to prevent page faults entirely for            are stored in the JIF in a ready-to-use binary format. This
+ideal, profiled workloads, this B-tree mechanism is essen-            allows these complex structures to be directly slotted into the
+tial for guaranteeing correctness in case execution diverges.         kernel’s memory management framework, taking expensive
+This approach provides a complete solution, avoiding ad-              VMA manipulation off the critical path.
+dress space fragmentation and costly page-by-page updates                 Simultaneously, prefetching begins with an initial syn-
+without sacrificing correctness.                                      chronous I/O batch for the small set of pages the process
+                                                                      will access first. This allows execution to resume immedi-
+                                                                      ately while the bulk of the memory is fetched by a dedicated
+4     Mechanisms for Memory Restoration
+                                                                      prefetcher thread. The prefetcher thread works continuously,
+Figure 8 details the components and operation of Spice’s              interleaving new I/O requests with the installation of PTEs
+memory module, which is designed to faithfully recreate the           for the previous batch. Eagerly installing PTEs eliminates
+memory subsystem’s state as efficiently as possible. Achiev-          thousands of minor page faults and ensures pages are ready
+ing this requires deep integration with memory management             for the application just before they are needed, preventing
+to meet its primary goals: prefetching the precise working set        execution stalls.
+to restore memory contents quickly, installing page table en-             This high-throughput approach is supported by a zero
+tries upfront to avoid page faults, and efficiently preserving        page pool, which is essential for taking page allocation off
+memory sharing.                                                       the critical path. Submitting large batches of I/O requires
+                                                                      acquiring many physical pages quickly, which can exhaust
+4.1   JIF preparation                                                 fast per-core free lists and fall back to the slower global
+In an offline phase, functions are pre-warmed with multi-             allocator. The zero page pool provides a ready supply of pre-
+ple invocations to trigger operations like Just-In-Time (JIT)         allocated pages for two purposes: buffering incoming data
+compilation before a full-memory checkpoint is taken. Mem-            from the snapshot and satisfying requests for writable zero
+ory pages from file-backed mappings are compared with                 pages. This prevents the prefetcher from stalling and allows
+their backing in storage; unmodified pages are discarded              it to keep pace with the application’s memory demands.
+from the snapshot, leaving only a reference to the original
+file. Finally, Overlay VMAs are generated for each original           5     Implementation
+VMA to efficiently represent the overlay of private pages on          We implement Spice’s metadata snapshot and restore inter-
+shared mappings. The Overlay VMA trees are pre-balanced               face within Junction’s library OS [14]. Junction provides a
+and stored in a compact binary format that requires no de-            containerized environment for running unmodified Linux
+serialization at restore time.                                        binaries, offering strong isolation by handling most system
+   After the initial checkpoint is taken, the system performs         calls in userspace within a restrictive seccomp and chroot
+several invocations to compute an ordered trace of the func-          jail. While we do not use its kernel-bypass features, Junc-
+tion’s memory accesses. The trace is added to the JIF file, and       tion’s userspace management of kernel state is ideal for our
+the involved pages are relocated and placed in a contiguous           purposes. It simplifies metadata serialization and deserializa-
+range in their order of access. This layout is explicitly opti-       tion, allowing us to demonstrate the benefits of a dedicated
+mized to enable high-throughput sequential reading during             restore interface. We use the lightweight cereal library to
+restoration.                                                          generate our compact metadata representation. To aid in
+                                                                  7
+                         Warm                                            Snapshot (Working Set)
+Language   Function                                                                                                              Description
+                      Latency (𝜇s)      VMAs      Delta Intervals   Private Pages Shared Pages     Zero Pages Working Set (MB)
+            image       255,713       258 (118)   708     (253)     78426 (8378) 40,951 (1997)       (5867)        (63.4)        Rotate a JPEG
+   Java
+            mtml          5658        189 (54)    549      (99)     6310    (900)   40588 (519)         (3)         (5.6)        Matrix Multiplication
+            image        43,069       310 (216)   566     (330)     34166 (7894) 27323 (1708)        (4822)        (56.3)        Rotate a JPEG
+  NodeJS
+            json          8376        290 (163)   469     (200)     9552 (3655) 27323 (1347)           (57)        (19.8)        JSON (de)serialization
+            html         10,977       81   (30)   193      (87)     3806 (1591)     3691   (473)       (64)         (8.3)        HTML rendering
+             cnn         53,686      1912 (176)   3142    (564)     72804 (10318) 367651 (3464)       (413)        (55.4)        CNN inference
+            hello          77         48   (16)   154      (56)     1105    (168)   2405   (176)        (1)         (1.3)        A no-op function
+            image        15,476       192 (47)    328      (97)     5169 (1471)     5343   (539)       (10)         (7.9)        Rotate a JPEG
+            json          7287        154 (40)    272      (93)     5002 (1606)     3999   (492)       (22)         (8.3)        JSON (de)serialization
+  Python
+              lr          1095       1292 (98)    1751    (170)     25207 (1928) 39852 (578)           (13)         (9.8)        LR inference
+            pyaes         1667        49   (16)   157      (50)     1240    (302)   2401   (211)        (1)         (2.0)        AES encryption
+             rnn          8634        312 (57)    1437    (164)     52382 (1537) 762571 (1013)         (49)        (10.2)        RNN inference
+            video       156,751       399 (83)    726     (191)     7966 (1990) 56421 (1382)         (1137)        (17.6)        Grayscale conversion
+Table 1. Characterization of memory usage for various serverless functions. Delta intervals counts the number of contiguous
+sets of pages with modified/private application data. Values in parentheses refer to the working set, as opposed to the whole of
+the snapshot. For zero pages, only those in the working set are reported.
+
+
+
+manipulating, updating, and verifying JIF images, we built                     6     Evaluation
+jiftool in 7,400 lines of Rust.                                                We aim to evaluate Spice by answering the following ques-
+   The core memory restoration logic resides in a 4,300-line                   tions:
+Linux 6.5.0 kernel module. This module also handles work-
+ing set estimation. We found that performing this tracing                            1. How does Spice reduce end-to-end cold start latency
+in the kernel is critical for accuracy; the high overhead of                            in the context of existing snapshot/restore systems
+userspace tracing tools can stall execution and distort mem-                            (§6.1)?
+ory access patterns. To generate a stable and accurate profile,                      2. How does each technique introduced by Spice con-
+our process involves iteratively tracing multiple restores,                             tribute to reducing cold start latency (§6.2)?
+using the working set from the previous run to pre-populate                          3. How does Spice perform in response to bursts of in-
+page table entries (PTEs) for the next, thereby minimizing                              vocations (§6.3)?
+tracer-induced artifacts.
+   Our implementation includes a special network-backed                           Experimental Setup. All experiments are conducted on a
+file interface to ensure the restored function can begin use-                  machine with an Intel(R) Xeon(R) Gold 5420+ with 28 cores @
+ful work immediately. Used by per-language shims, this                         2.00GHz and 128 GB of RAM. Our storage device is a Crucial
+interface allows an invocation request to be queued and                        T705 NVMe drive with a max sequential read bandwidth
+made ready before the restore completes. The host OS moni-                     of 13,600MB/s over PCIe Gen 5.0. We run all experiments
+tors thread interaction with this interface to identify critical               from this drive and use it to store all checkpoint images and
+request-handling threads and grants them the highest sched-                    shared libraries used during function invocations. Our test
+uling priority upon restore, ensuring they execute on their                    suite includes the memory and CPU intensive functions from
+first available time slice.                                                    FunctionBench [19]. FunctionBench is originally written in
+   To minimize snapshot size, we combine application-level                     Python so we ported two functions each to Node.js and
+cooperation with OS-level optimizations. The network-backed                    Java to better capture the landscape of serverless functions.
+interface provides a channel for the OS to signal an impend-                   Table 1 summarizes the functions used to evaluate Spice.
+ing checkpoint, allowing the application to proactively per-
+form state trimming. This includes running garbage collec-                     6.1    End-to-End Latency
+tion cycles and explicitly dropping pages belonging to freed
+caches or other transient data structures.                                     To understand how Spice performs in the context of existing
+   Separately, as a part of any snapshot operation, our OS im-                 systems, we compare to existing snapshot/restore systems
+plementation pursues its own optimizations to minimize un-                     that restore checkpoints entirely from storage without re-
+necessary state. For example, it translates any MADV_FREE                      lying on any warm state. As discussed in Section 2, these
+calls (lazy memory freeing) into eager MADV_DONTNEED                           systems include VM-based systems that introduce work-
+calls to release memory immediately. Additionally, it trims                    ing set prefetching, FaaSnap [8] and REAP [38], as well as
+each thread’s stack by identifying the current stack pointer                   CRIU [3] which restores processes entirely from userspace.
+and discarding any data in the unused region above its red-                    In light of the observations made in Section 2 we augment
+zone. These complementary techniques ensure the final snap-                    the daemon responsible for executing functions in VM-based
+shot is as lean as possible.                                                   systems to run in the SCHED_FIFO scheduling class to min-
+                                                                               imize interference from other tasks running the guest and
+                                                                           8
+       300           FaaSnap*           REAP*     CRIU*            Spice           Warm                                                                   1400
+       200                                                                                                                                                1200
+       100
+
+
+
+
+                                                                                                       75
+        60                                                                                                                                                1000
+
+
+
+
+                                                                                                        53
+                                                                                                                                                           800
+
+
+
+
+                                                                                                                               43 7
+                                                                                                                                 4
+            40
+Time (ms)
+
+
+
+
+                                                                                                                                                           600
+                                                                                                                                                           400
+
+
+
+
+                                                                                                                                                                               25755
+            20
+
+
+
+
+                                                  15 8
+                                                   1
+
+
+
+
+                                                                                                                                                                               2
+                                           10 3
+
+
+
+
+                                                                                                                                                                    15660
+                                                                                    8 3
+
+
+
+
+                                                                                                                 8 2
+                                                                                                                                                           200
+                                            1
+
+
+
+
+                                                                                     1
+
+
+
+
+                                                                                                                  1
+                                                           70
+                                                            1
+
+
+
+
+                                                                                                                                                                    1
+                                                                           1.1 8
+
+
+
+
+                                                                                                                                              8
+                                                                                                                                                5
+                      0.1.9
+
+
+                                 13.7
+
+            0                                                                                                                                                0
+                       1
+
+
+
+
+                     hello      pyaes      html   img      json            lr       rnn               cnn      json           img        mtml                      video      img
+                                                          Python                                                       Node                  Java                  Python     Java
+
+       Figure 9. Spice achieves end-to-end cold start latencies significantly closer to warm invocations than existing systems.
+
+call them FaaSnap* and REAP*. Native CRIU does not im-                                           500
+plement working set estimation but instead eagerly installs                                      250
+                                                                                                  20
+all memory pages. We modified CRIU to instead use mmap                                            15           CRIU
+
+
+
+
+                                                                                          Time (ms)
+and restore memory with demand paging which lowers total                                                       Spice
+                                                                                                  10
+latency compared to fetching all of checkpointed memory.                                           5
+We refer to our modified version of CRIU as CRIU*.                                                 0
+                                                                                                            hello pyaes html img json lr            rnn cnn video json img mtml img
+   Figure 9 shows end-to-end function invocation latency                                                                            Python                         Node      Java
+using checkpoints restored entirely from storage with a cold
+page cache. Spice is able to reduce latency significantly in all                          Figure 10. OS Metadata restore time comparing CRIU to
+cases, by 4-89% compared to REAP* and 7-92% compared to                                   Spice. Spice lowers latency through a dedicated interface for
+CRIU*. We additionally compare Spice to a warm function                                   restoring OS state and compact serialization.
+invocation. A warm invocation is one of a function that
+has already been invoked several times but with cold micro-
+architectural state (CPU caches, TLB). Cold caches illustrate                             of these components without expensive the system call re-
+an invocation on an otherwise busy system where cache state                               play performed in CRIU. In CRIU, metadata restore consists
+has been polluted by other processes running on the machine.                              of replaying the system calls that executed during a cold
+With the exception of hello which does no computation,                                    start and expensive de-serialization as user-space data struc-
+Spice is 1.01-7.75× slower than a warm invocation; much                                   tures are de-serialized and injected into the kernel through
+of the added cost is due to VMA creation which cannot be                                  system calls and translated into kernel data structures. In
+parallelized with execution.                                                              Spice, the majority of metadata is held in the userspace data
+   Spice is particularly impactful for functions with short                               structures of the Junction libOS, while VMAs are recreated
+execution times, which represent the majority of functions                                in bulk through the kernel module.
+in many serverless deployments [10, 32], but also reduces                                    Figure 10 compares the metadata restore latency in CRIU
+latency for functions with long execution times. This is a                                to that of Spice, including the time to create VMAs. In all
+consequence of introducing a dedicated kernel interface –                                 cases, Spice’s metadata restore latency is significantly lower
+functions with short execution times benefit from optimiza-                               than that of CRIU, helping Spice greatly reduce restore la-
+tions with smaller absolute impact on restore latency, like                               tency.
+system call batching and Overlay VMAs, while functions                                       Memory Restore. To evaluate Spice’s improvements to
+with long execution times benefit from pre-installing PTEs                                restoring memory, including actual memory contents, we
+and the page pool. For example, video processing has a large                              measure a cold restore through our kernel module with all
+number of anonymous zero pages in its working set and can                                 optimizations disabled and incrementally enable optimiza-
+quickly retrieve a batch of free pages from the page pool for                             tions to illustrate their impact. Figure 11 shows the results
+which the prefetcher thread will install PTEs.                                            with the RNN serving function which performs inference
+                                                                                          on a small model. Each optimization contributes to an over-
+6.2              Microbenchmarks                                                          all large reduction in memory restore time. Overlay VMAs
+Metadata Restore. A key component of Spice is the addition                                reduce the number of VMAs that need to be created on re-
+of a dedicated interface for restoring OS metadata includ-                                store when restoring mappings from shared files that become
+ing threads, VMAs, file descriptor state, signal handlers, and                            fragmented when written to. For RNN serving, 1451 VMAs
+timers. Spice implements a streamlined metadata restore step                              would need to be created to overlay private/modified pages
+that leverages the Junction libOS to demonstrate restoration                              over a shared mapping. The original process has only 314
+                                                                                      9
+                    Function Execution       Metadata Restore       Memory Restore        invocations increases compared to userspace. We also find
+            25                                                                            that the addition of the page pool further reduces latency
+            20                                                                            even though it issues more I/O to read private pages that will
+Time (ms)
+
+
+
+
+            15                                                                            be written to during restore. This is likely due to avoiding
+            10                                                                            large page allocations on the critical path, leading to lower
+             5
+                                                                                          latency and more stable performance.
+             0
+
+
+
+
+                               s
+                            rm
+                             er
+                   + eline
+
+                   + MAs d
+                      VMerlay
+
+
+
+
+                             W
+
+                    Pa r
+                             ol
+
+                   Wa lel
+                                                                                          7   Related Work
+                             o
+
+
+
+
+                           Lib
+                      V che
+
+
+
+
+                          Po
+                          Co
+                         ord
+
+
+
+                        Min
+                   + s
+
+
+
+
+                         ral
+
+
+
+                        Wa
+                          A
+
+
+
+
+                      rm
+                      ge
+                        s
+                        t
+
+
+
+
+                      Pa
+                      Ov
+
+
+
+
+                       +
+                      Re
+                     Ba
+             Ba
+
+
+
+
+                      +
+
+
+
+                    +
+                 +                                                                        Remote fork. Remote fork techniques for function cloning
+
+
+                 +
+                                                                                          have been explored recently [7, 17, 41]. These systems as-
+Figure 11. Ablation study of Spice’s memory restore opti-                                 sume a function is warm in the datacenter and use hardware
+mizations on the RNN serving Python function.                                             innovations like RDMA and CXL to quickly fork a new in-
+                                                                                          stance on a different machine. We consider these approaches
+             50                                                                           to be orthogonal to ours: in the case that no root function is
+                     Userspace Only
+                     Spice (No Pool)                                                      warm in the datacenter, restoring it from disk is preferable
+             40      Spice                                                                to starting a fresh new instance.
+ Time (ms)
+
+
+
+
+             30                                                                              Sandboxing. Existing systems use lightweight VMs [4,
+             20                                                                           8, 15, 21, 38], CRIU [20, 35, 40], or containers [23, 31] for
+                                                                                          checkpoint/restore. As we discussed in Section 2, these ap-
+                   1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24
+                                    # Concurrent Restores                                 proaches suffer from performance challenges. Some systems
+                                                                                          use alternative approaches for sandboxing. Faasm [33] relies
+Figure 12. Maximum invocation latency as the number of                                    on Wasm runtime as the isolation mechanism, which offers
+concurrent invocations increases. Spice maintains lower la-                               low startup costs but higher end-to-end execution time com-
+tency compared to an optimized userspace-only baseline due                                pared to a native Linux execution due to the cost of SFI [18].
+to careful kernel optimizations and lower contention.                                     SEUSS [9] implements unikernels, tailoring their sandbox to
+                                                                                          executing a specific function. Unlike Spice, SEUSS requires
+                                                                                          backporting to support additional language runtimes, com-
+VMAs in total. While batched VMA creation reduces the                                     plicating deployment on existing FaaS platforms.
+impact of creating a large number of VMAs, Overlay VMAs                                      Prefetching. Prefetching the working set of a function to
+contribute to reducing memory restore time.                                               reduce execution time has been explored by prior work [15,
+   We see additional benefit from reordering the private                                  21, 38]. Because there has yet to be a sufficient OS interface
+working set pages in the checkpoint image to be placed in                                 for restoring and prefetching function state, these systems
+the order they will be accessed by the restored function. Re-                             suffer from additional overhead with the use of existing so-
+ordering introduces additional VMA fragmentation because                                  lutions. Spice demonstrates that these overheads are not
+adjacent page ranges in the checkpoint file that would be                                 fundamental and other systems could benefit from our de-
+mapped contiguously into a single VMA are split due to ac-                                sign, for example, by snapshotting and restoring a function
+cesses that are temporally adjacent but not spatially adjacent.                           running in Spice inside a VM if virtualization is desired.
+Reordered regions need to be re-shuffled to be adjacent again                                Avoiding cold starts. Other systems suggest approaches
+in the address space, which would necessitate one VMA per                                 for pre-warming, optimizing keep-alive policies, and con-
+region. Reordering in this case creates 3095 total intervals,                             tainer re-use to avoid cold starts [5, 12, 15, 23, 25–27, 29,
+which we avoid creating through our use of Overlay VMAs.                                  42]. Keeping sandboxes warm hurts resource elasticity, and
+                                                                                          Spice’s fast cold starts represent a step toward eliminating
+6.3               Concurrency                                                             the need for keep-alive policies. Other systems optimize the
+To see how the techniques introduced by Spice scale with                                  snapshot timing to ensure that the captured state is the func-
+bursts of invocations, we measure the maximum invocation                                  tion at its highest performance [9, 44]. Faascale [43] and
+latency in a burst of invocations of a single function from                               AFaas [10] both discuss costs associatd with VM EPT faults
+a cold page cache in three configurations: a userspace-only                               and pursue strategies to mitigate those.
+baseline that uses our metadata restore interface but restores                               Memory Deduplication. Avoiding memory duplication
+memory entirely in userspace, Spice (no pool) uses our mem-                               is key for both performance and resource utilization. Fork-
+ory restore interface with the page pool disabled so private                              based approaches naturally share memory by leveraging
+pages are prefetched through the page cache, and Spice with                               CoW semantics [6, 7, 13, 17, 28, 41]. Other systems like
+all optimizations enabled. We find that Spice is able to main-                            SEUSS [9], Medes [31], and AFaaS [10] propose explicit
+tain significantly lower latency as the number of concurrent                              strategies for de-duplicating snapshot state. SEUSS and AFaaS
+                                                                                     10
+create layered snapshot stacks to reuse shared components                process from persistent storage, fork-based systems excel
+like language runtimes. However, because these stacks re-                at cloning that warm parent at microsecond latencies for
+quire a strict lineage of changes, their mechanisms are prac-            horizontal scaling.
+tically confined to sharing a single common base, but not                   This relationship suggests a new, hybrid architecture for
+the complex, overlapping mixtures of libraries found across              function instantiation. The principles of Spice’s page-cache-
+different functions. The Medes system [31] takes a different             aware design could be extended across the network to create
+approach; it reduces the memory penalty of keep-alive con-               a distributed page cache. Such a service would maintain a
+tainers using explicit deduplication to allow more functions             rack- or cluster-wide pool of frequently-accessed memory
+to remain in a semi-warm state. In contrast, Spice aims to re-           pages from common libraries and runtimes. During a restore,
+duce the need for keep-alive policies altogether by enabling             Spice could then source required pages from this low-latency
+function state to be stored to and rapidly restored from disk.           remote memory fabric in addition to local storage, further
+   Control path optimization. While Spice focuses on the                 reducing instantiation times and improving resource utiliza-
+data path of function instantiation, significant overheads can           tion across the cluster.
+also arise from the control path, including request schedul-                Limitations and Future Work. A key next step is ex-
+ing, resource placement, and network setup. Systems like                 tending our approach to virtualized environments. While
+Dirigent, AFaaS, SigmaOS, and others have explored sophis-               our current techniques can already improve restore times
+ticated schedulers and resource managers to minimize these               inside a guest VM by reducing in-guest overheads, further
+orchestration latencies [10, 11, 24, 36, 37, 39]. These efforts          potential can be unlocked with direct host-guest cooperation.
+are orthogonal and complementary to our work. Achieving                  This could be achieved with a custom hypercall interface
+the lowest possible end-to-end latency requires a holistic               that allows the guest to eagerly request EPT population for a
+approach, combining an efficient control path with the rapid             dispersed working set. By enabling the guest to pass its pre-
+instance restoration provided by Spice.                                  dicted memory layout to the hypervisor in a single, batched
+                                                                         operation, this approach would eliminate the thousands of
+                                                                         costly VM exits typically caused by individual page faults
+8    Discussion                                                          during memory restoration.
+Our evaluation demonstrates that by co-designing a snap-                    Furthermore, while we evaluated with fast local storage,
+shot/restore system with new OS primitives, Spice can re-                our techniques could be adapted to operate over the network.
+duce cold start latency to under 5ms. These results challenge            This would enable restoring functions from remote storage
+the conventional wisdom that restoring from persistent stor-             or directly from another node’s memory, blurring the line
+age is fundamentally slow. This opens up new possibilities               between cold starts and remote fork systems and offering
+for the design of serverless platforms and raises important              greater placement flexibility in large-scale clusters.
+questions for future work.
+   Resource Management and Keep-Alive Policies. Spice’s                  9    Conclusion
+sub-5ms restore times in our prototype blur the line between             By demonstrating that cold starts from persistent storage can
+warm and cold starts, potentially altering the economics of              achieve near-warm latency, this work redefines the funda-
+serverless resource management. The primary motivation                   mental trade-offs in serverless computing. The long-accepted
+for expensive keep-alive pools—avoiding the high latency of              compromise between performance and memory elasticity
+a cold start—is significantly diminished. This enables a new             is not an inherent limitation, but an artifact of operating
+operational model where platforms can practice aggressive                systems designed for an era before serverless. Our findings
+reclamation of idle instances to boost utilization, relying on           suggest that the focus of optimization should shift from
+just-in-time instantiation from disk to meet traffic demands             user-space heuristics and keep-alive policies to first-class OS
+without a major latency penalty.                                         support for state restoration.
+   This model also unlocks new strategies for cluster-level                 Spice serves as a blueprint for this new direction. By co-
+optimization. Because Spice leverages the host page cache                designing the execution engine with the kernel, we unlock a
+for sharing, operators can create specialized node pools                 new operational model where functions can be aggressively
+dedicated to functions with similar software stacks (e.g., a             offloaded to disk to maximize density and efficiency, yet
+“Python+AI” pool). Co-locating these functions maximizes                 instantiated in milliseconds on demand. This approach opens
+the page cache hit rate for common runtimes and libraries,               avenues for future platform architectures built around just-
+which both accelerates restores and increases overall mem-               in-time, disk-based instantiation as the default, rather than
+ory density through natural deduplication.                               the exception.
+   Integration with Fork-Based Approaches. The snap-
+shot/restore model of Spice is complementary to the cloning              References
+model of fork-based scaling mechanisms [7, 13, 41]. Whereas               [1] [n. d.]. AWS Lambda. https://aws.amazon.com/pm/lambda/. Accessed:
+Spice is optimized for rapidly instantiating the initial “parent”             2025-08-20.
+                                                                    11
+ [2] [n. d.]. Azure Functions. https://azure.microsoft.com/en-us/products/              USENIX Symposium on Networked Systems Design and Implementation
+     functions. Accessed: 2025-08-20.                                                   (NSDI 24). USENIX Association, Santa Clara, CA. https://www.usenix.
+ [3] [n. d.]. CRIU: Checkpoint/Restore In Userspace. https://criu.org/Main_             org/conference/nsdi24/presentation/fried
+     Page.                                                                         [15] Alexander Fuerst and Prateek Sharma. 2021. FaasCache: keeping
+ [4] Alexandru Agache, Marc Brooker, Alexandra Iordache, Anthony                        serverless computing alive with greedy-dual caching. In Proceedings
+     Liguori, Rolf Neugebauer, Phil Piwonka, and Diana-Maria Popa. 2020.                of the 26th ACM International Conference on Architectural Support
+     Firecracker: Lightweight Virtualization for Serverless Applications.               for Programming Languages and Operating Systems (Virtual, USA)
+     In 17th USENIX Symposium on Networked Systems Design and Imple-                    (ASPLOS ’21). Association for Computing Machinery, New York, NY,
+     mentation (NSDI 20). USENIX Association, Santa Clara, CA, 419–434.                 USA, 386–400. doi:10.1145/3445814.3446757
+     https://www.usenix.org/conference/nsdi20/presentation/agache                  [16] Joseph M. Hellerstein, Jose M. Faleiro, Joseph Gonzalez, Johann
+ [5] Siddharth Agarwal, Maria A. Rodriguez, and Rajkumar Buyya. 2021.                   Schleier-Smith, Vikram Sreekanti, Alexey Tumanov, and Chenggang
+     A Reinforcement Learning Approach to Reduce Serverless Function                    Wu. 2019. Serverless Computing: One Step Forward, Two Steps
+     Cold Start Frequency. In 2021 IEEE/ACM 21st International Symposium                Back. In 9th Biennial Conference on Innovative Data Systems Research,
+     on Cluster, Cloud and Internet Computing (CCGrid). 797–803. doi:10.                CIDR 2019, Asilomar, CA, USA, January 13-16, 2019, Online Proceedings.
+     1109/CCGrid51090.2021.00097                                                        www.cidrdb.org. http://cidrdb.org/cidr2019/papers/p119-hellerstein-
+ [6] Istemi Ekin Akkus, Ruichuan Chen, Ivica Rimac, Manuel Stein, Klaus                 cidr19.pdf
+     Satzke, Andre Beck, Paarijaat Aditya, and Volker Hilt. 2018. SAND:            [17] Jialiang Huang, MingXing Zhang, Teng Ma, Zheng Liu, Sixing Lin,
+     Towards High-Performance Serverless Computing. In 2018 USENIX                      Kang Chen, Jinlei Jiang, Xia Liao, Yingdi Shan, Ning Zhang, Mengting
+     Annual Technical Conference (USENIX ATC 18). USENIX Association,                   Lu, Tao Ma, Haifeng Gong, and YongWei Wu. 2024. TrEnv: Trans-
+     Boston, MA, 923–935. https://www.usenix.org/conference/atc18/                      parently Share Serverless Execution Environments Across Different
+     presentation/akkus                                                                 Functions and Nodes. In Proceedings of the ACM SIGOPS 30th Sym-
+ [7] Chloe Alverti, Stratos Psomadakis, Burak Ocalan, Shashwat Jaiswal,                 posium on Operating Systems Principles (Austin, TX, USA) (SOSP ’24).
+     Tianyin Xu, and Josep Torrellas. 2025. CXLfork: Fast Remote Fork over              Association for Computing Machinery, New York, NY, USA, 421–437.
+     CXL Fabrics. In Proceedings of the 30th ACM International Conference               doi:10.1145/3694715.3695967
+     on Architectural Support for Programming Languages and Operating              [18] Abhinav Jangda, Bobby Powers, Emery D. Berger, and Arjun Guha.
+     Systems, Volume 2 (Rotterdam, Netherlands) (ASPLOS ’25). Association               2019. Not So Fast: Analyzing the Performance of WebAssembly vs.
+     for Computing Machinery, New York, NY, USA, 210–226. doi:10.1145/                  Native Code. In 2019 USENIX Annual Technical Conference (USENIX
+     3676641.3715988                                                                    ATC 19). USENIX Association, Renton, WA, 107–120. https://www.
+ [8] Lixiang Ao, George Porter, and Geoffrey M. Voelker. 2022. FaaSnap:                 usenix.org/conference/atc19/presentation/jangda
+     FaaS made fast using snapshot-based VMs. In Proceedings of the Sev-           [19] Jeongchul Kim and Kyungyong Lee. 2019. FunctionBench: A Suite
+     enteenth European Conference on Computer Systems (Rennes, France)                  of Workloads for Serverless Cloud Function Service. In 2019 IEEE
+     (EuroSys ’22). Association for Computing Machinery, New York, NY,                  12th International Conference on Cloud Computing (CLOUD). 502–504.
+     USA, 730–746. doi:10.1145/3492321.3524270                                          doi:10.1109/CLOUD.2019.00091
+ [9] James Cadden, Thomas Unger, Yara Awad, Han Dong, Orran Krieger,               [20] Sumer Kohli, Shreyas Kharbanda, Rodrigo Bruno, Joao Carreira, and
+     and Jonathan Appavoo. 2020. SEUSS: skip redundant paths to make                    Pedro Fonseca. 2024. Pronghorn: Effective Checkpoint Orchestration
+     serverless fast. In Proceedings of the Fifteenth European Conference               for Serverless Hot-Starts. In Proceedings of the Nineteenth European
+     on Computer Systems (Heraklion, Greece) (EuroSys ’20). Association                 Conference on Computer Systems (Athens, Greece) (EuroSys ’24). As-
+     for Computing Machinery, New York, NY, USA, Article 32, 15 pages.                  sociation for Computing Machinery, New York, NY, USA, 298–316.
+     doi:10.1145/3342195.3392698                                                        doi:10.1145/3627703.3629556
+[10] Xiaohu Chai, Tianyu Zhou, Keyang Hu, Jianfeng Tan, Tiwei Bie, Anqi            [21] Nikita Lazarev, Varun Gohil, James Tsai, Andy Anderson, Bhushan
+     Shen, Dawei Shen, Qi Xing, Shun Song, Tongkai Yang, et al. 2025.                   Chitlur, Zhiru Zhang, and Christina Delimitrou. 2024. Sabre:
+     Fork in the Road: Reflections and Optimizations for Cold Start La-                 Hardware-Accelerated Snapshot Compression for Serverless Mi-
+     tency in Production Serverless Systems. In 19th USENIX Symposium                   croVMs. In 18th USENIX Symposium on Operating Systems Design and
+     on Operating Systems Design and Implementation (OSDI 25). 199–218.                 Implementation (OSDI 24). USENIX Association, Santa Clara, CA, 1–18.
+[11] Lazar Cvetković, François Costa, Mihajlo Djokic, Michal Friedman, and              https://www.usenix.org/conference/osdi24/presentation/lazarev
+     Ana Klimovic. 2024. Dirigent: Lightweight Serverless Orchestration. In        [22] Zijun Li, Jiagan Cheng, Quan Chen, Eryu Guan, Zizheng Bian, Yi Tao,
+     Proceedings of the ACM SIGOPS 30th Symposium on Operating Systems                  Bin Zha, Qiang Wang, Weidong Han, and Minyi Guo. 2022. RunD:
+     Principles (Austin, TX, USA) (SOSP ’24). Association for Computing Ma-             A Lightweight Secure Container Runtime for High-density Deploy-
+     chinery, New York, NY, USA, 369–384. doi:10.1145/3694715.3695966                   ment and High-concurrency Startup in Serverless Computing. In 2022
+[12] Nilanjan Daw, Umesh Bellur, and Purushottam Kulkarni. 2020. Xanadu:                USENIX Annual Technical Conference (USENIX ATC 22). USENIX As-
+     Mitigating cascading cold starts in serverless function chain deploy-              sociation, Carlsbad, CA, 53–68. https://www.usenix.org/conference/
+     ments. In Proceedings of the 21st International Middleware Conference              atc22/presentation/li-zijun-rund
+     (Delft, Netherlands) (Middleware ’20). Association for Computing Ma-          [23] Zijun Li, Linsong Guo, Quan Chen, Jiagan Cheng, Chuhao Xu, Deze
+     chinery, New York, NY, USA, 356–370. doi:10.1145/3423211.3425690                   Zeng, Zhuo Song, Tao Ma, Yong Yang, Chao Li, and Minyi Guo.
+[13] Dong Du, Tianyi Yu, Yubin Xia, Binyu Zang, Guanglu Yan, Chenggang                  2022. Help Rather Than Recycle: Alleviating Cold Startup in Server-
+     Qin, Qixuan Wu, and Haibo Chen. 2020. Catalyzer: Sub-millisecond                   less Computing Through Inter-Function Container Sharing. In 2022
+     Startup for Serverless Computing with Initialization-less Booting.                 USENIX Annual Technical Conference (USENIX ATC 22). USENIX As-
+     In Proceedings of the Twenty-Fifth International Conference on Archi-              sociation, Carlsbad, CA, 69–84. https://www.usenix.org/conference/
+     tectural Support for Programming Languages and Operating Systems                   atc22/presentation/li-zijun-help
+     (Lausanne, Switzerland) (ASPLOS ’20). Association for Computing Ma-           [24] Zhen Lin, Kao-Feng Hsieh, Yu Sun, Seunghee Shin, and Hui Lu. 2021.
+     chinery, New York, NY, USA, 467–481. doi:10.1145/3373376.3378512                   FlashCube: Fast Provisioning of Serverless Functions with Stream-
+[14] Joshua Fried, Gohar Irfan Chaudhry, Enrique Saurez, Esha Choukse,                  lined Container Runtimes. In Proceedings of the 11th Workshop on
+     Inigo Goiri, Sameh Elnikety, Rodrigo Fonseca, and Adam Belay. 2024.                Programming Languages and Operating Systems (Virtual Event, Ger-
+     Making Kernel Bypass Practical for the Cloud with Junction. In 21st                many) (PLOS ’21). Association for Computing Machinery, New York,
+
+                                                                              12
+     NY, USA, 38–45. doi:10.1145/3477113.3487273                                   [35] Paulo Silva, Daniel Fireman, and Thiago Emmanuel Pereira. 2020.
+[25] David Lion, Adrian Chiu, Hailong Sun, Xin Zhuang, Nikola Grcevski,                 Prebaking Functions to Warm the Serverless Cold Start. In Proceedings
+     and Ding Yuan. 2016. Don’t Get Caught in the Cold, Warm-up Your                    of the 21st International Middleware Conference (Delft, Netherlands)
+     JVM: Understand and Eliminate JVM Warm-up Overhead in Data-                        (Middleware ’20). Association for Computing Machinery, New York,
+     Parallel Systems. In 12th USENIX Symposium on Operating Systems                    NY, USA, 1–13. doi:10.1145/3423211.3425682
+     Design and Implementation (OSDI 16). USENIX Association, Savannah,            [36] Arjun Singhvi, Arjun Balasubramanian, Kevin Houck, Mo-
+     GA, 383–400. https://www.usenix.org/conference/osdi16/technical-                   hammed Danish Shaikh, Shivaram Venkataraman, and Aditya
+     sessions/presentation/lion                                                         Akella. 2021. Atoll: A Scalable Low-Latency Serverless Platform. In
+[26] Wes Lloyd, Minh Vu, Baojia Zhang, Olaf David, and George Leavesley.                Proceedings of the ACM Symposium on Cloud Computing (Seattle, WA,
+     2018. Improving Application Migration to Serverless Computing                      USA) (SoCC ’21). Association for Computing Machinery, New York,
+     Platforms: Latency Mitigation with Keep-Alive Workloads. In 2018                   NY, USA, 138–152. doi:10.1145/3472883.3486981
+     IEEE/ACM International Conference on Utility and Cloud Computing              [37] Ariel Szekely, Adam Belay, Robert Morris, and M. Frans Kaashoek.
+     Companion (UCC Companion). 195–200. doi:10.1109/UCC-Companion.                     2024. Unifying serverless and microservice workloads with SigmaOS.
+     2018.00056                                                                         In Proceedings of the ACM SIGOPS 30th Symposium on Operating Sys-
+[27] Ashraf Mahgoub, Edgardo Barsallo Yi, Karthick Shankar, Sameh El-                   tems Principles (Austin, TX, USA) (SOSP ’24). Association for Comput-
+     nikety, Somali Chaterji, and Saurabh Bagchi. 2022. ORION and the                   ing Machinery, New York, NY, USA, 385–402. doi:10.1145/3694715.
+     Three Rights: Sizing, Bundling, and Prewarming for Serverless DAGs.                3695947
+     In 16th USENIX Symposium on Operating Systems Design and Imple-               [38] Dmitrii Ustiugov, Plamen Petrov, Marios Kogias, Edouard Bugnion,
+     mentation (OSDI 22). USENIX Association, Carlsbad, CA, 303–320.                    and Boris Grot. 2021. Benchmarking, analysis, and optimization
+     https://www.usenix.org/conference/osdi22/presentation/mahgoub                      of serverless function snapshots. In Proceedings of the 26th ACM
+[28] Edward Oakes, Leon Yang, Dennis Zhou, Kevin Houck, Tyler Harter,                   International Conference on Architectural Support for Programming
+     Andrea Arpaci-Dusseau, and Remzi Arpaci-Dusseau. 2018. SOCK:                       Languages and Operating Systems (Virtual, USA) (ASPLOS ’21). As-
+     Rapid Task Provisioning with Serverless-Optimized Containers. In                   sociation for Computing Machinery, New York, NY, USA, 559–572.
+     2018 USENIX Annual Technical Conference (USENIX ATC 18). USENIX                    doi:10.1145/3445814.3446714
+     Association, Boston, MA, 57–70. https://www.usenix.org/conference/            [39] Ao Wang, Shuai Chang, Huangshi Tian, Hongqi Wang, Haoran Yang,
+     atc18/presentation/oakes                                                           Huiba Li, Rui Du, and Yue Cheng. 2021. FaaSNet: Scalable and Fast
+[29] Rohan Basu Roy, Tirthak Patel, and Devesh Tiwari. 2022. IceBreaker:                Provisioning of Custom Serverless Container Runtimes at Alibaba
+     warming serverless functions better with heterogeneity. In Proceedings             Cloud Function Compute. In 2021 USENIX Annual Technical Conference
+     of the 27th ACM International Conference on Architectural Support for              (USENIX ATC 21). USENIX Association, 443–457. https://www.usenix.
+     Programming Languages and Operating Systems (Lausanne, Switzer-                    org/conference/atc21/presentation/wang-ao
+     land) (ASPLOS ’22). Association for Computing Machinery, New York,            [40] Kai-Ting Amy Wang, Rayson Ho, and Peng Wu. 2019. Replayable Ex-
+     NY, USA, 753–767. doi:10.1145/3503222.3507750                                      ecution Optimized for Page Sharing for a Managed Runtime Environ-
+[30] Alireza Sahraei, Soteris Demetriou, Amirali Sobhgol, Haoran Zhang,                 ment. In Proceedings of the Fourteenth EuroSys Conference 2019 (Dres-
+     Abhigna Nagaraja, Neeraj Pathak, Girish Joshi, Carla Souza, Bo Huang,              den, Germany) (EuroSys ’19). Association for Computing Machinery,
+     Wyatt Cook, Andrii Golovei, Pradeep Venkat, Andrew Mcfague, Dim-                   New York, NY, USA, Article 39, 16 pages. doi:10.1145/3302424.3303978
+     itrios Skarlatos, Vipul Patel, Ravinder Thind, Ernesto Gonzalez, Yun          [41] Xingda Wei, Fangming Lu, Tianxia Wang, Jinyu Gu, Yuhan Yang,
+     Jin, and Chunqiang Tang. 2023. XFaaS: Hyperscale and Low Cost                      Rong Chen, and Haibo Chen. 2023. No Provisioned Concurrency: Fast
+     Serverless Functions at Meta. In Proceedings of the 29th Symposium                 RDMA-codesigned Remote Fork for Serverless Computing. In 17th
+     on Operating Systems Principles (Koblenz, Germany) (SOSP ’23). As-                 USENIX Symposium on Operating Systems Design and Implementation
+     sociation for Computing Machinery, New York, NY, USA, 231–246.                     (OSDI 23). USENIX Association, Boston, MA, 497–517. https://www.
+     doi:10.1145/3600006.3613155                                                        usenix.org/conference/osdi23/presentation/wei-rdma
+[31] Divyanshu Saxena, Tao Ji, Arjun Singhvi, Junaid Khalid, and Aditya            [42] Hanfei Yu, Rohan Basu Roy, Christian Fontenot, Devesh Tiwari, Jian
+     Akella. 2022. Memory deduplication for serverless computing with                   Li, Hong Zhang, Hao Wang, and Seung-Jong Park. 2024. Rainbow-
+     Medes. In Proceedings of the Seventeenth European Conference on Com-               Cake: Mitigating Cold-starts in Serverless with Layer-wise Container
+     puter Systems (Rennes, France) (EuroSys ’22). Association for Comput-              Caching and Sharing. In Proceedings of the 29th ACM International
+     ing Machinery, New York, NY, USA, 714–729. doi:10.1145/3492321.                    Conference on Architectural Support for Programming Languages and
+     3524272                                                                            Operating Systems, Volume 1 (La Jolla, CA, USA) (ASPLOS ’24). As-
+[32] Mohammad Shahrad, Rodrigo Fonseca, Inigo Goiri, Gohar Chaudhry,                    sociation for Computing Machinery, New York, NY, USA, 335–350.
+     Paul Batum, Jason Cooke, Eduardo Laureano, Colby Tresness, Mark                    doi:10.1145/3617232.3624871
+     Russinovich, and Ricardo Bianchini. 2020. Serverless in the Wild:             [43] Xinmin Zhang, Qiang He, Hao Fan, and Song Wu. 2024. Faascale: Scal-
+     Characterizing and Optimizing the Serverless Workload at a Large                   ing MicroVM Vertically for Serverless Computing with Memory Elas-
+     Cloud Provider. In 2020 USENIX Annual Technical Conference (USENIX                 ticity. In Proceedings of the 2024 ACM Symposium on Cloud Computing
+     ATC 20). USENIX Association, 205–218. https://www.usenix.org/                      (Redmond, WA, USA) (SoCC ’24). Association for Computing Machin-
+     conference/atc20/presentation/shahrad                                              ery, New York, NY, USA, 196–212. doi:10.1145/3698038.3698512
+[33] Simon Shillaker and Peter Pietzuch. 2020. FAASM: lightweight iso-             [44] Yifei Zhang, Tianxiao Gu, Xiaolin Zheng, Lei Yu, Wei Kuai, and San-
+     lation for efficient stateful serverless computing. In Proceedings of              hong Li. 2021. Towards a Serverless Java Runtime. In 2021 36th
+     the 2020 USENIX Conference on Usenix Annual Technical Conference                   IEEE/ACM International Conference on Automated Software Engineering
+     (USENIX ATC’20). USENIX Association, USA, Article 28, 15 pages.                    (ASE). 1156–1160. doi:10.1109/ASE51524.2021.9678709
+[34] Wonseok Shin, Wook-Hee Kim, and Changwoo Min. 2022. Fireworks:
+     a fast, efficient, and safe serverless framework using VM-level post-
+     JIT snapshot. In Proceedings of the Seventeenth European Conference
+     on Computer Systems (Rennes, France) (EuroSys ’22). Association for
+     Computing Machinery, New York, NY, USA, 663–677. doi:10.1145/
+     3492321.3519581
+
+                                                                              13
+

@@ -1,0 +1,1356 @@
+                                             Async-fork: Mitigating Query Latency Spikes Incurred by the
+                                                 Fork-based Snapshot Mechanism from the OS Level
+                                             ∗ Pu Pang1,2 , ∗ Gang Deng2 , Kaihao Bai1,2 , Quan Chen1 , Shixuan Sun3 , Bo Liu1 , Yu Xu2 , Hongbo Yao2 ,
+
+                                                Zhengheng Wang2 , Xiyu Wang2 , Zheng Liu2 , Zhuo Song1,2 , Yong Yang2 , Tao Ma2 , Minyi Guo1
+                                                                 1 Department of Computer Science and Engineering, Shanghai Jiao Tong University, China
+                                                                                                                 2 Alibaba Group, China
+                                                                                                 3 National University of Singapore, Singapore
+
+                                                           {avengerispp,asbaikaihao,chen-quan,boliu98,myguo}@sjtu.edu.cn,sunsx@comp.nus.edu.sg
+                                                 {denggang.dg,qiyu.xy,yuanzhi.yhb,zhengheng.wzh,xiyu.wxy,wenqing.lz,songzhuo.sz,boyu.mt}@alibaba-inc.com
+arXiv:2301.05861v1 [cs.DB] 14 Jan 2023
+
+
+
+
+                                         ABSTRACT                                                                               speed. For example, Memcached [49], Redis [42], KeyDB [25] and
+                                         In-memory key-value stores (IMKVSes) serve many online applica-                        their variants [7, 12, 19, 24] have been deployed in production
+                                         tions because of their efficiency. To support data backup, popular                     environments of big internet companies such as Facebook, Amazon
+                                         industrial IMKVSes periodically take a point-in-time snapshot of                       and Twitter. As all data resides in memory, the data persistent
+                                         the in-memory data with the system call fork. However, this mech-                      function is a key feature of IMKVSes for data backup.
+                                         anism can result in latency spikes for queries arriving during the                         A common data persistent approach is to take a point-in-time
+                                         snapshot period because fork leads the engine into the kernel mode                     snapshot of the in-memory data with the system call fork and dump
+                                         in which the engine is out-of-service for queries. In contrast to                      the snapshot into the file system. Figure 1(a) gives an example of the
+                                         existing research focusing on optimizing snapshot algorithms, we                       fork-based snapshot method. In the beginning, the storage engine
+                                         optimize the fork operation to address the latency spikes problem                      (the parent process) invokes fork to create a child process. As fork
+                                         from the operating system (OS) level, while keeping the data per-                      creates a new process by duplicating the parent process, the child
+                                         sistent mechanism in IMKVSes unchanged. Specifically, we first                         process will hold the same data as the parent. Thus, we can ask
+                                         conduct an in-depth study to reveal the impact of the fork operation                   the child process to write the data into a file in the background but
+                                         as well as the optimization techniques on query latency. Based on                      keep the parent process continuous processing queries. Although
+                                         findings in the study, we propose Async-fork to offload the work of                    the storage engine delegates the heavy IO task to the child process,
+                                         copying the page table from the engine (the parent process) to the                     the fork-based snapshot method can incur latency spikes [32, 52].
+                                         child process as copying the page table dominates the execution                        Specifically, queries arriving during the period of taking a snapshot
+                                         time of fork. To keep data consistent between the parent and the                       (from the start of fork to the end of persisting data) can have a long
+                                         child, we design the proactive synchronization strategy. Async-fork                    latency because the storage engine runs into the kernel mode and
+                                         is implemented in the Linux kernel and deployed into the online                        is out-of-service for queries. For example, the query arrives in time
+                                         Redis database in public clouds. Our experiment results show that                      𝑇0 in Figure 1(a). For brevity, queries arriving during the period
+                                         compared with the default fork method in OS, Async-fork reduces                        of taking a snapshot are called snapshot queries, while the others
+                                         the tail latency of queries arriving during the snapshot period by                     are called normal queries. In general, IMKVSes take a snapshot
+                                         81.76% on an 8GB instance and 99.84% on a 64GB instance.                               periodically (e.g., Redis by default takes a snapshot every 60 seconds
+                                                                                                                                if at least 10000 records are modified [47, 59]). Consequently, latency
+                                         PVLDB Reference Format:                                                                spikes for snapshot queries are not rare.
+                                         ∗ Pu Pang1,2 , ∗ Gang Deng2 , Kaihao Bai1,2 , Quan Chen1 , Shixuan Sun3 , Bo
+                                                                                                                                    To solve the problem, researchers proposed a variety of snap-
+                                         Liu1 , Yu Xu2 , Hongbo Yao2 , Zhengheng Wang2 , Xiyu Wang2 , Zheng Liu2 ,              shot algorithms such as Copy-on-Update [10, 33], Zigzag [11] and
+                                         Zhuo Song1,2 , Yong Yang2 , Tao Ma2 , Minyi Guo1 . Async-fork: Mitigating              Ping-Pong [11]. These algorithms focus on lowering the cost of
+                                         Query Latency Spikes Incurred by the Fork-based Snapshot Mechanism
+                                                                                                                                taking a snapshot by optimizing the occasion of copying data and
+                                         from the OS Level. PVLDB, 16(5): XXX-XXX, 2023.
+                                                                                                                                reducing the amount of data copied. However, a recent study [32]
+                                         doi:XX.XX/XXX.XX
+                                                                                                                                finds that the performance of the fork-based method is generally
+                                                                                                                                competitive with these advanced methods, and even outperforms
+                                         1    INTRODUCTION
+                                                                                                                                them for write-intensive workloads. Additionally, the implementa-
+                                         In-memory key-value stores (IMKVSes) are widely used in real-                          tion of the fork-based method is very simple and requires a small
+                                         world applications, especially online services (e.g., e-commerce                       engineering effort. As such, industrial IMKVSes do not adopt these
+                                         and social network), because of their ultra-fast query processing                      snapshot algorithms from academia and keep the fork-based as the
+                                         ∗ These authors contributed equally to this work.                                      built-in data persistent approach. As a result, IMKVSes still have
+                                         This work is licensed under the Creative Commons BY-NC-ND 4.0 International            latency spikes caused by the fork operation, which can harm the
+                                         License. Visit https://creativecommons.org/licenses/by-nc-nd/4.0/ to view a copy of
+                                         this license. For any use beyond those covered by this license, obtain permission by
+                                                                                                                                service quality of online applications.
+                                         emailing info@vldb.org. Copyright is held by the owner/author(s). Publication rights       In contrast to existing research focusing on optimizing snapshot
+                                         licensed to the VLDB Endowment.                                                        algorithms, we propose a straightforward approach to address the
+                                         Proceedings of the VLDB Endowment, Vol. 16, No. 5 ISSN 2150-8097.
+                                         doi:XX.XX/XXX.XX                                                                       problem. Specifically, we optimize the fork operation to reduce the
+                                                                                                                                long latency incurred by the fork-based snapshot from the operating
+                                                                                                                             Query       Query
+         Copy Metadata Except for Page Table   Copy Page Table       Handle Query       Persist Data     Kernel Mode                                      Latency
+                                                                                                                             Arrive     Response
+
+
+       Query                                            Query                                                 Query
+                    T0       T1
+      Invoke Fork                                      Invoke Fork                                           Invoke Fork
+      Parent                                           Parent                                                Parent
+                                                                                                                                 Proactively
+                                                                                                                                 Synchronize
+       Child                                            Child                                                 Child
+
+
+                         (a) Default Fork                            (b) SPT-based Fork                                    (c) Proposed Async-fork
+
+Figure 1: The workflow of the parent and child process with (a) default fork, (b) shared page table (SPT)-based fork, (c) the
+proposed Async-fork in the snapshot procedure.
+
+system (OS) level, while keeping the data persistent mechanism in                   these entries must have been copied to the child process and the
+IMKVSes unchanged.                                                                  parent process will directly modify them. In this way, the proactive
+    We first conduct an in-depth study to reveal the impact of the                  synchronization technique keeps the snapshot consistent and re-
+fork operation on query latency. Our profiling results on the default               duces the number of interruptions to the parent process compared
+fork operation show that the overhead of fork results in a long                     with SPT-based fork. Additionally, we parallelize the copy operation
+tail latency (up to hundreds of milliseconds) for snapshot queries,                 of the child process to further accelerate Async-fork.
+and copying the page table dominates the execution time of fork.                       We implement Async-fork in the Linux kernel (both x86 and
+This motivates us to further investigate the impact of advanced                     ARM64). Async-fork is integrated into the OS and transparent
+techniques [14, 15, 18, 35, 59] that can accelerate the fork operation.             to IMKVSes. The technique is also deployed in the online Redis
+We consider two optimization strategies, the huge page [14, 15] and                 databases in public Clouds1 . Despite that, we conduct experiments
+the shared page table [18, 35, 59]. As the huge page can degrade                    on our local machine for the purpose of test flexibility. In the ex-
+the performance of IMKVSes [28, 44], our profiling only involves                    periments, we select two popular IMKVSes, Redis and KeyDB, and
+the shared page table-based fork (SPT-based fork) [59], which is the                use the Redis benchmark [41] and Memtier benchmark [46]. The
+latest method. The SPT-based fork proposed to share the page table                  database instance size is varied from 1GB, 2GB, and 4GB . . . to 64GB.
+between the parent process and the child process in a copy-on-write                 Although the SPT-based fork [59] may lead to data leakage, our
+(CoW) manner to reduce the cost of the fork operation. However,                     experiment involves this method for comparison purposes because
+the CoW can frequently interrupt the parent process as shown in                     of its efficiency. For Redis, our experiment results show that 1) com-
+Figure 1(b). Our profiling results show that frequent interruption                  pared with the default fork, Async-fork reduces the 99%-ile latency
+can incur non-negligible overhead for snapshot queries although                     of snapshot queries by 17.57% (from 0.074ms to 0.061ms) on 1GB
+the SPT-based fork significantly reduces the tail latency compared                  instance, 81.76% (from 0.435ms to 0.079ms) on 8GB instance and
+with the default fork operation. Moreover, our analysis finds that                  99.84% (from 991.9ms to 1.5ms) on 64GB instance; and 2) compared
+the shared page table introduces the data leakage vulnerability,                    with the latest SPT-based fork, Async-fork reduces the 99%-ile la-
+which potentially leads to an inconsistent snapshot. Thus, both the                 tency of snapshot queries by 2.87% on 1GB instance, 39.73% on 8GB
+huge table and shared page table techniques cannot be applied in                    instance and 61.97% on 64GB instance. We obtain similar results
+this scenario.                                                                      on KeyDB. These results demonstrate the efficacy of the technique
+    Motivated by these findings, we propose Async-fork to mitigate                  proposed in this paper, especially for the large instances that can
+the latency spikes for snapshot queries by optimizing the fork                      lead to long latency.
+operation. Figure 1(c) demonstrates the general idea. As copying                       In summary, we make the following contributions in this paper.
+the page table dominates the cost of the fork operation, Async-                          • We conduct an in-depth study of the impact of the fork
+fork offloads this workload from the parent process to the child                            operations on the latency of snapshot queries in IMKVSes.
+process to reduce the duration that the parent process runs into the                     • We propose Async-fork that can mitigate the long latency
+kernel mode. This design also ensures that both the parent and child                        of snapshot queries from the OS level, which is orthogonal
+processes have an exclusive page table to avoid the data leakage                            to existing research on the problem.
+vulnerability caused by the shared page table.                                           • The technique is implemented in the Linux kernel (both x86
+    However, it is far from trivial to achieve in design since the                          and ARM64) and deployed in the online Redis database in
+asynchronization operations of the two processes on the page table                          public clouds.
+can result in an inconsistent snapshot, i.e., the parent process may                     • We conduct extensive experiments with Redis and KeyDB
+modify the page table, while the copy operation of the child process                        to evaluate the efficacy of the proposed techniques.
+is in process. To address the problem, we design the proactive syn-
+chronization technique. This technique enables the parent process                   2    BACKGROUND
+to detect all modifications (including that triggered by either users
+                                                                                    In this section, we first introduce the preliminaries and then discuss
+or OS) to the page table. If the parent process detects that some
+                                                                                    the related work.
+page table entries will be modified and these entries are not copied,
+                                                                                    1 https://www.alibabacloud.com/product/apsaradb-for-redis.     Last    accessed   on
+then it will proactively copy them to the child process. Otherwise,
+                                                                                    2022/11/13.
+                                                                                       copy of the page. In a word, benefiting from CoW, fork copies the
+                   Virtual Memory Space                                     Physical   metadata only.
+                                                                            Memory
+         VMA0                    VMA1                         VMA2                        Use Cases of fork in Database. Fork has a number of database
+                                                                             Space
+                                                                                       use cases because it can easily and efficiently create a snapshot of
+        PGD            PUD                 PMD                 PTE           Page      in-memory data, the consistency of which is guaranteed by the OS.
+        Level          Level               Level               Level
+                                                                                       In general, these cases can be categorized into two classes based on
+                   0xffffffc900000000           PMD0            PTE0
+
+                   0xfffffff600000000           PMD1            PTE1
+                                                                                       the usage of the snapshot. First, use fork to delegate dedicated tasks,
+           ...             ...                   ...              ...                  which have expensive IO or computation costs, to a child process
+                                                                PTE2
+                                                                                       without blocking the service of the parent process. MDC [40] uses
+                                 A PUD table
+                                 contains 512                   PTE3                   fork to record checkpoints for in-memory databases. Redis uses
+                                                                                       fork to conduct log rewriting [45] that optimizes the Append Only
+                                 PUD entries
+       Page Table ...                                             ...
+       Multi-level Radix Tree                          Correspond to VMA0
+                                                                                       File (AOF). FlurryDB [36] proposes to create replica based on fork
+         Figure 2: The organization of the page table.                                 in distributed environments. Second, use fork to create snapshots
+                                                                                       to support concurrent transaction processing because fork provides
+                                                                                       the snapshot isolation between processes. HyPer [30] proposes to
+                                                                                       evaluate hybrid OLTP and OLAP queries based on snapshots created
+2.1    Preliminary                                                                     by fork. AnKer [50] designs a fine-grained snapshot mechanism
+We first briefly review two operating system concepts, virtual mem-                    to support MVCC. In particular, AnKer takes a partial snapshot
+ory and fork that are closely related to this work. As our technique                   of in-memory data by co-designing the database engine and the
+is implemented and deployed in Linux, we introduce these concepts                      system call fork. Different from our research on accelerating the
+in the context of Linux. Then, we discuss the use cases of fork in                     fork operation from the OS level, AnKer focuses on optimizing
+databases.                                                                             which in-memory data should be captured by the snapshot.
+    Virtual Memory. As an effective approach to managing hard-                            All these use cases can potentially benefit from Async-fork be-
+ware memory resources, virtual memory is widely used in modern                         cause 1) they can encounter the query latency spike problem in-
+operating systems. A process has its own virtual memory space,                         curred by the fork operation; and 2) Async-fork can accelerate the
+which is organized into a set of virtual memory areas (VMA). Each                      snapshot creation. This paper focuses on the scenario that uses
+VMA describes a continuous area in the virtual memory space. The                       fork to take a point-in-time snapshot of in-memory data to persist
+page table is the data structure used to map the virtual memory                        the data [27, 45]. In particular, the storage engine calls fork to cre-
+space to the physical memory. It consists of a collection of page                      ate a child process that holds the same data as it. Then, the child
+table entries (PTE), each of which maintains the virtual-to-physical                   process writes the data to the hard drive, while the storage engine
+address translation information and access permissions. A VMA                          can continue to serve users’ queries. Although the storage engine
+corresponds to multiple PTEs.                                                          delegates the data dump task to the child process, it will be out-of-
+    Figure 2 shows an example of the page table. To reduce the                         service for queries during the invocation of fork because it runs
+memory cost, the page table is stored as a multi-level radix tree                      into the kernel mode. We are particularly interested in this scenario
+in which PTEs locate in leaf nodes (i.e., PTE Level in Figure 2).                      because the IMKVS is one of the most important services in public
+The part in the area marked with the dashed line corresponds to                        cloud and popular IMKVSes (e.g., Redis and KeyDB) [51] use this
+VMA0 . The tree at most has five levels. From top to bottom, they                      mechanism to persist data. Consequently, these stores encounter
+are the page global directory (PGD) level, the P4D level, the page                     serious a query latency spike problem (see Section 3), while they
+upper directory (PUD) level, the page middle directory (PMD) level                     are generally used in mission-critical applications that have a rigid
+and the PTE level. As P4D is generally disabled, we focus on the                       latency constraint. We also evaluate the effectiveness of Async-fork
+other four levels in this paper. Except for the PTE level, an entry                    on log rewriting in Redis [45]. The experiment results are presented
+stores the physical address of a page while this page is used as the                   in the technical report [2].
+next-level node (table). With the page size setting to 4KB, a table in                    Remarks. Instead of developing a general-purpose solution to
+each level contains 512 entries. Given a VMA, “VMA’s PTEs” refers                      replace the default fork in the OS, the goal of Async-fork is to
+to the PTEs corresponding to the VMA and “VMA’s PMDs” is the                           provide an efficient fork operation for the scenarios (especially for
+set of PMD entries that are parents of these PTEs in the tree. For                     IMKVSes) where 1) the applications are memory-intensive, and 2)
+example, PMD0 and PMD1 belong to VMA0 ’s PMDs in Figure 2.                             the parent process is latency-sensitive. Our design allows Async-
+    Fork Operation. Fork is a system call that creates a new process                   fork and the default fork to run in parallel in the OS. Users can
+by duplicating the calling process [1]. Both processes have sepa-                      easily choose the fork method used in applications (see Section 5.2).
+rate memory spaces. The new (resp. calling) process is called the
+child (resp. parent) process. To accelerate the operation, Linux im-
+plements fork with the copy-on-write (CoW) strategy. Specifically,                     2.2    Related Work
+while invoking fork, the parent process runs in the kernel mode                        Consistent snapshot is essential for in-memory databases to sup-
+and copies the metadata (e.g, VMAs, the page table, file descriptors,                  port backup and disaster recovery [5, 17, 32, 56]. Some consistent
+and signals) to the child process. The PTEs of both parent and child                   snapshot mechanisms have been proposed to trade off throughput,
+are set to write-protected. After that, the process that first modifies                latency, and memory footprint [9–11, 32, 33]. Naive snapshot [9]
+a write-protected page triggers a page fault, which leads to the                       blocked the storage engine until a deep copy of all the in-memory
+data is created, which is not suitable for IMKVSes in which the                                                                    I R U N                  F R S \ B S D J H B U D Q J H
+                                                                                                                                                                                                                
+
+
+
+
+                                                                            ( [ H F X W L R Q  7 L P H   P V 
+latency is critical. There are also some non-blocking snapshot mech-
+anisms. Copy-on-Update [10, 33] proposed to create a shadow copy
+
+
+
+
+                                                                                                                                                                                                                      3 U R S R U W L R Q 
+of the in-memory data; the storage engine is free to access any data                                                                                                                                        
+but create a deep copy when updates it for the first time. Note that,
+the fork-based snapshot is a Copy-on-Update variant that leverages                                                                                                                                             
+the operating system. Some other mechanisms used multi-version                                                         
+concurrency control (MVCC) [8] to keep multiple versions of in-                                                                                                                                
+memory data. Zigzag [11] maintained another untouched copy of
+                                                                                                                                                   5 H G L V  , Q V W D Q F H  6 L ] H   * % 
+the in-memory data and introduced metadata bits to indicate which       Figure 3: The execution time of fork and the percentage of
+copy the store engine should read from or write to. Based on Zigzag,    the time of copying the page table in fork.
+Ping-Pong [11] maintained three versions of the data to lower the
+cost of managing metadata bits. Hourglass and Piggyback [32] were
+                                                                        the response. In the experiment, we enhance the benchmark by
+developed by combining Zigzag and Ping-Pong.
+                                                                        generating queries in the open-loop mode [48, 58]. This enhance-
+    Although fork-based snapshot results in long latency during
+                                                                        ment sends commands to the server without waiting for replies to
+snapshot process, popular industrial IMKVSes (Redis and KeyDB)
+                                                                        previous queries to simulate real-world environments. The database
+still adopts fork-based snapshot for two reasons: 1) fork provides a
+                                                                        instance size is varied from 1GB to 64GB. By default, Redis takes
+simple engineering implementation for consistent snapshot, while
+                                                                        one snapshot per 60 seconds if at least 10000 keys changed. In order
+it requires great efforts to integrate the above approaches into the
+                                                                        to measure the impact of the fork operation accurately, we execute
+IMKVS. 2) None of the above approaches completely outperform the
+                                                                        the BGSAVE command to trigger the operation of taking a snapshot.
+fork-based snapshot in write-intensive workloads [32]. For example,
+                                                                        We classify queries into two groups, normal and snapshot, based
+Ping-Pong and Hourglass can mitigate the latency spikes, while
+                                                                        on their arrival time. The snapshot queries are the queries arriving
+Ping-Pong incurs 3x memory footprint and Hourglass results in
+                                                                        during the period of taking the snapshot (i.e., from the invocation
+higher latency during normal operation. This work resolves the
+                                                                        of fork until the end of persisting the in-memory data), while the
+latency spikes of the fork-based snapshot, while keeping its original
+                                                                        others are normal queries. We measure the 99%-ile (p99) latency and
+superiorities.
+                                                                        the maximum latency of normal and snapshot queries, respectively.
+    Previous work [33, 40] noted that the memory footprint increases
+                                                                        The two latencies greatly impact user experiences and are often
+during snapshot process due to the CoW strategy. MDC [40] pro-
+                                                                        used to measure the performance of user-facing databases [29, 32].
+posed to release the pages that have been persisted as soon as pos-
+                                                                        We repeat each experiment five times and report the average value.
+sible. AnKer [50] introduced a fine-grained version of fork to take
+partial snapshot when databases do not need to persist all the data.
+CCoW [23] optimized the CoW mechanism based on the spatial              3.1                                         Performance of fork for Taking a Snapshot
+locality of memory access. It prioritizes the copy for high-locality    Figure 3 presents the execution time of fork and the time of copying
+memory regions to improve the performance on write-intensive            the page table in the fork operation. We can see that the execution
+workloads. Async-fork is orthogonal and complementary to them.          time grows roughly linearly with the instance size increasing from
+    There is also other approach to persist data in IMKVSes. Redis      1GB to 64GB. The 1GB instance takes less than 10 ms, while the
+and KeyDB use Append Only File (AOF) [27, 45] to log every write        64GB instance takes more than 600 ms. We can also see that the time
+operation received by the storage engine, that will be played again     of the page table copy dominates the execution time. Particularly,
+after the database reboots to reconstruct the original dataset. The     the copy operation takes over 97% percentage of the execution time
+snapshot and AOF are complementary, and it is recommended to            on all test cases and up to 99.93% percentage on the 64 GB instance.
+enable both of them simultaneously in IMKVSes.                          Without loss of generality, we measure the detailed metrics of
+                                                                        copying the page table on the 8 GB instance to further study the
+                                                                        copy operation.
+3   MOTIVATION                                                             In the experiment, the page table of the 8GB instance has one
+In this section, we present our profiling results to demonstrate        PGD entry, eight PUDs, 212 PMDs and 221 PTEs. Overall, fork copies
+the impact of the fork operation on the query latency. We first         the table level-by-level from top to bottom along the radix tree. The
+evaluate the performance of fork for taking the snapshot to pinpoint    copy of one PGD/PUD/PMD entry requires to apply for a page to
+the key performance factors. We then reveal the impact of the           store its children and initialize the page. The operation takes around
+fork operation on query latency. In addition to the default fork in     500 ns. Thus, the copy of the 212 PMDs takes around 2 ms, while
+Linux, our profiling involves the state-of-the-art approach [59] of     the overhead of copying PGDs and PUDs is trivial because there are
+optimizing the fork operation. Lastly, we summarize our findings        only a few entries. The rest time (around 70 ms) is spent on copying
+according to the profiling results.                                     PTEs. Based on the results, we have the following observation.
+   Profiling Setting. We use Redis benchmark [41] to study the             Observation 1. For the fork operation, the execution time dramat-
+performance in the experiments. The detailed configuration of the       ically grows with the instance size increasing, and the page table copy
+test machine is introduced in Section 6.1. The experiment reports       dominates the cost. For the page table copy, the overhead of copying
+the latency of a query, that is the elapsed time between the time       PGDs and PUDs is trivial, while that of copying PMDs and PTEs is
+point that the client issues the query and that the client receives     non-negligible.
+Table 1: Migrating a page from “X” to “Y” when the parent
+and child process share the page table.                                  manner. Specifically, the fork operation returns immediately after
+      Step    Operation       Parent(P)    Child(C)                      copying the metadata except for the page table. The page table will
+                             TLB: V → X TLB: V → X                       be copied in a CoW manner. However, we find that the shared page
+        1   Initial state
+                             PTE: V → X PTE: V → X                       table design introduces the data leakage problem, the working set
+            P: Set PTE →     TLB: V → X TLB: V → X                       size estimation problem and the NUMA problem. First, the inconsis-
+        2
+            None present     PTE: V → N PTE: V → N                       tency between the shared page table and the translation lookaside
+                             TLB: N/A    TLB: V → X                      buffer (TLB) of the child process can lead to the data leakage prob-
+        3   P: Flush TLB
+                             PTE: V → N PTE: V → N                       lem. Second, we cannot accurately estimate the working set size,
+            C: Skipped       TLB: N/A    TLB: V → X                      which indicates the memory usage of each process and is important
+        4
+            because N!=X     PTE: V → N PTE: V → N                       for cloud resource management [57]. This is because the usage
+                             TLB: N/A    TLB: V → X                      is calculated based on the states in the page table [21], while the
+        5   P: Update PTE                                                table is shared by multiple processes. Third, the shared page table
+                             PTE: V → Y PTE: V → Y
+                             TLB: V → Y TLB: V → X                       and the corresponding processes can locate on different NUMA
+        6   P&C: Access V                                                nodes, which increases the TLB miss overhead [4, 38]. Moreover,
+                             PTE: V → Y PTE: V → Y
+                                                                         the NUMA balance mechanism cannot work as expected due to the
+                                                                         shared page table. Due to space limit, we discuss the working set
+3.2    Impact of Fork Operations on Latency                              size problem and the NUMA problem in the technical report [2]. In
+We reveal the impact of the fork operation on the query latency          the following, we use the example in Table 1 to demonstrate the
+in this subsection. Before presenting the results, we first introduce    data leakage problem, which is the most serious one among the
+existing optimization approaches to the fork operation.                  three problems. We also write a test program2 to reproduce the
+   Huge Page [14, 15]. In the operating system (OS), we can increase     example in practice.
+the page size to reduce the number of pages used by a process,              TLB is the hardware to accelerate the translation from a virtual
+for example, setting the page size to 2MB instead of 4KB. The            address to a physical address by caching recent translation results.
+large page size can reduce the number of PTEs and accelerate             Initially, the virtual address “V” is mapped to the physical address
+the fork operation. However, previous study found that the page          “X” in PTE and the mapping is cached in TLB. Note that PTE is
+fault latency can increase from 3.6𝜇𝑠 to 378𝜇𝑠 after enabling huge       shared between parent and child, whereas the two processes have
+page because compacting and zeroing memory in the page fault             their own TLB entries. Suppose that the memory management
+incurs higher overhead on huge page than that on regular page [31].      mechanism (e.g., memory compaction [6, 53], swap [55] and NUMA
+Moreover, Redis consumes much more memory space after enabling           balance [54]) of OS mitigates the page from “X” to a new page frame
+the huge page because applications do not always fully utilize the       “Y” in the parent process. Then, OS sets the mapping from “V->X”
+big page (e.g., in the experiment of [31], the memory consumption        to “V->N” (None Present) to indicate that the mapping is invalid
+of Redis increased from 12.2GB to 20.7GB). Additionally, allocating      in Step 2 and flushes the parent’s TLB entry in Step 3. For other
+huge page can lead to many fragments in the physical memory              processes, the OS loops over each of them to check whether its
+because it requires consecutive physical memory areas to build           PTEs contain "V->X"; if so then set the value to "V->N" and flush the
+a huge page. Consequently, the kernel needs to perform a heavy           TLB; otherwise, skip the process. This works well if each process
+defragment operation which leads to high CPU utilization [39]. The       has a private page table. However, ODF uses the shared page table
+experiment of [39] shows that the benchmark milc in SPEC CPU             design. When the OS checks the child process, the PTE has been set
+2006 spends 343 seconds (37% of its overall execution time) in kernel    to "V->N" in the parent process because the PTE is shared between
+mode to perform the defragment operation when the memory is              the parent and child processes and therefore the OS cannot find
+highly fragmented.                                                       any PTE with the value "V->X" in the child process. Thus, the OS
+   Consequently, huge page is recommended to be disabled in many         skips the update to the child in Step 4. In Step 5, the parent updates
+databases (e.g., Couchbase, MongoDB, KeyDB and Redis [16, 28, 37,        PTE to map “V” to “Y”. Although PTE has the correct mapping, the
+44]). In particular, two No-SQL databases, Couchbase and MongoDB,        child’s TLB entry is inconsistent with PTE. Consequently, the future
+recommend users to disable the technique because huge page per-          access to “V” in the child can lead to a data leakage problem. Despite
+forms poorly with random memory accesses in workloads [16, 37].          that, we study the performance of the shared page table-based fork
+KeyDB and Redis, which are two IMKVSes, recommend users to               in our experiments for comparison purposes. As ODF [59] is the
+disable huge page because the technique can incur a big latency          latest work and the only one that is publicly available3 among the
+penalty and big memory usage [28, 44]. Specifically, if we enable        methods [18, 35, 59] adopting the shared page table design, our
+the huge page, the parent and child processes share huge pages           experiments focus on ODF.
+after calling fork to persist on disk. In a busy instance, a few event      Experiment Results. Figures 4 and 5 present the 99%-ile la-
+loops in either of the two processes will cause to target thousands      tency and the maximum latency of normal queries and snapshot
+of pages and trigger the copy operation of a large amount of process     queries, respectively. Snapshot-ODF denotes the results of using
+memory because of the copy-on-write mechanism in OS. Conse-              the On-Demand-Fork [59] to take the snapshot, which is the lat-
+quently, this leads to a big latency and a big memory usage. As          est shared page table-based fork method. Snapshot-DEF denotes
+such, our profiling does not involve this technique.
+   Shared Page Table [18, 35, 59]. This technique proposed to share      2 https://doi.org/10.5281/zenodo.7189585, Last accessed on 2022/11/13.
+
+the page table between parent and child in a copy-on-write (CoW)         3 https://github.com/rssys/on-demand-fork, Last accessed on 2022/11/13.
+                                 Normal        Snapshot-ODF   Snapshot-DEF          Page Table & Pages
+                           103
+   99%-ile Latency (ms)
+
+                                                                                    PTE0       ( k0, v0 ) Page0    2                   1        PTE0      ( k0, v0 ) Page0
+
+                           102
+                                                                                                                  OS NUMA       User Sets
+                                                                                    PTE1                                                        PTE1
+                                                                                               ( k1, v1 ) Page1    Balance      ( k2, v2 )                ( k1, v1 ) Page1
+                                                                                    PTE2                                                        PTE2
+
+                           101
+                                                                                    PTE3       Null                                             PTE3      ( k2, v2 ) Page2
+
+                                                                                                      T0 T1                      T2        T3
+                           100
+                                                                                                                                                Handle query
+                                                                                       Parent
+                          10 1
+                                 1        2     4     8 16 32            64                Child
+                                           Redis Instance Size (GB)                                       Copy PTEs                               Persist data
+Figure 4: The 99%-ile latencies of normal queries and snap-                         PTE0       Null        PTE0         ( k0, v0 ) Page0        PTE0      ( k0, v0 ) Page0
+shot queries in Redis.                                                              PTE1       Null        PTE1
+                                                                                                                             Copying ...
+                                                                                                                                                PTE1
+                                                                                                                                                          ( k1, v1 ) Page1
+                                                                                    PTE2       Null        PTE2                                 PTE2
+                                                                                    PTE3                   PTE3         Null                    PTE3      ( k2, v2 ) Page2
+                                 Normal        Snapshot-ODF   Snapshot-DEF
+   Maximum Latency (ms)
+
+
+
+
+                             3
+                           10
+                                                                                                                             3 Out of
+                                                                                                                              memory
+
+
+                           102                                                                Figure 6: The challenges in Async-fork.
+
+                           101                                                in IMKVSes. As IMKVSes have a rigid requirement on the latency
+                           100                                                to serve online scenarios, a high-performance fork is required to
+                                                                              reduce the long latency of snapshot queries.
+                          10 1   1        2     4     8 16 32            64
+                                           Redis Instance Size (GB)           4     DESIGN OF ASYNC-FORK
+Figure 5: The maximum latencies of normal queries and                         In this section, we introduce the design of Async-fork, an operating
+snapshot queries in Redis.                                                    system-based solution that effectively reduces the long latency of
+                                                                              snapshot queries without incurring extra vulnerabilities.
+the results of using the default fork in Linux. As shown in the
+figures, the latency of normal queries slightly increases with the            4.1      General Idea
+instance size varying from 1GB to 64GB. In contrast, the value of             Figure 1(c) shows the general idea of Async-fork. While the parent
+snapshot queries grows sharply. The shared page table technique               process is responsible to copy page tables during snapshot in the
+dramatically reduces the latency of the default fork, especially for          default fork, as shown in the figure, Async-fork offloads the work
+the large instance. For example, on the 64GB instance size, the               of copying page table to the idle child process while keeping other
+optimization reduces the 99%-ile latency from 911.95ms to 3.96ms              steps in the fork unchanged. In this way, the parent process is
+and the maximum latency from 1204.78ms to 59.28ms. The latency                able to handle queries while the child process copies the page table
+of Snapshot-ODF is higher than that of Normal because the CoW                 from the parent process simultaneously. However, it is non-trivial to
+of the page table frequently interrupts the engine process. For ex-           achieve the design of Async-fork, as a snapshot may be inconsistent
+ample, the engine process is interrupted over 7000 times on the               due to the asynchronous operations on the page table.
+16GB instance, which leads to frequent out-of-service for queries.               The inconsistency happens when the parent process modifies a
+According to the analysis of existing optimization methods and the            PTE before the child process has copied it. Take Figure 6 as an ex-
+experiment results, we have the following observation.                        ample. The IMKVS takes a snapshot at time T0 , and the in-memory
+   Observation 2. The fork operation has a significant impact on              data is {(𝑘 0, 𝑣 0 ), (𝑘 1, 𝑣 1 )}. Suppose a user query that sets a new KV
+the latency of snapshot queries, and the tail latency of the default          pair (𝑘 2, 𝑣 2 ) arrives at time T2 (① in Figure 6), and the child process
+function is up to hundreds of milliseconds. Although the shared page          is copying PTEs from time T1 to T3 . The parent process handles
+table technique reduces the latency of the default fork operation, the        this query, and PTE2 is modified to point to a new page (Page2 ) that
+overhead incurred by frequent interruptions is non-negligible and the         contains (𝑘 2, 𝑣 2 ). If the child process has not copied the original
+shared page table introduces the potential data leakage problem.              PTE2 before the modification, it would copy the modified PTE2 , and
+                                                                              owns the new pair (𝑘 2, 𝑣 2 ) in its memory space. In this way, the
+3.3                       Summary                                             data (𝑘 2, 𝑣 2 ) is persisted, and inconsistency happens (the key-value
+Based on the observations, we find that copying the page table dom-           pair (𝑘 2, 𝑣 2 ) does not exist when the snapshot is taken at time 𝑇0 ).
+inates the execution time of the default fork in Linux, especially, for          Async-fork resolves the above inconsistency problem by using
+large instances. The overhead of fork results in a long latency (up to        the parent process to proactively synchronize the modified PTEs to
+hundreds of milliseconds) for queries issued during the invocation            the child process. We explain the detailed steps in Section 4.2. Two
+of fork. Although several optimization methods [14, 15, 18, 35, 59]           main challenges have to be resolved in this solution.
+of the fork operation have been proposed, they either lead to poor               Firstly, it is necessary to detect all the PTE modifications. How-
+performance of IMKVSes, or have a data leakage problem, which                 ever, besides of the user operations, many inherent memory man-
+potentially generates an inconsistent snapshot. Thus, these opti-             agement operations in the operating system also cause PTE modi-
+mizations cannot be used in the fork-based snapshot mechanism                 fications. For instance, the OS periodically migrates pages among
+ Algorithm 1: The framework of Async-fork
+   // The parent process
+                                                                                                           P-VMA0       P-VMA1           P-VMA2                  Parent
+ 1 for each VMA𝑖 in (VMA0 , VMA1 , VMA2 ...) do
+                                                                                                           PGD      PUD          PMD                PTE Operation of Parent
+ 2      Copy VMA𝑖 to child process;
+ 3      Copy VMA𝑖 ’s PGDs/PUDs to child process;
+                                                                                                           Level    Level        Level              Level
+                                                                                                                               PMD0 | RW=1
+ 4      Set all VMA𝑖 ’s PMDs to be write-protected;                                                                                                  RW=0
+
+
+
+
+                                                                                         Two-way Pointer
+ 5 end                                                                                                                         PMD1 | RW=0           RW=0
+
+ 6 Put the child process on a CPU to run it;
+ 7 while true do                                                                                                               PMD2 | RW=1           RW=1
+
+ 8      if PTE modification is detected and this PTE’s PMD is write-protected then                                             PMD3 | RW=0           RW=1
+ 9           Copy PMD to child process;
+10           Copy 512 PTEs of this PMD to child process;                                                     Parent                                  PTE 0
+                                                                                                                                  Parent             RW=0
+11           Set the PMD to be writeable;                                                                   Copies to          Modifies a PTE        PTE 1
+
+12           Set the 512 PTEs to be write-protected;                                                         Child                                   RW=0
+                                                                                                                        Parent Proactively Synchronizes
+13      end
+14 end
+                                                                                                                                  PMD0               RW=0         Child
+   // The child process
+                                                                                                                                                     RW=0       Copies from
+15 for each VMA𝑖 in (VMA0 , VMA1 , VMA2 ...) do
+16      for each PMD 𝑗 of VMA𝑖 do                                                                                                                    Null
+                                                                                                                                                                  Parent
+17           if PMD 𝑗 is write-protected then                                                                                     PMD2               PTE 0
+18                Copy PMD 𝑗 from parent process;                                                                                                    RW=0
+                                                                                                                                                     PTE 1
+19                Copy 512 PTEs of PMD 𝑗 from parent process;                                                                                        RW=0
+
+20                Set the PMD to be writeable;                                                                                               Null
+                                                                                                                                                             Operation of Child
+21                Set the 512 PTEs to be write-protected;
+22           end
+                                                                                                           C-VMA0       C-VMA1           C-VMA2                    Child
+23      end
+24 end
+                                                                                     Figure 7: An example of copying page table in Async-fork.
+                                                                                     “RW=1” represents writable and “RW=0” represents write-
+                                                                                     protected.
+
+NUMA nodes [54], causing the involved PTEs to be modified as                         then traverses the VMAs, and copies PMD entries and PTEs from
+inaccessible (② in Figure 6). We describe the method to detect the                   the parent process. Figure 7 shows an example of the asynchronous
+PTE modifications in Section 4.3.                                                    page table copy. In the figure, the PGD/PUD entries have been
+   Secondly, errors may occur during Async-fork. For instance, the                   copied by the parent process, but PMD entries and PTEs have not
+child process may fail to copy an entry due to out of memory (③                      yet (some PMD entries point to “null”). The child process copies
+in Figure 6). In this case, error handling is necessary, as we should                PMD entries and PTEs from the parent process (e.g., PMD0 and its
+restore the process to the state before it calls Async-fork. We present              PTEs).
+how errors are handled in Section 4.4.                                                  We offload the work of copying PMD entries and PTEs to the
+   By resolving the above challenges, the time of the parent process                 child process because the overhead of copying them is non-negligible,
+used on fork is greatly reduced, and the latency of the snapshot                     as analyzed in Section 3.1. Meanwhile, we keep that the parent pro-
+queries can be reduced in consequence. Moreover, after the child                     cess copies PGD/PUD entries. This is because the overhead of copy-
+process finishes copying the page table, the two processes have                      ing PGD/PUD entries is trivial, and it is more robust to minimize
+their complete private page table. Therefore, the Async-fork does                    the change to the Linux kernel.
+not introduce the data leakage vulnerability.                                           Synchronizing Modified PTEs Proactively. When the child
+   In the following sections, we use the terminology in x86 Linux to                 process is responsible for copying PMD entries and PTEs, it is
+explain our design. We also implement Async-fork on Arm Linux                        possible that the PTEs are modified by the parent process before
+using similar ideas, while similar results are achieved compared                     they are actually copied. Note that only the parent process is aware
+with x86. Algorithm 1 describes how the parent process (Line 1 to                    of the modifications (the way to detect the PTE modification will
+14) and the child process (Line 15 to 24) work in Async-fork.                        be introduced in Section 4.3).
+                                                                                        In general, there are two ways to copy the to-be-modified PTEs
+4.2     Proactive Synchronization                                                    for the consistency. 1) the parent process proactively copies the
+Before introducing the proactive synchronization in detail, we first                 PTEs to the child process; 2) the parent process notifies the child
+introduce how we offload the work of copying page table to the                       process to copy the PTEs and waits until the copying is finished.
+child process in Async-fork.                                                         As both ways result in the same interruption in the parent process,
+   Copying Page Table Asynchronously. In the default fork, the                       we choose the former way (Lines 8 to 12 in Algorithm 1).
+parent process traverses all its VMAs and copies the corresponding                      More specifically, when a PTE is modified during snapshot, the
+parts of the page table to the child process. The page table is copied               parent process copies not only this PTE but also all the other PTEs
+from top to bottom. In Async-fork, the parent process roughly                        of a same PTE table (512 PTEs in total), as well as the parent PMD
+follows the above process, but only copies PGD, P4D (if exists) and                  entry to the child process proactively. For instance, when PTE1 in
+PUD entries to the child process (Lines 1 to 3 in Algorithm 1). After                Figure 7 is modified, the parent process proactively copies PMD2 ,
+that, the child process starts to run, and the parent process returns                PTE0 and PTE1 to the child process. We choose to copy the entire
+to the user mode to handle queries (Lines 7 to 14). The child process                PTE table because we can quickly detect a range of PTEs that will
+be modified, but accurately identifying which one will be modified      where operations in the OS modify VMAs/PTEs as checkpoints in
+is expensive in practice.                                               the technical report [2].
+   Eliminating Unnecessary Synchronizations. Always letting                We implement the detection by hooking the checkpoints. Once
+the parent process copy the modified PTEs is unnecessary, as it is      a checkpoint is reached, the parent process checks whether the
+possible that the to-be-modified PTEs have already been copied by       involved PMD entries and PTEs have been copied (by checking the
+the child process. We identify if the PMD entries and PTEs have         R/W flag of the PMD entry). For a VMA-wide modification, all the
+been copied by the child process, to avoid unnecessary synchro-         PMD entries of this VMA are checked, while only one PMD entry is
+nizations. A flag is required to track this status. We reuse the R/W    checked for a PMD-wide modification. The uncopied PMD entries
+flag of the PMD entry to record the status. Since the R/W flag is       and PTEs will be copied to the child process before modifying them.
+only used when the PMD entry points to a huge page in the x86              If a VMA is large, the parent process may take a relatively long
+Linux kernel, the flag tracks the status correctly. We reuse the R/W    time to check all PMD/PTE entries by looping over each of them.
+flag because 1) this design can avoid adding new fields to the kernel   We therefore introduce a two-way pointer, which helps the parent
+data structures; and 2) the popular databases (e.g., Redis, KeyDB,      process quickly determine whether all entries of a VMA have been
+MongoDB, and Couchbase) recommend disabling the huge page to            copied to the child, to reduce the cost. Each VMA has a two-way
+improve the performance [16, 28, 37, 44]. Additionally, it is unnec-    pointer, which is initialized by the parent process during the invo-
+essary to use Async-fork if applications use the huge page because      cation of the Async-fork function. The pointer in the VMA of the
+the applications with huge page do not require PTEs but a small         parent process (resp. the child process) points to the corresponding
+number of PGD/PUD/PMD entries (i.e., the page table is small).          VMA of the child process (resp. the parent process). In this way,
+   An alternative approach is to use an unused bit in the struct        the two-way pointer maintains a connection between the VMAs
+page as the flag. Specifically, each PMD entry points to a PTE table,   of the parent and the child. The connection will be closed after all
+while OS maintains a data structure (struct page) for each PTE table.   PMDs/PTEs of the VMA are copied to the child. Specifically, if no
+The struct page has bits that are not used by the current Linux         VMA-wide modification happens during the copy of PMDs/PTEs
+kernel. Previous research uses these bits as flags, for example, ODF    of the VMA, then the child closes the connection by setting the
+uses some bits in struct page as a reference counter. However, this     pointers in the VMAs of both the parent and child to null after
+approach requires further modification to the kernel to initialize      the copy operation. Otherwise, the parent will synchronize the
+the bit. Therefore, we do not adopt the design using the struct page.   modification (i.e., copying the uncopied PMDs/PTEs to the child),
+   If a PMD entry and its 512 PTEs have not been copied to the          and close the connection by setting the pointers to null after the
+child process, the PMD entry will be set as write-protected (e.g.,      copy operation. As both parent and child processes can access the
+PMD1 in Figure 7). Note that, it does not break the CoW strategy        two-way pointers, the pointers are protected by locks to keep the
+of fork since it still triggers the page fault when the corresponding   state consistent. When a VMA-wide modification occurs, the par-
+page is written on x86 [22]. Once the PMD/PTEs have been copied         ent process can quickly determine whether all PMDs/PTEs of a
+to the child process (e.g., PMD0 ), the PMD entry is changed to be      VMA have been copied to the child by checking the pointer’s value,
+writable (the PTEs are changed to be write-protected to maintain        instead of looping over all these PMDs. Besides, the pointer is also
+the CoW strategy). Since both parent and child processes lock the       used in handling errors (see Section 4.4).
+page of the PTE table with trylock_page() when they are copying
+PMD entries and PTEs, they will not copy PTEs pointed by the
+same PMD entry at the same time.                                        4.4    Handling Errors
+                                                                        Since copying the page table involves memory allocation, some
+                                                                        errors may occur during both the default fork and Async-fork. For
+4.3    Detecting Modified PTEs                                          instance, a process may fail to initialize a new PTE table due to out
+The operations that modify PTEs in the OS can be divided into           of memory. Such error may only happen in the parent process in the
+two categories: 1) VMA-wide modification. Some operations act on        default fork and has a standard way to handle the error. However,
+specific VMAs, including creating, merging, deleting VMAs and so        the copying of page table is offloaded to the child process in Async-
+on. The modification of a VMA may also cause the VMA’s PTEs be          fork, such error may happen in the child process, and a method is
+modified. For example, the user sends queries to delete lots of KV      required to handle such errors. Specifically, we should restore the
+pairs. The IMKVS (parent process) then reclaims the corresponding       parent process to the state before it calls Async-fork, to ensure that
+virtual memory space by munmap. Some VMAs are hence split or            the parent process will not crash in the future.
+deleted while the VMAs’ PTEs are deleted as well. A VMA is usually          As Async-fork may modify the R/W flags of the PMD entries
+large because the operating system always tends to merge adjacent       of the parent process, we roll back these entries to be writable
+VMAs. It means that the VMA-wide modification usually causes            when errors occur in Async-fork. Errors may occur 1) when the
+extensive PTE modifications, while many VMA’s PMD entries are           parent process copies PGD/PUD entries, 2) when the child process
+involved. 2) PMD-wide modification. Other operations modify the         copies PMD/PTEs, and 3) during a proactive synchronization. In
+PTE directly. For example, the page of parent process can be re-        the first case, the parent process rolls back all the write-protected
+claimed by the out of memory (OOM) killer. In this case, one PMD        PMD entries. In the second case, the child process rolls back all
+entry is involved. Note that swapping or migrating a 4KB page           the remaining uncopied PMD entries. After that, we send a signal
+will change the PTE but the data will not be changed, so we will        (SIGKILL) to the child process. The child process will be killed when
+not handle it. Due to limited space, we summarize the locations         it returns to the user mode and receive the signal. In the third case,
+the parent process only rolls back the PMD entries of the VMA
+                                                                            Parent                                    Kernel Mode                    User Mode
+containing the PMD entry that is being copied. The purpose is to                         copy_page_range( )
+avoid contending for the PMD entry lock with the child process.                                                      wake_up_new_task( )              if (fork( )!=0)
+                                                                                                                                                      { // parent
+An error code is then stored into the two-way pointer of the VMA.             fork(2)
+                                                                                                                             vma_merge( )               mmap(2);
+Before (and after) copying PMDs/PTEs of a VMA, the child process                                                             F>0            F == 0      ...
+                                                                                           hook(FAST)
+                                                                                                                            hook(SLOW)                }
+will check the pointer to see whether there are errors. If so, then
+it stops copying PMD/PTE entries immediately and performs the
+                                                                                               ret_ from_ fork
+                                                                            Child                                               F == 0                   if (fork( )==0)
+                                                                                               schedule_tail( )
+rollback operations that are already described in the second case.                                                                                       { // child
+                                                                                                                                                           ….
+                                                                                                                            hook(SLOW)
+                                                                                                                                                         }
+
+5     OPTIMIZATION AND IMPLEMENTATION                                        Async-fork                     hook( )
+In this section, we present the optimization that further improves            Module              FAST                    SLOW
+
+the performance of Async-fork, and the way to implement Async-                            (1) Copy PGD & PUD
+                                                                                          entries
+                                                                                                                   (1) Copy PMD&PTEs
+                                                                                                                   (2) Set PMD entries to
+fork in Linux.                                                                            (2) Set PMD entries to
+                                                                                          be write-protected
+                                                                                                                   be writable
+                                                                                                                   (3) Set PTEs to be
+                                                                                                                   write-protected
+
+5.1    Accelerating Page Table Copy                                                Figure 8: The implementation of Async-fork.
+The parent process is still interrupted when a proactive PTE syn-
+chronization is triggered. A straightforward way to reduce the cost       “Fast” flag. At the end of Async-fork’s invocation, the parent process
+of the proactive PTE synchronization is to let the child process to       puts the child process into the runqueue of a CPU and returns to
+first copy the PTEs potentially modified before other PTEs. How-          the user mode. Before the child process returns to the user mode,
+ever, this method is not practical because the data accessed by           it copies the page table using the function with “Slow” flag. The
+user queries are relatively random and the child process cannot           parent process proactively copies the uncopied PMD/PTEs (using
+determine which PTEs will be modified when the parent invokes             the function with “Fast” flag) to the child process before modifying
+Async-fork. We therefore propose to minimize the number of proac-         them.
+tive PTE synchronizations by reducing the duration of copying the             Flexibility. For the IMKVS workload that has small memory
+page table.                                                               footprint, the page table copy is already short. In this case, Async-
+   As VMAs are independent, the kernel threads can totally per-           fork brings small benefit. For these workloads, we provide an inter-
+form the copy in parallel and obtain near-linear speedup. There-          face in memory cgroup to control whether Async-fork is enabled
+fore, the child process may launch multiple kernel threads to copy        (as well as the number of kernel threads used to speed up copying
+PMD/PTEs in multiple VMAs in parallel, so that the copy completes         PMD/PTEs in the child process). Specifically, when users add a pro-
+faster. It can effectively reduce the number of proactive PTE syn-        cess to a memory cgroup, they can pass a parameter to enable/disable
+chronization because the synchronization only happens during the          Async-fork at run time (i.e., the parameter F in Figure 8). As shown
+period that the child process is copying PMD/PTEs. The probability        in the figure, if the parameter value is 0, then the process will use
+of triggering a proactive PTE synchronization gets lower when the         the default fork. Otherwise, Async-fork is enabled. As such, users
+period becomes shorter. The experiment in Section 6.3 shows the           can determine which fork operation the process uses as necessary
+efficiency of this optimization.                                          and use Async-fork without any modification in the source code of
+   Multiple kernel threads consume CPU cycles. These threads              applications. The process will use the default fork if no parameter
+periodically check whether they should be preempted and give up           is passed in.
+CPU resources by calling cond_resched(), in order to reduce the               Memory overhead. The only memory overhead of Async-fork
+interference on other normal processes.                                   comes from the added pointer (8B) in each VMA of a process. In
+                                                                          the case, the memory overhead in a process is the number of VMAs
+5.2    Implementation of Async-fork                                       times 8𝐵. Considering a machine with 512GB main memory while
+Figure 8 shows the implementation of Async-fork with a modu-              400 processes run simultaneously, there are roughly 760,000 VMAs
+lar design. We encapsulate the code ingested to the kernel into a         according to our statistics. In this case, the memory overhead will
+hook function, which is instantiated in a kernel module. We can in-       be 760000×8B ≈ 6MB. This overhead is generally negligible.
+sert/remove the module in/from the kernel as necessary. The hook              Support for ARM64. The design of Async-fork can also be
+function is inserted to the call path of default fork and memory          implemented on ARM64. Specifically, we use the APTable[1:0] [34]
+subsystem in the Linux kernel (version 4.19). Users can determine         in the table descriptor of the PMD entry as the R/W flag. Async-
+the usage of the default fork and Async-fork with the parameter 𝐹 .       fork can also be implemented on other architectures that support
+   The hook function is enhanced from copy_page_range(), which            hierarchical attributes in the page table.
+accepts a flag (Fast or Slow) to control the copying of the page table.       Consecutive Snapshots. It is possible that the parent process
+ With “Fast” flag, the function copies PGD/PUD entries and sets           starts the next snapshot using Async-fork before the previous child
+PMD entries to be write-protected. With “Slow” flag, the function         process finishes copying PMD/PTEs, as the parent process returns
+copies the write-protected PMD entries and PTEs; when the copying         to the user mode before the child process. In the current implemen-
+finishes, it sets the PMD entries to be writable and sets the PTEs to     tation, we will not block the next Async-fork call but keep a VMA’s
+be write-protected. When Async-fork is called, the parent process         page table be copied by only one child process at any time. When
+copies the page table to the child process using the function with        the parent process copies a VMA to the child process, it checks the
+two-way pointer to identify whether there exists a previous child
+
+
+
+
+                                                                              99%-ile Latency (ms)
+
+
+
+
+                                                                                                                                                    99%-ile Latency (ms)
+                                                                                                                        Async-fork                                                      Async-fork
+
+process copying the page table of this VMA. If exists, it proactively                                10
+                                                                                                              0
+                                                                                                                        ODF                                                             ODF
+
+copies the whole page table of this VMA to the previous child pro-                                                                                                         10
+                                                                                                                                                                                0
+
+
+cess. Async-fork adopts this design because supporting concurrent                                         −1
+                                                                                                     10
+fork operations need to track all child processes that are copying
+                                                                                                                  1     2 4 8 16 32 64                                              1 2 4 8 16 32 64
+page tables. This is hard because the kernel does not provide the                                                     Redis Instance Size (GB)                                       KeyDB Instance Size (GB)
+information and we need to inject new data structures into the                                       Figure 9: The 99%-ile latency of snapshot queries.
+kernel to record the states and synchronize these child processes.
+   As Async-fork cannot support concurrent fork operations in a
+
+
+
+
+                                                                              Maximum Latency (ms)
+
+
+
+
+                                                                                                                                                 Maximum Latency (ms)
+process (the same as the default fork in the OS), Async-fork cannot                                                    Async-fork
+                                                                                                                       ODF
+                                                                                                                                                                                        Async-fork
+                                                                                                                                                                                        ODF
+support the cases where the parent process needs to conduct the
+fork operation in an ultra-high frequency (e.g., in milliseconds).                                        1                                                                     1
+                                                                                                     10                                                                    10
+In spite of the limitation, Async-fork works well for database use
+cases because a storage engine does not create many child processes                                               1     2 4 8 16 32 64                                              1   2    4   8   16   32   64
+from the parent process simultaneously in practice. Specifically,                                                     Redis Instance Size (GB)                                      KeyDB Instance Size (GB)
+
+conducting the fork operation frequently leads the parent to fre-             Figure 10: The maximum latency of snapshot queries.
+quently turn into the kernel mode, which hurts the service quality.
+Moreover, many processes executing in parallel will degrade the
+                                                                           results are reported. 4) In Async-fork, the child process launches
+performance due to the resource contention (e.g., IO bandwidth
+                                                                           7 additional kernel threads (together with the child process itself,
+and CPU resources). Therefore, IMKVSes (e.g., Redis and KeyDB)
+                                                                           there are 8 threads in total) to help it copy PMDs/PTEs faster. Our
+do not recommend ultra-frequent data snapshots (generally 60 sec-
+                                                                           experiment in Figure 14 shows that Async-fork still outperforms the
+onds [47]) and have no cases requiring the parent process to invoke
+                                                                           state-of-the-art solution with a single child process. 5) The KeyDB
+Async-fork in milliseconds to our knowledge. For HyPer, which
+                                                                           server is configured with 4 threads.
+uses the fork operation to support concurrent transaction process-
+                                                                              Metrics. We launch a large number of queries (5 × 106 ) to the
+ing, Async-fork can work well. This is because the parent process
+                                                                           IMKVS and record the latency of the queries that arrive in the
+handles OLTP (a single updater) that has a rigid requirement on the
+                                                                           snapshot process (start from the parent process calls fork until the
+latency, whereas the child process executes OLAP which generally
+                                                                           child process persists all in-memory data). Specifically, we measure
+has a long execution time and is more tolerant of the latency than
+                                                                           the 99%-ile latency because latency-sensitive services generally
+OLTP. Moreover, HyPer notices the cost of the fork operation and
+                                                                           provide an SLA on some percentile. Moreover, we report the maxi-
+designs a novel mechanism, which makes multiple OLAP queries
+                                                                           mum latency because IMKVS is often used for demanding use cases
+to share a snapshot, to improve the performance.
+                                                                           that have a rigid requirement for the worst-case latency [43]. For
+                                                                           example, the increase of the maximum latency of Redis can lead
+6     EVALUATION                                                           to read error on connections [52]. Therefore, in the production
+In this section, we evaluate the effectiveness of Async-fork.              environment [20], the maximum latency is an important indicator
+                                                                           of system stability. Due to limited space, we report the experiment
+6.1    Experimental Setup                                                  results of query processing throughput and total out-of-service
+                                                                           time of the parent process in the technical report [2]. In the report,
+We evaluate Async-fork on a machine with two Intel Xeon Platinum
+                                                                           we also discuss the method of tuning IMKVSes to further improve
+8163 processors, each of them has 24 physical cores (48 logical cores).
+                                                                           the performance.
+The machine has 384GB memory, and 1TB NVMe hard drive. In
+                                                                              Baselines. We compare Async-fork with On-Demand-Fork (de-
+terms of software setup, the experimental platform runs CentOS
+                                                                           noted by ODF in short) [59], the state-of-the-art shared page table-
+7.9 with Linux 4.19. Except for the experiments in Section 6.4, all
+                                                                           based fork. In ODF, each time a shared PTE is modified by a process,
+the other experiments are conducted within a single machine as
+                                                                           not only one PTE but 512 PTEs located on the same PTE table will
+described above.
+                                                                           be copied at the same time. We do not report the results of the
+   Benchmarks. We use Redis (version 5.0.10) [42] and KeyDB
+                                                                           default fork in this section since it results in 10X higher latency
+(version 6.2.0) [25] compiled with gcc 6.5.1 as the representative
+                                                                           compared with both Async-fork and ODF in most cases (already
+IMKVS servers, and use Redis benchmark [41] as well as Memtier
+                                                                           presented in Section 3.2). To accurately measure the performance of
+benchmark [46] to be the workload generators. The benchmarks
+                                                                           the IMKVSes in the experiments, we trigger the snapshot operation
+reveal the scenario where multiple clients send requests to the
+                                                                           manually using the BGSAVE command.
+IMKVS server simultaneously. Similar to prior work [13], we en-
+hance Redis benchmark to generate queries in an open-loop mode
+for measuring the latency accurately [48, 58].                             6.2                        Overall Evaluation
+   By default, the experiments are conducted with the following            We first evaluate Async-fork using write-intensive workloads that
+settings: 1) 50 clients (default settings) are used in Redis benchmark,    require frequent snapshots for data persistence.
+while 50 clients are used in Memtier benchmark for consistency. 2)            Latency Results. In this experiment, we use the Redis bench-
+The key range is set to 2×108 , the key size of 8B and the value size of   mark [41] to generate the write-intensive workload by issuing SET
+1024B. 3) Each experiment is repeated by five times and the average        queries to the IMKVSes, and configure the clients to send 50,000
+                               Async-fork       ODF                                                                                                                   Async-fork            ODF
+                    4                                                           4
+               10                                                          10                                                                                 9                                                                               9
+
+
+
+
+                                                                                                                                       99%-ile Latency (ms)
+
+
+
+
+                                                                                                                                                                                                                       99%-ile Latency (ms)
+                    3                                                           3
+                                                                                                                                                                                                   Redis                                                                           KeyDB
+               10                                                          10
+   Frequency
+
+
+
+
+                                                               Frequency
+                                                                                                                                                              6                                                                               6
+                    2                                                           2
+               10                                                          10
+                    1                                                           1                                                                             3                                                                               3
+               10                                                          10
+                    0                                                           0
+               10                                                          10                                                                                 0                                                                               0
+                           1    2 4 8 16 32 64                                         1    2 4 8 16 32 64                                                        1:1(Uni.) 1:10(Uni.) 1:1(Gau.) 1:10(Gau.)                                       1:1(Uni.) 1:10(Uni.) 1:1(Gau.) 1:10(Gau.)
+                              Redis Instance Size (GB)                                    Redis Instance Size (GB)                                                     Set:Get(Access Pattern)                                                         Set:Get(Access Pattern)
+                        (a) Interruption within [16us, 31us]                        (b) Interruption within [32us, 63us]
+
+
+
+
+                                                                                                                              Maximum Latency (ms)
+
+
+
+
+                                                                                                                                                                                                              Maximum Latency (ms)
+                                                                                                                                                     15                                                                              15
+Figure 11: The frequency of interruptions in the parent pro-                                                                                                                                       Redis                                                                           KeyDB
+cess during the snapshot process.                                                                                                                    10                                                                              10
+
+                                                                                                                                                              5                                                                               5
+such queries in a second. Since the IMKVS is often used in the con-
+text of demanding use cases, there are usually strict requirements                                                                                            0
+                                                                                                                                                                  1:1(Uni.) 1:10(Uni.) 1:1(Gau.) 1:10(Gau.)
+                                                                                                                                                                                                                                              0
+                                                                                                                                                                                                                                                  1:1(Uni.) 1:10(Uni.) 1:1(Gau.) 1:10(Gau.)
+on both the 99%-ile latency and the worst case latency [26, 43].                                                                                                       Set:Get(Access Pattern)                                                         Set:Get(Access Pattern)
+
+   Figure 9 shows the 99%-ile latencies of snapshot queries in Redis                                                       Figure 12: The 99%-ile latency and maximum latency of
+and KeyDB, with ODF and Async-fork. As observed, Async-fork                                                                snapshot queries under different workloads in an 8GB
+outperforms ODF in all the cases, and the performance gap increases                                                        IMKVS.
+when the instance size gets larger. For instance, operating on a
+64GB IMKVS instance, the 99%-ile latency of the snapshot queries
+is 3.96ms (Redis) and 3.24ms (KeyDB) with ODF, while the 99%-                                                              6.3                                Detailed Evaluation
+ile latency reduces to 1.5ms (Redis, 61.9% reduction) and 1.03ms                                                           Sensitivities to the Read/Write Patterns. Figure 12 shows the
+(KeyDB, 68.3% reduction) with Async-fork.                                                                                  results using four workloads with different read-write patterns
+   Figure 10 shows the maximum latency of the snapshot queries.                                                            generated with Memtier [46]. In the figure, “1:1 (Uni.)” represents
+As observed, Async-fork greatly reduces the maximum latency                                                                the workload with 1:1 Set:Get Ratio and the uniform random access
+of the benchmarks compared with ODF, even if the instance size                                                             pattern, while “1:10 (Gau.)” is the workload with 1:10 Set:Get ratio
+is small. For a 1GB IMKVS instance, the maximum latencies of                                                               and the Gaussian distribution access pattern.
+the snapshot queries are 13.93ms (Redis) and 10.24ms (KeyDB)                                                                  Observed from Figure 12, Async-fork still outperforms ODF. The
+respectively with ODF, while the maximum latencies are decreased                                                           benefit is smaller for the workload with more GET queries. This
+to 5.43ms (Redis, 60.97% reduction) and 5.64ms (KeyDB, 44.95%                                                              is because the serving (parent) process only copy a small number
+reduction) with Async-fork.                                                                                                of PTEs for the GET-intensive workloads. Moreover, the modified
+   Deep Diving. The interruption of Async-fork is caused by the                                                            memory is smaller in the experiment with the Gaussian distribution
+proactive synchronization, whereas the interruption of ODF is                                                              compared with the uniform random access pattern. With random
+caused by the CoW of the page table. We measure the interrup-                                                              pattern, the key-value pairs in the IMKVS have the same probability
+tions of the parent process during the snapshot to understand the                                                          of being accessed, and parts of key-value pairs may be accessed
+reason that Async-fork outperforms ODF. Specifically, the parent                                                           repeatedly with the Gaussian Distribution access pattern. Since
+process turns into kernel mode and is out of service for queries                                                           shared PTEs are copied only when they are modified for the first
+when executing the copy_pmd_range() function. The overhead of                                                              time in ODF, the parent process is interrupted fewer times with the
+copy_pmd_range() dominates the cost of executing in the kernel                                                             Gaussian distribution access pattern.
+mode. In order to examine the number of interruptions and the                                                                 In general, Async-fork works better for write-intensive work-
+out-of-service time, we use the bcc tool [3] to count the number                                                           loads. The larger the modified memory is, the better Async-fork
+of copy_pmd_rage() invocations and measure the execution time                                                              performs. Integrating Async-fork with CCoW [23] to improve the
+of each invocation. The result of bcc is a histogram in which the                                                          performance on write-intensive workloads is an interesting re-
+bucket is the time duration and the frequency is the number of                                                             search direction because Async-fork can utilize CCoW to copy
+invocations whose execution time falls into the bucket. The cate-                                                          the PTEs of high-locality memory pages in advance to reduce the
+gories [16𝑢𝑠, 31𝑢𝑠] and [32𝑢𝑠, 63𝑢𝑠] are two default buckets of bcc.                                                       number of proactive synchronizations.
+In our experiments, all invocations fall into the two buckets.                                                                The Impact of the Number of Clients. In this experiment, we
+   Figure 11 shows the frequency of the interruptions within [16us,                                                        change the number of clients in Redis-benchmark while keeping
+31us] and [32us, 63us]. We can see that Async-fork significantly                                                           sending 50, 000 SET queries every second to an 8GB IMKVS server.
+reduces the frequency of interruptions. For example, Async-fork                                                            Figure 13 shows the results of 99%-ile and maximum latency with
+reduces the frequency of interruptions from 7348 to 446 on the 16GB                                                        10, 50, 100 and 500 clients. As observed, Async-fork outperforms
+instance. Async-fork greatly reduces the interruptions because                                                             ODF, while the performance gap increases as the number of clients
+the interruptions happen only when the child process is copying                                                            increases. This is because more requests arrive at the IMKVS at the
+PMD/PTEs (the required time is within 600ms as in Figure 15).                                                              same time when the number of clients increases. As a result, more
+However, the interruption can happen until all data is persisted                                                           PTEs may be modified at the same time, and the duration of one
+by the child process in ODF, while the data persistence operation                                                          interruption to the parent process may become longer.
+requires tens of seconds (e.g., persisting 8GB in-memory data takes                                                           The Impact of the Number of Threads In the Child Pro-
+about 40s). Under the same workload, the parent process is more                                                            cess. In Async-fork, multiple kernel threads may be used to copy
+vulnerable to interruption when using ODF.                                                                                 PMD/PTEs in parallel in the child process. Figure 14 shows the
+                                                                     Async-fork                     ODF                                                                                                                                                                                                                     Async-fork         Default fork
+                                                                                                                                                                                                     1                                                                                                                  3                                                                 3
+                                                                                                                                                                                                10                                                                                                                 10                                                                10
+      99%-ile Latency (ms)
+
+
+
+
+                                                                                                                                               99%-ile Latency (ms)
+                                                       1
+                                               10
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                              Maximum Latency (ms)
+                                                                                                                                                                                                                                                                                            99%-ile Latency (ms)
+                                                           Redis                                                                                                                                           KeyDB
+                                                                                                                                                                                                     0
+                                                       0                                                                                                                                        10
+                                               10
+                                                                                                                                                                                                                                                                                                                        2
+                                                                                                                                                                                                  −1
+                                                                                                                                                                                                                                                                                                                   10                                                                     2
+                                                   −1                                                                                                                             10                                                                                                                                                                                                 10
+                                              10
+                                                   −2                                                                                                                                             −2
+                                              10                                                                                                                                  10                                                                                                                                    1
+                                                                    10       50      100     500                                                                                                                 10     50      100     500                                                                        10
+                                                                           Number of Clients                                                                                                                          Number of Clients                                                                                                                                                   1
+                                                                                                                                                                                                                                                                                                                                                                                     10
+                                                                                                                                                                                                                                                                                                                               8               16                                                8               16
+      Maximum Latency (ms)
+
+
+
+
+                                                                                                                                               Maximum Latency (ms)
+                                                       2                                                                                                                                             2
+                                               10                                                                                                                                               10                                                                                                                          Redis Instance Size(GB)                                           Redis Instance Size (GB)
+                                                           Redis                                                                                                                                           KeyDB
+
+                                               10
+                                                       1
+                                                                                                                                                                                                10
+                                                                                                                                                                                                     1                                                                                  Figure 16: The 99%-ile latency and maximum latency of
+                                                                                                                                                                                                                                                                                        snapshot queries with Async-fork in production.
+                                                       0                                                                                                                                             0
+                                               10                                                                                                                                               10
+
+                                              10
+                                                   −1
+                                                                                                                                                                                  10
+                                                                                                                                                                                                  −1                                                                                    6.4                         Evaluation in Production Environment
+                                                                    10       50      100     500                                                                                                                 10     50      100     500
+                                                                           Number of Clients                                                                                                                          Number of Clients                                                 Async-fork has been deployed in our production Redis Clouds. We
+                                                                                                                                                                                                                                                                                        rent a Redis database from our public cloud to evaluate Async-fork
+Figure 13: The 99%-ile latency and the maximum latency of
+                                                                                                                                                                                                                                                                                        in the production environment. The rented Redis server has 16GB
+snapshot queries under different numbers of clients in an
+                                                                                                                                                                                                                                                                                        memory and 80GB SSD. We also rent another virtual machine with
+8GB IMKVS.
+                                                                                                                                                                                                                                                                                        4 vCPU cores and 16GB memory from the same cloud to run the
+                                                                       $ V \ Q F  I R U N               $ V \ Q F  I R U N                                                                              2 ' )                                                                     Redis benchmark as the client. The client settings are the same as
+                                                                                                                                                                                                                                                                                  previous experiments. The network bandwidth between the IMKVS
+                                                                                                                                                      0 D [ L P X P  / D W H Q F \   P V 
+        L O H  / D W H Q F \   P V 
+
+
+
+
+                                                                                                                                                                                                                                                                                        server and the client is 3Gbps.
+                                                                                                                                                                                                                                                                                        We compare Async-fork with the default fork in this subsection
+                                                                                                                                                                                                   
+                                                                                                                                                                                                                                                                                        because ODF is not available in our cloud. Figure 16 shows the
+                                                                                                                                                                                                                                                                                        99%-ile latency and maximum latency of the snapshot queries with
+                                                  
+                                                                                                                                                                                                                                                                                     the default fork and Async-fork. As observed, with an 8GB instance,
+                                                                                                                                                                                                                       
+                                                                      5 H G L V  , Q V W D Q F H  6 L ] H   * %                                                                                               5 H G L V  , Q V W D Q F H  6 L ] H   * %                       the 99%-ile latency of the snapshot queries is reduced from 33.29ms
+Figure 14: The 99%-ile and maximum latency of snapshot                                                                                                                                                                                                                                  to 4.92ms, and the maximum latency is reduced from 169.57ms to
+queries when Async-fork uses 1 or 8 threads.                                                                                                                                                                                                                                            24.63ms. With a 16GB instance, the former is reduced from 155.69ms
+                                                                     Async-fork-#1                    Async-fork-#2                                                                                      Async-fork-#4                  Async-fork-#8
+                                                                                                                                                                                                                                                                                        to 5.02ms, while the latter is reduced from 415.19ms to 40.04ms.
+     Time of Copying PMD/PTEs (ms)
+
+
+
+
+                                              10
+                                                   3
+                                                                                                                                                                                                                                                                                           Before Async-fork is deployed on our Redis Clouds, we received
+                                                                                                                                               0.08                                                                                                          20
+                                                                                                                                                                                                                                                                                        a large number of complaints from tenants about the long latency
+                                                                                                                                                                                                                                                                 Maximum Latency (ms)
+                                                                                                                        99%-ile Latency (ms)
+
+
+
+
+                                              10
+                                                   2
+                                                                                                                                               0.06                                                                                                          15                         when taking the snapshot. Some tenants even have to disable the
+                                                                                                                                               0.04                                                                                                          10
+                                                                                                                                                                                                                                                                                        snapshot function, and they cannot reboot their Redis servers, oth-
+                                              10
+                                                   1
+                                                                                                                                                                                                                                                                                        erwise the data lost. After we deploy Async-fork, no more latency
+                                                                                                                                               0.02                                                                                                          5
+                                                                                                                                                                                                                                                                                        complaints have been received.
+                                                   0
+                                              10                                                                                               0.00                                                                                                          0
+                                                           1         2    4    8 16 32 64                                                                                                                      P99       Max
+                                                                    Redis Instance Size (GB)                                                                                                                 8GB Redis Instance                                                         7               CONCLUSION
+                                                                               (a)                                                                                                                                 (b)
+Figure 15: (a) The time that the child process takes to copy                                                                                                                                                                                                                            In this paper, we study the latency spikes incurred by the fork-based
+PMDs/PTEs in Async-fork. (b) The 99%-ile and maximum la-                                                                                                                                                                                                                                snapshot mechanism in IMKVSes and address the problem from the
+tency in an 8GB Redis instance.                                                                                                                                                                                                                                                         operating system level. In particular, we conduct an in-depth study
+                                                                                                                                                                                                                                                                                        to reveal the impact of the fork operation on the latency spikes.
+99%-ile and maximum latency of snapshot queries under different                                                                                                                                                                                                                         According to the study, we propose Async-fork. It optimizes the
+Redis instance sizes. Async-fork#𝑖 represents the results of using 𝑖                                                                                                                                                                                                                    fork operation by offloading the workload of copying the page table
+threads in total to copy the PMDs/PTEs.                                                                                                                                                                                                                                                 from the parent process to the child process. To guarantee data
+    Observed from Figure 14, Async-fork#1 (the child process itself)                                                                                                                                                                                                                    consistency between the parent and the child, we design the proac-
+still brings shorter latency than ODF. The maximum latency of the                                                                                                                                                                                                                       tive synchronization strategy. Async-fork is implemented in the
+snapshot queries is decreased by 34.3% on average, compared with                                                                                                                                                                                                                        Linux kernel and deployed in production environments. Extensive
+ODF. We can also find that using more threads (Async-fork#8) can                                                                                                                                                                                                                        experiment results show that the technique proposed in this paper
+further decrease the maximum latency. This is because the sooner                                                                                                                                                                                                                        can significantly reduce the tail latency of queries arriving during
+the child process finishes copying PMDs/PTEs, the lower probability                                                                                                                                                                                                                     the snapshot period.
+the parent process is interrupted to proactively synchronize PTEs.
+    In more detail, Figure 15(a) shows the time that the child process                                                                                                                                                                                                                  ACKNOWLEDGMENTS
+takes to copy PMDs/PTEs with different numbers of kernel threads,                                                                                                                                                                                                                       This work was partially sponsored by the National Natural Science
+while Figure 15(b) shows the corresponding 99%-ile and maximum                                                                                                                                                                                                                          Foundation of China (62232011, 62022057), and Shanghai interna-
+latency in an 8GB Redis instance. As we can see, launching more                                                                                                                                                                                                                         tional science and technology collaboration project (21510713600).
+kernel threads effectively reduces the time of copying PMDs/PTEs                                                                                                                                                                                                                        This work was also supported by Alibaba Group through Alibaba
+in the child process. The shorter the time is, the lower the latency                                                                                                                                                                                                                    Innovative Research Program. Quan Chen and Minyi Guo are the
+becomes.                                                                                                                                                                                                                                                                                corresponding authors.
+REFERENCES                                                                                  [29] Harshad Kasture and Daniel Sanchez. 2016. Tailbench: a benchmark suite and
+ [1] [n.d.]. fork(2). https://linux.die.net/man/2/fork.                                          evaluation methodology for latency-critical applications. In 2016 IEEE Interna-
+ [2] 2022.        Async-fork: Mitigating Query Latency Spikes Incurred by                        tional Symposium on Workload Characterization (IISWC). 1–10.
+     the Fork-based Snapshot Mechanism from the OS Level (Complete                          [30] Alfons Kemper and Thomas Neumann. 2011. HyPer: A hybrid OLTP&OLAP
+     Version).            https://drive.google.com/drive/folders/1xkwhyYmyDV5dD-                 main memory database system based on virtual memory snapshots. In 2011 IEEE
+     X03ge1CmwUBNnGgN4X?usp=sharing.                                                             27th International Conference on Data Engineering. IEEE, 195–206.
+ [3] 2022. BPF Compiler Collection (BCC). https://github.com/iovisor/bcc.                   [31] Youngjin Kwon, Hangchen Yu, Simon Peter, Christopher J Rossbach, and Emmett
+ [4] Reto Achermann, Ashish Panwar, Abhishek Bhattacharjee, Timothy Roscoe,                      Witchel. 2016. Coordinated and efficient huge page management with ingens.
+     and Jayneel Gandhi. 2020. Mitosis: Transparently self-replicating page-tables               In 12th {USENIX } Symposium on Operating Systems Design and Implementation
+     for large-memory machines. In Proceedings of the Twenty-Fifth International                 ( {OSDI } 16). 705–721.
+     Conference on Architectural Support for Programming Languages and Operating            [32] Liang Li, Guoren Wang, Gang Wu, and Ye Yuan. 2018. Consistent snapshot
+     Systems. 283–300.                                                                           algorithms for in-memory database systems: Experiments and analysis. In 2018
+ [5] Antirez. [n.d.]. Redis persistence demystified. http://antirez.com/post/redis-              IEEE 34th International Conference on Data Engineering (ICDE). IEEE, 1284–1287.
+     persistence-demystified.html.                                                          [33] A-P Liedes and Antoni Wolski. 2006. Siren: A memory-conserving, snapshot-
+ [6] Vlastimil Babka. 2016.               mm, compaction: introduce kcompactd.                   consistent checkpoint algorithm for in-memory databases. In 22nd International
+     https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/                  Conference on Data Engineering (ICDE’06). IEEE, 99–99.
+     ?id=698b1b30642f1ff0ea10ef1de9745ab633031377.                                          [34] Arm Limited. [n.d.]. Arm Architecture Reference Manual Armv8, for A-profile
+ [7] Katelin A Bailey, Peter Hornyack, Luis Ceze, Steven D Gribble, and Henry M                  architecture. https://developer.arm.com/documentation/ddi0487/gb/.
+     Levy. 2013. Exploring storage class memory with key value stores. In Proceedings       [35] Dave McCracken. 2003. Sharing page tables in the linux kernel. In Linux Sympo-
+     of the 1st Workshop on Interactions of NVM/FLASH with Operating Systems and                 sium. 315.
+     Workloads. 1–8.                                                                        [36] Michael J Mior and Eyal de Lara. 2011. Flurrydb: a dynamically scalable rela-
+ [8] Philip A Bernstein, Vassos Hadzilacos, and Nathan Goodman. 1987. Concurrency                tional database with virtual machine cloning. In Proceedings of the 4th Annual
+     control and recovery in database systems. Vol. 370. Addison-wesley Reading.                 International Conference on Systems and Storage. 1–9.
+ [9] Greg Bronevetsky, Rohit Fernandes, Daniel Marques, Keshav Pingali, and Paul            [37] Mongodb. 2021. Disable Transparent Huge Pages (THP) — MongoDB Manual.
+     Stodghill. 2006. Recent advances in checkpoint/recovery systems. In Proceedings             https://docs.mongodb.com/manual/tutorial/transparent-huge-pages.
+     20th IEEE International Parallel & Distributed Processing Symposium. IEEE, 8–pp.       [38] Ashish Panwar, Reto Achermann, Arkaprava Basu, Abhishek Bhattacharjee, K
+[10] Tuan Cao. 2013. Fault tolerance for main-memory applications in the cloud. Cornell          Gopinath, and Jayneel Gandhi. 2021. Fast local page-tables for virtualized NUMA
+     University.                                                                                 servers with vMitosis. In Proceedings of the 26th ACM International Conference on
+[11] Tuan Cao, Marcos Vaz Salles, Benjamin Sowell, Yao Yue, Alan Demers, Johannes                Architectural Support for Programming Languages and Operating Systems. 194–
+     Gehrke, and Walker White. 2011. Fast checkpoint recovery algorithms for fre-                210.
+     quently consistent applications. In Proceedings of the 2011 ACM SIGMOD Interna-        [39] Ashish Panwar, Aravinda Prasad, and K Gopinath. 2018. Making huge pages
+     tional Conference on Management of data. 265–276.                                           actually useful. In Proceedings of the Twenty-Third International Conference on
+[12] Badrish Chandramouli, Guna Prasaad, Donald Kossmann, Justin Levandoski,                     Architectural Support for Programming Languages and Operating Systems. 679–
+     James Hunter, and Mike Barnett. 2018. Faster: A concurrent key-value store                  692.
+     with in-place updates. In Proceedings of the 2018 International Conference on          [40] Jiwoong Park, Yunjae Lee, Heon Young Yeom, and Yongseok Son. 2020. Memory
+     Management of Data. 275–290.                                                                efficient fork-based checkpointing mechanism for in-memory database systems.
+[13] Shuang Chen, Christina Delimitrou, and José F Martínez. 2019. Parties: Qos-                 In Proceedings of the 35th Annual ACM Symposium on Applied Computing. 420–
+     aware resource partitioning for multiple interactive services. In Proceedings of the        427.
+     Twenty-Fourth International Conference on Architectural Support for Programming        [41] RedisLab. 2021. How fast is Redis? https://redis.io/topics/benchmarks.
+     Languages and Operating Systems. 107–120.                                              [42] RedisLab. 2021. Redis. https://redis.io/.
+[14] The Kernel Development Community. 2021. HugeTLB Pages. https://www.kernel.             [43] RedisLab. 2021. Redis latency monitoring framework. https://redis.io/topics/
+     org/doc/html/latest/admin-guide/mm/hugetlbpage.html.                                        latency-monitor.
+[15] The Kernel Development Community. 2021. Transparent Hugepage Support.                  [44] RedisLab. 2021. Redis Latency Problems Troubleshooting. https://redis.io/topics/
+     https://www.kernel.org/doc/html/latest/admin-guide/mm/transhuge.html.                       latency.
+[16] Couchbase. 2021. Disabling Transparent Huge Pages (THP). https://docs.                 [45] RedisLab. 2021. Redis Persistence. https://redis.io/topics/persistence.
+     couchbase.com/server/current/install/thp-disable.html.                                 [46] RedisLab. 2022. memtier. https://github.com/RedisLabs/memtier_benchmark.
+[17] Cristian Diaconu, Craig Freedman, Erik Ismert, Per-Ake Larson, Pravin Mittal,          [47] RedisLab. 2022. redis.conf. https://github.com/redis/redis/blob/7.0/redis.conf.
+     Ryan Stonecipher, Nitin Verma, and Mike Zwilling. 2013. Hekaton: SQL server’s          [48] Bianca Schroeder, Adam Wierman, and Mor Harchol-Balter. 2006. Open versus
+     memory-optimized OLTP engine. In Proceedings of the 2013 ACM SIGMOD Inter-                  closed: A cautionary tale. USENIX.
+     national Conference on Management of Data. 1243–1254.                                  [49] Matthew Shafer. 2012. Memcached. https://github.com/memcached/memcached.
+[18] Xiaowan Dong, Sandhya Dwarkadas, and Alan L Cox. 2016. Shared address trans-           [50] Ankur Sharma, Felix Martin Schuhknecht, and Jens Dittrich. 2018. Accelerating
+     lation revisited. In Proceedings of the Eleventh European Conference on Computer            Analytical Processing in MVCC Using Fine-Granular High-Frequency Virtual
+     Systems. 1–15.                                                                              Snapshotting. In Proceedings of the 2018 International Conference on Management
+[19] Bin Fan, David G Andersen, and Michael Kaminsky. 2013. Memc3: Compact                       of Data (Houston, TX, USA) (SIGMOD ’18). Association for Computing Machinery,
+     and concurrent memcache with dumber caching and smarter hashing. In 10th                    New York, NY, USA, 245–258.
+     {USENIX } Symposium on Networked Systems Design and Implementation ( {NSDI }           [51] solid IT. 2022. DB-Engines Ranking of Key-value Stores. https://db-engines.com/
+     13). 371–384.                                                                               en/ranking/key-value+store.
+[20] Caixin Gong, Chengjin Tian, Zhengheng Wang, Sheng Wang, Xiyu Wang, Qiulei              [52] Trivago Technology. 2017. Learn Redis the hard way (in production). https:
+     Fu, Wu Qin, Long Qian, Rui Chen, Jiang Qi, Ruo Wang, Guoyun Zhu, Chenghu                    //tech.trivago.com/2017/01/25/learn-redis-the-hard-way-in-production/.
+     Yang, Wei Zhang, and Feifei Li. 2022. Tair-PMem: A Fully Durable Non-Volatile          [53] Linus Torvalds. 2018. linux/mm/compaction.c. https://github.com/torvalds/linux/
+     Memory Database. Proc. VLDB Endow. 15, 12 (aug 2022), 3346–3358.                            blob/v4.19/mm/compaction.c.
+[21] Brendan Gregg. 2018. Working Set Size Estimation. https://www.brendangregg.            [54] Linus Torvalds. 2018. linux/mm/memory.c. https://github.com/torvalds/linux/
+     com/wss.html.                                                                               blob/v4.19/mm/memory.c.
+[22] Part Guide. 2011. Intel® 64 and ia-32 architectures software developer’s manual.       [55] Linus Torvalds. 2018. linux/mm/vmscan.c. https://github.com/torvalds/linux/
+     Volume 3B: System programming Guide, Part 2, 11 (2011).                                     blob/v4.19/mm/vmscan.c.
+[23] Minjong Ha and Sang-Hoon Kim. 2022. CCoW: Optimizing Copy-on-Write                     [56] Hao Zhang, Gang Chen, Beng Chin Ooi, Kian-Lee Tan, and Meihui Zhang. 2015.
+     Considering the Spatial Locality in Workloads. Electronics 11, 3 (2022). https:             In-memory big data management and processing: A survey. IEEE Transactions
+     //doi.org/10.3390/electronics11030461                                                       on Knowledge and Data Engineering 27, 7 (2015), 1920–1948.
+[24] Alan Harris. 2010. Distributed caching via memcached. In Pro ASP. NET 4 CMS.           [57] Wei Zhang, Ningxin Zheng, Quan Chen, Yong Yang, Zhuo Song, Tao Ma, Jingwen
+     Springer, 165–196.                                                                          Leng, and Minyi Guo. 2020. URSA: Precise Capacity Planning and Fair Scheduling
+[25] Snap Inc. 2022. KeyDB. https://keydb.dev/.                                                  Based on Low-Level Statistics for Public Clouds. In 49th International Conference
+[26] Snap Inc. 2022. Latency Monitoring Tool. https://docs.keydb.dev/docs/latency-               on Parallel Processing - ICPP (Edmonton, AB, Canada) (ICPP ’20). Association for
+     monitor/.                                                                                   Computing Machinery, New York, NY, USA, Article 73, 11 pages.
+[27] Snap Inc. 2022. Persistence. https://docs.keydb.dev/docs/persistence.                  [58] Yunqi Zhang, David Meisner, Jason Mars, and Lingjia Tang. 2016. Treadmill:
+[28] Snap Inc. 2022. Troubleshooting Latency Issues. https://docs.keydb.dev/docs/                Attributing the source of tail latency through precise load testing and statistical
+     latency/.                                                                                   inference. In 2016 ACM/IEEE 43rd Annual International Symposium on Computer
+                                                                                                 Architecture (ISCA). IEEE, 456–468.
+                                                                                      Table 2: Migrating a page from “X” to “Y” before the child
+[59] Kaiyang Zhao, Sishuai Gong, and Pedro Fonseca. 2021. On-demand-fork: a           process copies the PTE (“V->X”) in Async-fork.
+     microsecond fork for memory-intensive and latency-sensitive applications. In             Step     Operation    Parent(P) Child(C)
+     Proceedings of the Sixteenth European Conference on Computer Systems. 540–555.
+                                                                                                                    TLB:V->X TLB:N/A
+                                                                                                1    Initial state
+                                                                                                                    PTE:V->X PTE:N/A
+A     ISSUES INCURRED BY SHARED PAGE                                                                 P: Set PTE →   TLB:V->X TLB:N/A
+      TABLE DESIGN                                                                              2
+                                                                                                     None present   PTE:V->N PTE:N/A
+We initially consider using ODF in our cloud to solve the query                                                     TLB:N/A     TLB:N/A
+                                                                                                3    P: Flush TLB
+latency spike problem. However, we find that the shared page table                                                  PTE:V->N PTE:N/A
+design adopted in ODF [59] (as well as previous studies [18, 35])                                                   TLB:N/A     TLB:N/A
+                                                                                                4    P: Update PTE
+incurs several issues, which block its usage in the production envi-                                                PTE:V->Y PTE:N/A
+ronment.                                                                                                            TLB:N/A     TLB:N/A
+                                                                                                5    C: Copy PTE
+   Data Leakage Problem. As presented in Section 3.2, ODF has                                                       PTE:V->Y PTE:V->Y
+the data leakage problem due to the inconsistency between the page                                                  TLB:V->Y TLB:V->Y
+                                                                                                6    P&C: Access V
+table and the TLB. A potential fixing method for the data leakage                                                   PTE:V->Y PTE:V->Y
+vulnerability works as follows: 1) for each PTE, record the processes
+that share it; and 2) if the PTE of a page is set to be invalid in the
+parent process, then the OS notifies the other processes sharing
+                                                                                      different nodes. The overhead of TLB miss can increase due to page
+the PTE to flush the TLB entry. However, it is not easy to record
+                                                                                      table walk on the remote node [4, 38]. Although our experiments
+all the processes that share a PTE; this problem is similar to the
+                                                                                      do not consider NUMA environments, we mention this issue to
+reverse mapping problem, i.e., mapping a physical page back to the
+                                                                                      show the gap between ODF and practice.
+PTEs that correspond to it. Although the reverse mapping concept
+                                                                                         Fixing these issues is far from trivial and requires significant
+looks simple and easy to implement, it is hard in practice due to the
+                                                                                      efforts (e.g., adding new data structures and further modifying the
+space and access efficiency problem. As introduced in the blogs4,5
+                                                                                      kernel). This motivates us to develop a new fork mechanism that
+by Jonathan Corbet, the author of Linux Device Drivers, each re-
+                                                                                      can work in the production environment. Different from the shared
+verse mapping method requires complicated data structures and
+                                                                                      page table design, Async-fork has the same design as the default
+an update mechanism. Unfortunately, for each PTE, ODF records
+                                                                                      fork operation in which both parent and child processes have a
+the number of processes that share it, but has no reverse mapping
+                                                                                      private page table. The parent’s PTE table is locked if a PTE (belongs
+information. To that end, ODF cannot support the fixing method.
+                                                                                      to this table) will be updated in the parent process. Therefore, when
+   WSS Estimation Problem. The Linux kernel cannot accurately
+                                                                                      the PTE is updated in the parent process, either the PTE has been
+estimate the working set size (WSS) of a process using ODF, while
+                                                                                      copied by the child process before the update or not. For the first
+WSS is an important metric, which cloud providers utilize to im-
+                                                                                      case, both child and parent processes have their own PTEs whereby
+prove the resource utilization. Specifically, WSS is the memory size
+                                                                                      Async-fork has no data leakage issue. For the second case, the
+that a process actually requires in run time. A process can populate
+                                                                                      child process will copy the PTE after the update because of the
+a memory space that is much bigger than the actual usage (e.g.,
+                                                                                      lock on the parent’s PTE table. We use the example in Table 2 to
+apply for a memory pool with a fixed size at startup but do not
+                                                                                      demonstrate this case. The parent’s PTE table is locked during the
+shrink in run time). The Linux kernel estimates WSS of a process
+                                                                                      page migration (Step 2 to Step 4). The PTE can be accessed by the
+by counting how many pages the process has visited (based on the
+                                                                                      child process after Step 4. Then, the child process will copy the
+accessed bit of the PTE [21]). However, the shared page table design
+                                                                                      updated PTE. As such, Async-fork does not suffer from the data
+in ODF prevents the kernel from distinguishing the visitor of a page.
+                                                                                      leakage problem.
+Consequently, the Linux kernel cannot give an accurate estimation
+                                                                                         Nevertheless, the idea that shares a page table among multiple
+on WSS. In practice, it is very important for public clouds to im-
+                                                                                      processes and uses CoW to keep consistent is promising because it
+prove resource utilization because tenants generally would like to
+                                                                                      can reduce the workload of copying the page table. It is an interest-
+apply for more resources than their actual demands (e.g., 68.4% of
+                                                                                      ing and challenging future research to address all the above issues
+memory space is wasted in our clouds [57]).
+                                                                                      and develop a fork method based on the shared page table design.
+   NUMA Problem. We find that the NUMA balancing mechanism
+does not work as expected with ODF. Specifically, when the NUMA
+balancing mechanism decides to change the page location for the
+                                                                                      B    IMPLEMENTATION DETAILS
+child process, it will set PTEs to be PROT_NONE (i.e., accessing the                  We summarize the operations that modify VMAs/PTEs in the OS
+pages in the future triggers page faults) to ask the child process to                 as checkpoints. Table 3 lists the functions (i.e., checkpoints) that
+handle the faults. However, both the parent and child processes can                   can modify a VMA or a PTE, through a comprehensive analysis
+capture the faults due to the shared page table design. Additionally,                 on the Linux kernel. As shown in the table, some operations are
+the overhead of TLB miss increases when the processes sharing                         caused by users’ queries, while others are caused by OS inherent
+the page table run on different NUMA nodes because there is only                      memory management operations. Different kernel versions show
+one copy of PTEs, and some processes and the PTEs can locate into                     quite stable call paths. Our analysis shows that only one function
+                                                                                      related to Async-fork has ever been modified from Linux kernel
+4 https://lwn.net/Articles/23732. Last accessed on 2022/11/13.                        2.6 to 6.0 (see Table 4). Thus, the kernel related to our work is very
+5 https://lwn.net/Articles/383162. Last accessed on 2022/11/13.                       stable.
+                                                      Table 3: Operations that may modify VMAs/PTEs.
+          VMA-wide                     Description                          Checkpoint                                   PMD-wide                 Description                    Checkpoint
+                                  User uses system calls            vma_merge( ),__split_vma( ),
+     mmap(2),munmap(2),            proactively, casuing           detach_vmas_to_be_unmapped( ),                                               A virtual address is
+     madvise(2),mprotect(2),    the properties of VMAs to                 madvise_vma( ),                                                     accessed for the first
+                                                                                                                         page fault                                       __handle_mm_fault( )
+      mlock(2),munlock(2),     be modified or VMAs to be                do_mprotect_pkey( ),                                                time and OS allocates a
+          mremap(2)               deleted, split, extended                 mlock_fixup( ),                                                 page that is mapped by it.
+                                        or merged.                        vma_to_resize( )
+                                   User/OS expands the                   expand_upwards( ),                                                    OOM killer reclaims
+        expand_stack( )                                                                                                out of memory                                           zap_pmd_range( )
+                                  address space of stack.              expand_downwards( ),                                                         pages.
+                                 OS periodically migrates
+                                                                                                                                               Direct I/O, VFIO pin
+                               pages among NUMA nodes.
+        NUMA balance                                                   change_prot_numa( )                              get user page             get pages and                follow_page_pte( )
+                                   PTEs are modified to
+                                                                                                                                                 modifies them.
+                                      be inaccessible.
+
+    Table 4: The lifecycle and location of related functions.
+                 Function                     Lifecycle              Location                                         100k
+               vma_merge()                  v2.6.12 - v6.0          mm/mmap.c
+
+
+
+
+                                                                                                   Throughput (QPS)
+               __split_vma( )               v2.6.33 - v6.0          mm/mmap.c                                         80k
+     detach_vmas_to_be_unmapped( )          v2.6.12 - v6.0          mm/mmap.c                                         60k
+              madvise_vma( )              v2.6.12 - v5.16.20       mm/madvise.c
+           do_mprotect_pkey( )               v4.9 - v6.0          mm/mprotect.c                                       40k
+               mlock_fixup( )               v2.6.12 - v6.0         mm/mblock.c
+                                                                                                                      20k
+              vma_to_resize( )              v2.6.33 - v6.0         mm/mremap.c                                                                                  Async-fork                 ODF
+            expand_upwards( )               v2.6.15 - v6.0          mm/mmap.c                                            0
+          expand_downwards( )               v2.6.23 - v6.0          mm/mmap.c                                                0          1250     2500     3750          5000       6250
+           change_prot_numa( )               v3.8 - v6.0          mm/mempolicy.c                                                                        Time (ms)
+          __handle_mm_fault( )               v3.12 - v6.0          mm/memory.c               Figure 17: The changes of throughput during snapshot pro-
+             zap_pmd_range( )               v2.6.12 - v6.0         mm/memory.c               cess in a 16GB Redis Server.
+            follow_page_pte( )               v3.16 - v6.0            mm/gup.c
+                                                                                                                      200k
+                                                                                                   Throughput (QPS)
+                                                                                                                      160k
+    In practice, updating the kernel is a critical task for both cloud
+                                                                                                                      120k
+providers and users. They tend to stay with a kernel version for
+a relatively long time to keep the stability of services. Therefore,                                                  80k
+it is common for cloud providers to customize the OS kernel for                                                       40k
+                                                                                                                                                                Async-fork                 ODF
+important applications or specific internal needs in the produc-                                                         0
+tion environment even the modification to the kernel cannot be                                                               0          1250     2500     3750          5000       6250
+                                                                                                                                                        Time (ms)
+upstreamed. For example, Facebook uses a customized disk cache
+                                                                                             Figure 18: The changes of throughput during snapshot pro-
+component6 in the kernel to speed up MySQL, and Google adds
+                                                                                             cess in a 16GB KeyDB Server.
+specific rules7 for the out-of-memory killer in their kernel. The
+implementation of Async-fork adopts the modular design, which
+                                                                                             interval (50ms), estimate the throughput of the engine by summing
+can be easily inserted in (or removed from) the kernel.
+                                                                                             up the values of all threads whose timestamps fall into the interval.
+                                                                                                As we can see, the throughput drops rapidly when the snapshot
+C     SUPPLEMENT EXPERIMENTS
+                                                                                             is taken while it increases gradually after that. For example, In
+In this section, we first report the experiment results of query                             the worst case, the throughput of Redis server drops to 17,592
+processing throughput and total out-of-service time for the parent                           queries per second (QPS) and 42,980 QPS with ODF and Async-fork
+process during the snapshot process. We then report the experiment                           respectively. Besides, the throughput increases to the normal level
+results of using Async-fork in log rewriting. Additionally, we report                        much faster with Async-fork than with ODF. The throughput of
+the execution time of Async-fork and ODF. Lastly, we discuss the                             KeyDB is higher than that of Redis because KeyDB uses four threads
+method of tuning IMKVSes to further improve the performance.                                 to process queries in our experiments.
+   Throughput Results. This experiment measures the process-                                    The experiments with other instance sizes of Redis and KeyDB
+ing throughput of the IMKVS when taking a snapshot of the in-                                show similar results. Figure 19 further shows the minimum process-
+memory data. To do so, we use Redis benchmark [41] to launch a                               ing throughput with different instance sizes of Redis and KeyDB.
+great many queries and report the number of completed queries on                             Async-fork increases the minimum throughput by 2.44x on average
+the server side as the processing throughput.                                                (up to 2.9x) compared with ODF in Redis. The minimum through-
+   Figures 17 and 18 show the processing throughput on a 16GB Re-                            put of KeyDB is increased by 1.6x on average (up to 2.69x). Once
+dis instance and a 16GB KeyDB instance, respectively. The through-                           the load exceeds the processing ability of the server, some queries
+put is reported for every 50ms. Since KeyDB handles queries with                             queue up and suffer from a long latency. The lower the processing
+multiple threads, we measure the throughput of KeyDB as follows:                             throughput is, the longer the latency will be, which is consistent
+1) each thread independently measures its throughput for every                               with the results of Section 6.2.
+50ms and records the value with a timestamp; and 2) for each time                               Total Out-of-service Time. As discussed in Section 6.2, the
+6 https://engineering.fb.com/2013/10/09/core-data/flashcache-at-facebook-from-               parent process is out-of-service for queries during the invocation of
+2010-to-2013-and-beyond. Last accessed on 2022/11/13.                                        copy_pmd_range(). We report the total out-of-service time (the sum
+7 https://lwn.net/Articles/871195. Last accessed on 2022/11/13.                              of the duration of each copy_pmd_range() invocation), as shown
+                                                 Async-fork        ODF                                                                                                               Async-fork        ODF                                 Default fork
+                                     5                                                                  5
+                                10                                                                 10
+
+
+
+
+                                                                                                                                                                                                                   Maximum Latency (ms)
+                                                                                                                                            99%-ile Latency (ms)
+   Min. Procssing Thr.
+
+
+
+
+                                                                             Min. Procssing Thr.
+                                     4                                                                  4
+                                10                                                                 10
+                                     3                                                                  3                                                               2                                                                      2
+                                10                                                                 10                                                              10                                                                     10
+                                     2                                                                  2
+                                10                                                                 10                                                                   1                                                                      1
+                                     1                                                                  1
+                                                                                                                                                                   10                                                                     10
+                                10                                                                 10
+                                     0                                                                  0                                                               0                                                                      0
+                                10                                                                 10                                                              10                                                                     10
+                                             1     2 4 8 16 32 64                                           1 2 4 8 16 32 64                                                    1     2 4 8 16 32 64                                               1     2 4 8 16 32 64
+                                                 Redis Instance Size (GB)                                    KeyDB Instance Size (GB)                                               Redis Instance Size (GB)                                           Redis Instance Size (GB)
+Figure 19: The minimum processing throughput during the                                                                                 Figure 21: The 99%-ile and maximum latency of log rewrit-
+snapshot process.                                                                                                                       ing queries in Redis.
+                                                                                                                                                                            0
+   Total Out-of-service Time (ms)
+
+
+
+
+                                                                                                                                                                    10                   Async-fork          ODF
+
+
+
+
+                                                                                                                                            Execution Time (ms)
+                                                      Async-fork            ODF
+                                         2
+                                    10
+                                                                                                                                                                        −1
+                                                                                                                                                                   10
+                                         1
+                                    10
+
+                                                                                                                                                                        −2
+                                                                                                                                                                   10
+                                         0
+                                                                                                                                                                                     1         2       4         8         16                                  32        64
+                                    10                                                                                                                                                                 Redis Instance Size (GB)
+                                                  1           2      4        8        16                              32       64
+                                                                   Redis Instance Size (GB)                                                Figure 22: The execution time of Async-fork and ODF.
+  Figure 20: The total out-of-service time of Redis server.
+                                                                                                                                        is disabled, the 99%-ile latency and maximum latency of normal
+in Figure 20. Compared with Async-fork, the parent process is                                                                           queries on a 16GB instance are 0.079ms and 5.78ms, respectively.
+out-of-service for a longer time with ODF.                                                                                              In contrast, the values increase to 1.56ms and 11.3ms when AOF
+    Impact of Async-fork on Log Rewriting Queries. In addi-                                                                             is enabled. Nevertheless, Async-fork significantly reduces the la-
+tion to taking the snapshot, Redis can also persist data with Ap-                                                                       tency of log rewriting queries as shown in Figure 21. The results
+pend Only File (AOF). Redis logs every write operation received                                                                         demonstrate the effectiveness of Async-fork.
+by the server in a file, while these operations can then be replayed                                                                       The Execution Time of Fork. The duration of the fork opera-
+again at server startup to reconstruct the original dataset. How-                                                                       tion greatly impacts the latency of the snapshot queries. Figure 22
+ever, the AOF log file gets bigger and bigger as write operations                                                                       shows the time of the parent process returns from calling Async-
+are performed. Consequently, Redis conducts the log rewriting to                                                                        fork and ODF at different instance sizes. Compared with the default
+optimize the AOF log file [45]. Specifically, the store engine calls                                                                    fork (Figure 3), both Async-fork and ODF reduce the execution
+fork to create a child process. The child process rebuilds the AOF                                                                      time of invoking the fork operation effectively. In the large 64GB
+file into the shortest sequence of commands needed to rebuild the                                                                       instance, the parent process completes Async-fork in 0.61ms, and
+current dataset in memory, while the parent process continues to                                                                        completes ODF in 1.1ms respectively. The time is reduced because
+serve the user’s queries. Due to the usage of fork, latency spikes                                                                      they remove the most time-consuming phase from the default fork.
+will also be incurred during the log rewriting process.                                                                                 We can also observe that Async-fork is slightly faster than ODF. One
+    In the experiments, we use the Redis benchmark [41] to generate                                                                     possible reason is that ODF introduces per-page counters to support
+the workload and execute the BGREWRITEAOF command to trigger                                                                            the CoW sharing, incurring extra time cost for initialization.
+the log rewriting operation in Redis. We record the latency of the                                                                         Tuning IMKVSes. In our experiments, we set Redis and KeyDB
+queries arriving during the period of conducting log rewriting (from                                                                    to their default settings. Tuning the hyperparameters of IMKVSes
+the start of the fork operation to the end of log rewriting). We call                                                                   may further reduce the latency of snapshot queries. In the following,
+these queries log rewriting queries for brevity.                                                                                        we discuss the problem, while leaving it to the future studies.
+    Figure 21 presents the 99%-ile latency and maximum latency                                                                             By reducing the PTE modifications, the number of proactive PTE
+of log rewriting queries with different fork methods. Compared                                                                          copies in Async-fork can be further reduced. The PTE modifications
+with the default fork, Async-fork reduces the 99%-ile latency of                                                                        can be reduced by configuring the memory allocator appropriately.
+log rewriting queries by 71.81% (from 11.53ms to 3.25ms) on 1GB                                                                         In general, by allocating a large enough virtual memory space
+instance, 90.29% (from 84.03ms to 8.16ms) on 8GB instance and                                                                           for storing user data and meta information, the required mmap
+97.66% (from 1093.35ms to 25.59ms) on 64GB instance. Compared                                                                           operations at runtime can be greatly reduced. In addition, it is
+with ODF, Async-fork reduces the 99%-ile latency of log rewriting                                                                       better to retain the unused virtual memory for late use, rather
+queries by 39.7% (from 5.39ms to 3.25ms) on 1GB instance, 43.92%                                                                        than free them by calling munmap. Both the mmap and munmap
+(from 14.55ms to 8.16ms) on 8GB instance and 71.09% (from 88.51ms                                                                       operations cause PTE modifications. The default memory allocator
+to 25.59ms) on 64GB instance. The latency of log rewriting queries                                                                      jemalloc8 of Redis and KeyDB supports the above configuration: 1)
+is higher than that of snapshot queries because the overall perfor-                                                                     Pre-allocating virtual memory space through zmalloc/zfree without
+mance of Redis degrades when enabling AOF. In particular, the                                                                           populating it (so that no extra physical memory is consumed). 2)
+storage engine enabling AOF needs to synchronize the log into                                                                           Configuring the built-in property ‘retain’ to be true.
+the disk [45] in addition to processing queries. We observe the
+performance degradation of normal queries as well. When AOF                                                                             8 https://github.com/jemalloc/jemalloc. Last accessed on 2022/11/13.
+

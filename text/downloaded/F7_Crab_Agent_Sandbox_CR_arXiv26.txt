@@ -1,0 +1,1157 @@
+                                                   Crab: A Semantics-Aware Checkpoint/Restore
+                                                          Runtime for Agent Sandboxes
+                                               Tianyuan Wu∗           Chaokun Chang∗                Lunxi Cao                   Wei Gao                 Wei Wang
+                                                  HKUST                    HKUST                    HKUST                      HKUST                     HKUST
+                                               Hong Kong SAR,           Hong Kong SAR,           Hong Kong SAR,             Hong Kong SAR,            Hong Kong SAR,
+                                                   China                    China                    China                      China                     China
+                                         Abstract                                                                 This rich, accumulated state makes checkpoint/restore
+                                         Autonomous agents act through sandboxed containers and                (C/R) an increasingly important systems capability for sand-
+                                         microVMs whose state spans filesystems, processes, and run-           boxed agents. Three use cases are particularly pressing. Fault
+                                                                                                               tolerance: long-horizon agent workloads can span hundreds
+arXiv:2604.28138v1 [cs.OS] 30 Apr 2026
+
+
+
+
+                                         time artifacts. Checkpoint and restore (C/R) of this state is
+                                         needed for fault tolerance, spot execution, RL rollout branch-        of turns [5, 20, 40, 45, 56]; a crash without a checkpoint
+                                         ing, and safe rollback—yet existing approaches fall into two          forces costly re-execution of all prior work. Spot/preemptible
+                                         extremes: application-level recovery preserves chat history           execution: cloud spot instances offer substantial cost sav-
+                                         but misses OS-side effects, while full per-turn checkpointing         ings for sandbox deployment but can be preempted on short
+                                         is correct but too expensive under dense co-location.                 notice [3]; C/R preserves progress across preemptions. RL
+                                            The root cause is an agent–OS semantic gap: agent frame-           rollouts: tree-based reinforcement learning (RL) post-training
+                                         works see tool calls but not their OS effects; the OS sees            algorithms such as Tree GRPO [25] branch from interme-
+                                         state changes but lacks turn-level context to judge recov-            diate states; C/R can fork a sandbox from a checkpoint in-
+                                         ery relevance. This gap hides massive sparsity: over 75%              stead of re-executing a shared prefix [46]. C/R is also critical
+                                         of agent turns produce no recovery-relevant state, so most            to safe rollback, where operators restore the sandbox to a
+                                         checkpoints are unnecessary.                                          known-good state after a catastrophic or adversarially in-
+                                            Crab (Checkpoint-and-Restore for Agent SandBoxes) is a             duced action [14, 41]. All of these cases require the runtime
+                                         transparent host-side runtime that bridges this gap without           to efficiently snapshot and restore the full sandbox state on
+                                         modifying agents or C/R backends. An eBPF-based inspec-               which agent execution depends.
+                                         tor classifies each turn’s OS-visible effects to decide check-           However, efficient C/R for agent sandboxes is not a straight-
+                                         point granularity; a coordinator aligns checkpoints with turn         forward application of existing mechanisms. The core chal-
+                                         boundaries and overlaps C/R with LLM wait time; and a host-           lenge is an agent–OS semantic gap: agent execution inter-
+                                         scoped engine schedules checkpoint traffic across co-located          leaves LLM reasoning with tool calls whose effects materi-
+                                         sandboxes. On shell-intensive and code-repair workloads,              alize as OS state changes, yet neither the agent layer nor
+                                         Crab raises recovery correctness from 8% (chat-only) to               the OS layer alone has the information needed for efficient
+                                         100%, cuts checkpoint traffic by up to 87%, and stays within          C/R. Application-level methods, such as coding-assistant
+                                         1.9% of fault-free execution time.                                    rewind [6, 39] and framework persistence [26, 30, 33], pre-
+                                                                                                               serve conversational or file state cheaply but miss OS-side
+                                         1    Introduction                                                     effects such as installed packages, spawned processes, and
+                                                                                                               files modified by shell commands. OS- and VM-level mech-
+                                         AI systems are undergoing a fundamental shift, evolving
+                                                                                                               anisms [13, 17, 19, 38] guarantee correctness by saving full
+                                         from passive single-turn chatbots to autonomous multi-step
+                                                                                                               execution state, but they are semantics-oblivious: they treat
+                                         agents that reason, act, and iterate in real execution environ-
+                                                                                                               every step as equally stateful, imposing substantial cost and
+                                         ments [8, 39, 41, 53]. These agents compile projects, run shell
+                                                                                                               poor scalability under high-density sandbox deployment. Ta-
+                                         commands, install dependencies, start background services,
+                                                                                                               ble 1 summarizes this divide; we quantify it on realistic agent
+                                         and iteratively modify files and runtime state until a task is
+                                                                                                               workloads in §3.
+                                         resolved. To support such workloads, production platforms
+                                                                                                                  Bridging this gap requires a specialized C/R system for
+                                         provide sandboxed environments—containers or microVMs
+                                                                                                               agent sandboxes that satisfies three requirements. R1: Re-
+                                         that expose a full Linux OS with a filesystem, shell, and pro-
+                                                                                                               covery correctness. Each restore point must reconstruct the
+                                         cess space [16, 47]. Agent sandboxes have become critical
+                                                                                                               sandbox state on which future execution depends—including
+                                         infrastructure: they are the medium through which agents
+                                                                                                               filesystem and process effects of prior tool calls—not merely
+                                         act on the world. Agents are therefore OS-level actors whose
+                                                                                                               chat history. R2: Low exposed overhead. Checkpointing
+                                         effective state spans the conversation history and kernel-
+                                                                                                               must not dominate end-to-end agent latency; a system that
+                                         visible state—filesystem contents, long-lived processes, and
+                                                                                                               pauses the sandbox for every checkpoint negates the benefit
+                                         installed packages.
+                                         ∗ Equal contribution.
+
+                                                                                                           1
+ System             Layer       State Captured   Correct   Cost       Beyond failure recovery, Crab also enhances the agents by
+ Claude [6]          App         Chat + Git/FS     ×       Low        enabling agent-facing uses of C/R. In our case studies, expos-
+ LangGraph [26]   Framework      Conversation      ×       Low        ing rollback as a tool lets agents replace brittle shell-level
+ Docker [12]         OS         Full Container     ✓       Med
+                                                                      self-recovery with a single sandbox restore, reducing wall-
+ E2B [17]            VM            Full VM         ✓       High       clock time by up to 29% and rollback tokens by 36%.
+                                                                         This paper makes three contributions.
+ Crab             Cross-layer      Adaptive        ✓       Low
+                                                                        • We identify the agent–OS semantic gap and quantify
+Table 1. Comparison of C/R approaches for agent sandboxes.
+                                                                          its consequences: chat-only recovery succeeds on only
+App-level methods are efficient but incomplete; OS/VM-level
+                                                                          8–13% of Terminal-Bench tasks, while every-turn full
+methods are correct but costly. Crab bridges this gap with
+                                                                          checkpointing slows execution by up to 3.78× under
+semantics-aware C/R.
+                                                                          dense co-location (§3).
+of C/R. R3: Scalable under dense co-location. Check-
+                                                                       • We design and implement Crab, a host-side runtime
+point traffic from many sandboxes must not collapse shared               that infers recovery-relevant state from OS-visible ef-
+host resources such as storage bandwidth and C/R backends.               fects, overlaps checkpoint work with LLM wait time, and
+Meeting all three requires that the system infer which turns             coordinates C/R across co-located sandboxes—without
+produce recovery-relevant state and coordinate checkpoint                modifying agents or C/R backends (§4–§5).
+work across co-located sandboxes.
+   We present Crab, a transparent host-side runtime that               • We evaluate Crab on Terminal-Bench and SWE-Bench
+bridges this gap without modifying either the agent or ex-               and show that it achieves 100% recovery correctness
+isting C/R backends. Our key insight is that the runtime                 while staying within 1.9% of no-fault, checkpoint-free
+can treat the agent as a black box and instead observe OS-               execution time, even at 96-sandbox density (§7).
+visible effects at turn boundaries to decide checkpoint gran-
+ularity. Because agents naturally alternate between local             2   Background
+tool execution and waiting for the next LLM response, the             AI Agents and Sandboxes. AI agents are increasingly de-
+system can overlap checkpoint work with LLM wait time,                ployed to tackle software engineering and automation tasks
+hiding most of the cost. Crab is built from three compo-              that require interacting with real execution environments,
+nents. A user-space Coordinator sits on the agent–LLM con-            not just generating text. Agents such as Claude Code [8]
+trol path as a proxy, identifies turn boundaries (R1), and            and Codex [39] can read and edit files, run shell commands,
+overlaps checkpoint work with LLM wait windows (R2). A                and coordinate multi-step workflows across tools and repos-
+lightweight eBPF-based [28] Inspector observes OS-visible             itories. Their execution follows an interleaved control loop
+effects after each turn—filesystem changes, process state,            between the large language model (LLM) and the execution
+memory modifications—and classifies each turn as requiring            environment: the agent receives an LLM response, issues tool
+no checkpoint, a filesystem-only checkpoint, a process-only           actions, collects their results, feeds the observations back to
+checkpoint, or a full checkpoint (R1). A host-side C/R Engine         the model, and repeats. We call one such model–environment
+schedules and executes checkpoint requests across densely             exchange an interaction turn.
+co-located sandboxes using commodity backends—runc for                   These agents typically run in sandboxes: isolated execution
+lifecycle management, ZFS snapshots [24] for filesystem               environments such as containers or VMs that expose a real
+state, and CRIU [38] for process state—smoothing check-               OS interface, including a filesystem, shell, and process space.
+point bursts and prioritizing jobs that would otherwise block         Agent and sandbox can be integrated in two ways. In the
+agent progress (R3).                                                  agent-in-a-sandbox model, the agent process itself runs inside
+   We evaluate Crab on code-repair SWE-Bench [53] and                 the sandbox. In the agent-with-a-sandbox model, the agent
+shell-intensive Terminal-Bench [31] workloads driven by               remains outside but interacts with the sandbox through its
+three agents and LLMs. Crab achieves 100% recovery cor-               interfaces, e.g., by executing commands or manipulating files
+rectness, compared with 8–13% for chat-only and 28–42%                remotely. Both patterns are common in deployed systems,
+for chat+filesystem baselines on Terminal-Bench. Despite              from cloud sandboxes such as E2B [16] to Docker-backed
+one crash per task, Crab stays within 1.9% of no-fault ex-            environments such as OpenHands [47]. In either case, each
+ecution time—whereas restarting from scratch adds up to               interaction turn mutates not only the conversation history
+1.67× on SWE-Bench, and every-turn full checkpointing adds            but also the OS state of the sandbox.
+up to 3.78× on Terminal-Bench at 96-sandbox density due               C/R for Sandboxed Agents. Because sandboxed agents
+to host I/O contention. Crab classifies up to 87% of turns            accumulate mutable OS state, checkpoint/restore (C/R) is a
+as requiring no checkpoint, eliminating corresponding C/R             key system capability. Efficient C/R enables fault tolerance
+works entirely. In runs without injected failures, asynchro-          under crashes, cost-effective execution on preemptible spot
+nous overlap keeps the p95 exposed checkpoint delay to                instances, and reinforcement learning (RL) algorithms such
+0.44% of task time at a density of 64 co-located sandboxes.           as Tree GRPO [25]. As shown in Table 2, these use cases
+                                                                  2
+ Scenario        Checkpoint    Restore     #Ckpts      Need                             No Failure             Restart            Chat + FS         Chat Only
+                                                                                          100%100%                         100%
+                                                                                  100%
+
+
+
+
+                                                                       Solved %
+ FaultRecover     Frequent    On failure   Single    Fast snap                     75%                                      75%
+
+
+
+
+                                                                                                                     CDF
+                                                                                                        48%
+ Spot [3]        On preempt   On restart   Single   Fast migrate                   50%                                      50%
+                                                                                   25%                          6%          25%
+ TreeRL [25]     Per branch   On expand    Multi      Fast fork                     0%                                       0%
+                                                                                            e       t      S                      0     4       8      12
+ SpecAct[54]      Frequent     On reject   Single    Fast C&R                          ailur Restahrat + Fhat Only
+                                                                                   No F         C       C                             Solve Time (minutes)
+ Proactive C/R    Frequent    On demand    Multi      Tool API
+Table 2. Use cases for agent C/R. They differ in checkpoint                                            (a) Replay-based evaluation.
+timing and persistence needs but all require efficient snap-                              100%100%                         100%
+                                                                                  100%
+
+
+
+
+                                                                       Solved %
+                                                                                   75%                                      75%
+
+
+
+
+                                                                                                                     CDF
+shot and recovery of sandbox state.                                                50%                  34% 28%             50%
+                                                                                   25%                                      25%
+                                                                                    0%                                       0%
+                                                                                            e       t      S                      0     4       8      12
+impose different requirements on the C/R substrate. In Fault                           ailur Restahrat + Fhat Only
+                                                                                   No F         C       C                             Solve Time (minutes)
+Recovery, checkpoints must be frequent enough to avoid redo-
+                                                                                                         (b) Real-LLM evaluation.
+ing substantial work after failures. In SpotAgent, checkpoints
+must preserve progress across preemption events—which
+                                                                       Figure 1. Recovery-state gap under four recovery strategies.
+may arrive with little warning [3]—and support fast restore
+                                                                       Left: task solve rate. Right: CDF of per-task runtime. Slow-
+for efficient migration. In TreeRL [25], checkpoints enable
+                                                                       down is defined as median restart / no failure solve time.
+branching rollouts, where many executions share a com-
+mon prefix and re-executing that prefix is wasteful. In spec-
+ulative action execution [54], checkpoints let the runtime
+fork from the current sandbox state, execute draft actions in
+                                                                   To quantify this gap, we randomly sample 50 Terminal-
+parallel, and quickly discard or commit the fork depending
+                                                                Bench [31] tasks that succeed in a clean run using the iFlow-
+on whether the oracle action agrees. Moreover, exposing
+                                                                ROME [46] model, inject exactly one failure at a random
+rollback as an agent-facing API enables proactive recovery,
+                                                                position along each trajectory, and compare three recovery
+allowing the agent to replace brittle shell-level cleanup with
+                                                                strategies against a No failure baseline: (1) Restart, which
+a direct restore to a known-good checkpoint.
+                                                                restarts execution from the beginning, (2) Chat-only, which
+   Although these scenarios differ in checkpoint timing, re-
+                                                                recovers using only the chat history, and (3) Chat+FS, which
+store triggers, and persistence needs, they share a common
+                                                                recovers the filesystem together with the conversational
+requirement: the runtime must snapshot and recover sand-
+                                                                history, but without in-memory process state. To separate
+box state efficiently. However, no existing system addresses
+                                                                recovery requirements from model stochasticity and the
+this well, as we show in §3.
+                                                                agent’s ability to “repair” a broken environment, we evaluate
+                                                                under both deterministic trace replay and a live LLM service.
+3 Gaps and Challenges                                              Figure 1 shows the evaluation results. Restart preserves
+Existing C/R approaches for agents fall into two extremes,      correctness   but increases median time-to-solve by 1.81× (re-
+each with a fundamental limitation. Application- and framework- play)  and  1.55×  (live LLM) because all prior work must be
+level methods recover conversational or file state but miss     re-executed.   Chat-only     succeeds on only 6% of tasks under
+OS-side effects, producing inconsistent environments (§3.1).    replay  and   28% with   a live LLM. Chat+FS improves replay
+OS- and VM-level methods capture full sandbox state but         success  to  48%  but  reaches  only 34% with a live LLM: once
+treat every turn as equally stateful, imposing prohibitive      the recovered   environment     diverges from the original execu-
+cost under dense deployment (§3.2). Both gaps stem from an      tion, the agent  may    notice  missing state and take corrective
+agent–OS semantic gap: neither the agent nor the OS layer       actions  that  further   perturb  the run. In  short, lightweight
+alone has the information needed for efficient C/R. We iden-    recovery   is fundamentally     incomplete,   while  restart-based
+tify this gap and show why it cannot be bridged at the tool     recovery  is  correct  only  by re-executing   all prior work.
+API level (§3.3), motivating our system design in §4.
+                                                                3.2 Full-State Checkpointing Does Not Scale
+3.1 Lightweight Recovery Is Often Incorrect                     The opposite extreme to lightweight recovery is to check-
+Application- or framework-level approaches, such as Lang-              point the full sandbox state after every turn. This approach
+Graph [26] and coding assistants like Claude Code [8], pre-            preserves correctness but imposes prohibitive overhead. A
+serve conversational history or file changes but not the live          full checkpoint must capture both filesystem state and live
+runtime state that subsequent tool invocations may depend              process state. Even modern sandbox substrates expose this
+on. Because tool execution produces concrete OS-level ef-              cost: E2B [16] (based on Firecracker [19]) requires paus-
+fects, including filesystem modifications and in-memory pro-           ing the microVM before snapshot creation and introduces
+cess state, resuming from conversational or filesystem state           more than 4 s overhead [17, 19]. Even with faster off-the-
+alone often leads to an inconsistent environment.                      shelf Linux substrates—ZFS [24] for filesystem state and
+                                                                   3
+      100%                                         100%                                                                                         Tool-Call Distribution
+
+      75%                                          75%                               100: Med=17                                      60%                                9%       21%
+               median = 3.34s                                                  32: Med=5        1
+CDF
+
+
+
+
+      50%                                          50%                                          16
+                                                                             16: Med=3                                         run_shell_command            todo_write        replace
+                                                                                                32
+      25%                                          25%                                                                         read_file                    write_file        Other tools
+                                                                            1: Med=0            100
+       0%                                                 0%                                                                                      Shell Syntax Cues
+             0     20   40    60   80                                  0        15      30     45
+              Per-Turn Execution Time (s)                                   Checkpoint RPS vs. Density                                      70%                                16%
+
+
+
+Figure 2. Agent turn-time distribution and checkpoint pres-                                                        0%         20%               40%              60%            80%         100%
+                                                                                                                              Opaque / no cue          Redirect only           Mixed cues
+sure at host scale. Left: CDF of agent turn time. Right: host-                                                                Pipe only                Background only
+side checkpoint arrival RPS distribution vs sandbox density.
+                                                                                                                   Figure 4. Opacity of agent actions. Top: tool-call distribution.
+                                                                                                 47.4 s
+  Modify 100MB                   11.8                                                                              Bottom: fraction of shell commands with explicit side-effect
+                                                    Ckpt. Time (ms)
+
+
+
+
+                                                                                                 23.8 s
+                                                                                                 12.7 s
+      Create 1000                                                     104                        7.8 s             syntax versus semantically ambiguous commands.
+                                   13.7
+           4K files
+                                                                                              128 MB
+Create 100-level                          19.4                                                256 MB               expensive. What is missing is a way to determine whether
+   directory tree                                                     103                     512 MB
+     Mixed 100                              21.8                                              1024 MB              a turn modifies recovery-relevant sandbox state, and thus
+ Concurrent Ops
+                      0     6   12    18  24                                 24 8 16   32                 64
+                                                                                                                   whether a full checkpoint is necessary. In real agent deploy-
+                          Snapshot Time (ms)                                       Concurrency                     ments, agent turns that make sandbox state changes are
+                                                                                                                   sparse, where more than 75% of turns are stateless (e.g., file
+Figure 3. Left: ZFS snapshot overhead remains within tens                                                          reads), see Figure 13 in our evaluation. This information,
+of ms. Right: CRIU-based process checkpoint latency can                                                            however, is not visible at either the application or OS layer
+grow to tens of seconds under high concurrency; Testbed:                                                           alone—a problem we call the agent–OS semantic gap. Agent
+AWS c6id.32xlarge [1] with local NVMe SSDs.                                                                        frameworks observe tool invocations but cannot determine
+                                                                                                                   their concrete OS effects. Conversely, the OS observes filesys-
+runc+CRIU [38] for process state—the overhead could reach                                                          tem and process changes but lacks the agent-level context
+seconds, dominated by process checkpointing.                                                                       to judge whether those changes matter for recovery.
+   The cost compounds at host scale. Agents generate fre-                                                             This agent–OS semantic gap cannot be bridged by inspect-
+quent checkpoint opportunities: as Figure 2 (left) shows, our                                                      ing tool invocations, because the dominant tool type reveals
+Terminal-Bench traces exhibit a median turn duration of                                                            almost nothing about its OS-level effects. In our Terminal-
+3.34 s and 117 expected turns per task. With 100 sandboxes                                                         Bench traces, run_shell_command accounts for 60.4% of all
+per host (128 cores), naively checkpointing every turn yields                                                      tool calls (Figure 4). At the API level, a call like python
+a median checkpoint arrival rate of 17 requests/s and a p90                                                        arbitrary_script.py may modify files, spawn long-lived
+of 26 requests/s (Figure 2 (right)). Such bursty arrivals in-                                                      processes, or simply produce output—yet the tool signature
+troduce frequent interruptions to each sandbox and quickly                                                         is identical in each case. Moreover, the command space is
+overwhelm shared C/R backends.                                                                                     unbounded: commands can invoke arbitrary programs or
+   Figure 3 shows the underlying bottleneck. While ZFS snap-                                                       scripts whose side effects cannot be reliably inferred from
+shots [24] remain cheap—even under high concurrency, per-                                                          syntax or static analysis. Even explicit syntactic signals are
+snapshot overhead stays within 22 ms—process checkpoints                                                           rare: among 12,483 shell commands in our traces, only 5.3%
+can be expensive. As Figure 3 (right) shows, CRIU [13] dump                                                        contain redirection, 1.0% use background execution, and
+cost grows with the live memory footprint, which is espe-                                                          16.2% involve pipes. Treating all actions as stateful recreates
+cially problematic for agent sandboxes: AgentCgroup [56]                                                           the cost of full-state checkpointing; relying on tool labels or
+reports a stable framework baseline of roughly 185 MB, with                                                        syntax alone risks the incorrect recovery shown in §3.1. The
+tool-driven memory bursts that can exceed 4 GB. In our con-                                                        key challenge is therefore to infer recovery-relevant state
+current dump experiment on a local AWS NVMe SSD with                                                               changes from observed OS-level effects at turn boundaries,
+2.1M/1.1M random R/W IOPS, even 16 concurrent 128 MB                                                               rather than from tool names or command syntax—a problem
+dumps prolong dump time to 1.3 s, while 64 concurrent 1 GB                                                         we address in §4.
+dumps take 47 s. At realistic co-location densities (e.g., 100
+sandboxes on a 128-core host), full-state, per-turn check-                                                         4    Design Overview
+pointing easily overwhelms host I/O and cannot scale.                                                              Bridging the agent–OS semantic gap requires a runtime that
+                                                                                                                   combines agent-level turn semantics with OS-level visibility
+3.3       The Agent–OS Semantic Gap                                                                                into recovery-relevant state. Such a runtime must satisfy
+§3.1 and §3.2 rule out both obvious extremes: recovering                                                           three requirements. R1: Correctness. Each restore point
+only conversational or filesystem state is often incorrect,                                                        must correctly reconstruct the sandbox state on which fu-
+while checkpointing full process state after every turn is too                                                     ture execution depends, including filesystem and process
+                                                                                                               4
+effects. R2: Low exposed overhead. Checkpointing should                                                                 LLM APIs
+                                                                                                                     Response Request
+be taken out of the sandbox’s critical path, with minimal                                  User
+                                                                                                                      Coordinator (§5.1)                C/R Engine (§5.3)
+                                                                                         Submit:
+impact on end-to-end execution. R3: Scalable under co-                                   Sandbox                                                         Scheduler
+                                                                                                               Sandbox-1       SWE          Sandbox-3
+location. Checkpointing must remain efficient under dense                                config +                              Agent
+                                                                                                                 Claude                                   Workers
+                                                                                         Prompt                                              Codex
+
+
+
+
+                                                                                                                                                                     Checkpoint
+sandbox co-location, so that contention for shared C/R back-
+
+
+
+
+                                                                                                                                                                      Manager
+                                                                                                                  Code
+                                                                                                                             Sandbox-2                      CRIU
+ends and storage bandwidth does not inflate task latency.                User                Inspector           Tools         Tools          Tools         ZFS
+                                                                         space                Daemon
+                                                                       Kernel                              Inspector eBPF (§5.2)                           ZFS Kmod
+4.1   Design Rationale                                                 Space                                                Host OS Kernel
+These requirements motivate our semantics-aware host-side
+design. The key observation is that the runtime must under-
+stand, at turn granularity, what state has become recovery-          Figure 5. Architecture overview of Crab; yellow blocks are
+relevant and when checkpoint work can be performed with-             key components of Crab.
+out unnecessarily extending the critical path. Accordingly,
+Crab is organized around three key ideas.                              Agent & Sbx                Turn 𝑖                     Wait for LLM               Wait Turn 𝑖+1
+                                                                       Coordinator                                   Decide (4) Submit & Enqueue        Wait (7) Forward
+                                                                                               (1) Intercept
+Semantics-driven checkpointing (R1). Correct recovery                              Scheduler
+
+
+
+
+                                                                      C/R Engine
+                                                                                                                              (5) Schedule         (6) Intercept&Wait
+
+
+
+
+                                                                                                                                                                             CRAB
+requires preserving OS state that future turns depend on,                          Workers      Other sandboxes’ Checkpoint jobs     Checkpoint Dump
+which application- or framework-level persistence alone                            Manager                 (3) Query      Checkpoint Lifecycle Tracking
+                                                                       Inspector                 (2) Forward      Inspect
+cannot provide. At the same time, not every turn creates
+                                                                       LLM Service                                LLM Thinking & Response Generation                    Time
+recovery-relevant state, and not every stateful turn requires
+the same checkpoint granularity. Crab therefore infers, from
+OS-visible effects, whether a completed turn requires no                                       Figure 6. Workflow timeline of Crab.
+checkpoint, a filesystem checkpoint, or a full checkpoint.
+Capturing only the minimal recovery-relevant state pre-
+                                                                     architecture. Crab has three key components that jointly
+serves correctness while avoiding unnecessary full dumps.
+                                                                     realize all three design rationales to meet R1–R3.
+Asynchronous checkpointing at turn boundaries (R2).
+                                                                     Coordinator. The Coordinator sits on the control path be-
+Even selective checkpointing can still hurt performance if its
+                                                                     tween the agent and the external LLM service. It identifies
+latency is exposed on the sandbox’s critical path. Crab ad-
+                                                                     turn boundaries by intercepting requests and responses, and
+dresses this by exploiting the turn semantics of agent execu-        uses them to trigger checkpoint decisions at a precise consis-
+tion: agents naturally alternate between local tool execution        tency point—realizing asynchronous checkpointing at turn
+and waiting for the next LLM response in turns; Crab uses            granularity (R2). By aligning checkpoints with completed
+this wait window to run checkpoint work asynchronously,
+                                                                     turns, it also establishes the consistency points required for
+so much of the checkpoint cost is overlapped rather than
+                                                                     correct recovery (R1). Finally, it exposes per-sandbox ex-
+directly added to end-to-end latency.
+                                                                     ecution context (e.g., whether a checkpoint is still hidden
+Host-level coordination of checkpoint execution (R3).                behind the LLM wait window) to the C/R Engine, enabling
+Checkpoint cost is paid against shared host resources, includ-       host-scoped scheduling (R3).
+ing storage bandwidth and C/R backends. Crab therefore
+                                                                     Inspector. The Inspector provides the OS-level semantic
+schedules checkpoint work at host scope rather than let-             signals that realize semantics-driven checkpointing (R1). Af-
+ting sandboxes checkpoint independently. This allows the             ter each completed turn, it examines OS-visible effects via
+runtime to smooth bursts across co-located sandboxes and             eBPF [28] and determines what recovery-relevant state has
+prioritize checkpoints that would otherwise delay execution.
+                                                                     changed: none, filesystem-only, process-only, or full state.
+                                                                     This signal tells the system whether checkpointing is needed
+4.2   Architecture and Workflow                                      and at what granularity, ensuring that only the minimal
+Realizing all three rationales requires a design point that          recovery-relevant state is captured.
+neither a per-sandbox “sidecar” nor a kernel-only approach           C/R Engine. The C/R Engine realizes host-level coordina-
+can occupy. A per-sandbox sidecar can react only locally             tion (R3) and ensures that each checkpoint is a complete
+and cannot coordinate checkpoint traffic across sandboxes            and consistent recovery point (R1). It receives checkpoint
+sharing the same host resources (R3). A kernel-only design           requests from the Coordinator, schedules them across co-
+can observe OS effects but does not naturally expose turn            located sandboxes to minimize contention and prioritize
+boundaries or the LLM wait windows needed to hide check-             urgent work, executes them using the underlying backends,
+point latency (R2). Crab therefore adopts a host-side runtime        and tracks checkpoint versions for later restore.
+that couples OS-visible observation with host-scoped con-            Workflow. Figure 6 shows the steady-state workflow, which
+trol over checkpoint timing and lifecycle. Figure 5 shows the        proceeds in two phases.
+                                                                 5
+   1) Async checkpoint dispatch. At the end of turn 𝑖, the Co-                                               Changed=False Time
+ordinator intercepts the agent’s request to the LLM (○) 1 and                                                Changed=True Time
+forwards it (○).
+              2 This request marks the completion of turn 𝑖
+                                                                                                              Changed=True Time
+and opens a window in which checkpoint work can proceed
+without blocking the agent. The Coordinator consults the                                                      Changed=True Time
+Inspector to determine what recovery-relevant state turn                           File/Proc’s Lifecycle    Last Reset (Checkpoint)
+𝑖 produced (○) 3 and decides whether to Skip or issue a                            File/Proc Modification    Current Query
+Filesystem-only, Process-only, or Filesystem+Process
+                                                                       Figure 7. Examples of net filesystem / process changes.
+checkpoint. If checkpointing is needed, it submits the request
+for sandbox 𝑠 at turn 𝑖 to the C/R Engine (○).
+                                           4 The C/R Engine
+schedules and executes this request at host scope (○):  5 the         Asynchronous Checkpoint Dispatch (R2). Immediately
+Scheduler orders it against other checkpoint work, Workers            after forwarding the outbound request, the Coordinator
+invoke the underlying backends, and the Manager tracks the            queries the Inspector (§5.2) for the turn’s recovery-relevant
+resulting checkpoint.                                                 state changes and, if checkpointing is needed, submits a
+   2) Completion gating. When the LLM response returns, the           checkpoint job to the C/R Engine (§5.3). Because the LLM
+Coordinator intercepts it before releasing it to the agent (○).
+                                                            6         has not yet responded, this checkpoint work proceeds con-
+If the checkpoint for turn 𝑖 has already completed, the re-           currently with the LLM inference, overlapping checkpoint
+sponse is forwarded immediately and turn 𝑖+1 begins (○).    7         latency with the LLM wait window rather than placing it on
+Otherwise, the Coordinator delays release until the check-            the sandbox’s critical path.
+point finishes. This gate ensures that no turn proceeds be-
+                                                                      Completion Gating (R2). As shown in Figure 6 (○–         6 ○),
+                                                                                                                                   7
+fore its recovery state is durable, while overlapping as much
+                                                                      the proxy buffers the returning LLM response and checks
+checkpoint latency as possible with LLM wait time.
+                                                                      whether the outstanding checkpoint has already finished. If
+                                                                      so, the response is released to the agent immediately; other-
+5     Runtime and Mechanisms                                          wise the proxy blocks until the checkpoint completes. Check-
+We now zoom in on the three components of Crab and                    point latency is therefore exposed to the agent only when it
+their runtime mechanisms. We start to describe how the                exceeds the LLM wait window.
+Coordinator uses an HTTP-proxy interposition to detect turn           Urgency Signaling (R3). If the LLM response returns while
+boundaries, dispatch checkpoint work asynchronously, and              the corresponding checkpoint is still in progress, the Co-
+gate agent progress (§5.1). We then present the Inspector’s           ordinator promotes that job from the C/R Engine’s normal
+eBPF-based state tracking and its net-change semantics for            queue to its high-priority queue. This signal lets the host-side
+identifying recovery-relevant OS effects (§5.2). We also detail       scheduler (§5.3) prioritize checkpoint work that has become
+the C/R Engine’s reactive scheduling, worker dispatch, and            exposed on the sandbox’s critical path, while deferring jobs
+versioned checkpoint management (§5.3).                               whose latency is still hidden behind their LLM wait windows.
+
+5.1   Coordinator: The Control Plane                                  5.2   Inspector: The State Tracker
+The Coordinator is implemented as a lightweight HTTP                  The Inspector realizes semantics-driven checkpointing (R1)
+reverse-proxy on the agent–LLM path. Modern agents com-               by determining, for each sandbox, whether recovery-relevant
+municate with external LLM services through standardized              OS state—filesystem or process—has changed since the last
+HTTP APIs, so interposing at this boundary lets Crab infer            checkpoint. It consists of two parts: a lightweight in-kernel
+turn semantics, regulate agent progress, and enforce consis-          eBPF [28] monitor that captures OS-visible effects, and a
+tent recovery—all without modifying agent code or check-              userspace daemon that exports these results through an
+point backends. Below we describe the four mechanisms the             HTTP query interface (Figure 5). The Coordinator queries
+Coordinator provides.                                                 this interface at the end of each turn (§5.1) to decide whether
+Turn-Boundary Detection (R1). The proxy inspects ev-                  to skip the checkpoint, issue a filesystem/process-only check-
+ery outbound HTTP request from the agent to the LLM.                  point, or request a full checkpoint. The Inspector does not
+An outbound request signals that the agent has finished ex-           decide when to checkpoint; it reports what has changed.
+ecuting the tool actions from the previous LLM response,              Net-change Semantics. Not every OS event that the Inspec-
+marking the completion of a turn. At this point, the Coor-            tor observes is recovery-relevant. Agent execution produces
+dinator records the request–response pair into a persistent           many transient effects: Linux shells execute all commands by
+conversation log. This log serves two purposes: it defines the        forking short-lived subprocesses, and some tool invocations
+sequence of turn-aligned recovery points from which the               create temporary files that are removed within the same turn.
+agent can resume, and it provides the cached history needed           If every such event were treated as a state change, nearly ev-
+for the fast-forward mechanism described in §6.                       ery turn would appear changed, even without lasting effects.
+                                                                  6
+   The Inspector therefore defines “change” as the net change         policy based on whether each job’s checkpoint latency is
+between the last checkpoint and the current inspection point          still hidden or has already become exposed.
+(Figure 7). Transient effects that have already disappeared               The Scheduler maintains two FIFO queues: a normal queue
+are ignored; only persistent effects—a file that remains cre-         for checkpoint jobs still covered by an outstanding LLM wait
+ated or modified, a process that remains alive, or memory             window, and a high-priority queue for jobs whose matching
+pages dirtied by a long-running process—are reported. This            LLM response has already returned. New jobs enter the nor-
+semantics focuses the Inspector on exactly the state that             mal queue, since their latency can still be overlapped. If the
+must be preserved for correct recovery. We implement it               LLM response returns before the checkpoint finishes, the
+with two complementary tracking mechanisms.                           Coordinator promotes that job to the high-priority queue
+Tracking Filesystem State. We use eBPF to build a light-              (§5.1). Workers always prefer the high-priority queue. Starva-
+weight in-kernel monitor attached to the syscall raw tra-             tion cannot occur: every pending job is eventually promoted
+cepoints (sys_enter/sys_exit), which provide per-syscall              when its LLM response arrives, or has already completed
+argument visibility at low overhead. The monitor operates             in the normal queue before promotion is needed. This pol-
+at per-file granularity and records filesystem-affecting op-          icy directs limited host I/O bandwidth to jobs whose delay
+erations issued by processes in the sandbox, including file           is already visible to the agent, while deferring jobs whose
+creation, deletion, renaming, and writes. Operations to spe-          latency can still be hidden.
+cial file handles such as stdout are excluded. For each event,        Workers. Workers are concurrent processes that perform
+the monitor stores the syscall type and relevant arguments in         the actual checkpoint and restore operations using off-the-
+BPF maps, which are periodically consumed by a userspace              shelf C/R backends: CRIU [13] for process state and Open-
+daemon on the host. The daemon computes the net filesys-              ZFS [24] for filesystem state. The number of Workers is sized
+tem change since the last checkpoint. Once a checkpoint               to saturate the host’s I/O bandwidth without overwhelming
+completes, the daemon clears the accumulated BPF-map en-              it, maximizing checkpoint throughput under concurrency.
+tries, resetting the filesystem tracking baseline.                    Each Worker receives a job from the Scheduler and exe-
+Tracking Process and In-Memory State. We track process-               cutes it according to its checkpoint type. Filesystem-only
+space changes using Linux cgroups [27] together with the              checkpoints invoke a ZFS snapshot, which provides fast
+kernel’s soft-dirty page tracking mechanism [29]. Each sand-          incremental checkpointing via block-level copy-on-write.
+box is associated with a cgroup, which defines the member-            Process checkpoints invoke CRIU dump through runc, with
+ship boundary for the processes belonging to that sandbox.            incremental checkpointing enabled when applicable. Full
+Between checkpoints, the Inspector records whether the                checkpoints compose the two. For restore, Workers invoke
+cgroup has gained new processes or lost existing ones, cap-           the corresponding ZFS rollback and CRIU load operations to
+turing process creation and exit as persistent state changes.         reconstruct the requested sandbox state.
+   For processes that remain alive across the interval, we de-        Manager. Because Crab may checkpoint only filesystem
+tect memory modification via soft-dirty tracking. The Inspec-         state, only process state, or both, individual dump artifacts
+tor reads each living process’s dirty bits in /proc/PID/pagemap       are often not valid recovery points on their own. The Man-
+to determine whether the process has written to any vir-              ager therefore treats recovery state as a versioned manifest
+tual memory page since the last checkpoint. Once a check-             rather than a single artifact. Each published checkpoint ver-
+point completes, the Inspector clears the soft-dirty bits via         sion is a tuple 𝐶𝑖 = (𝑃 𝑗 , 𝐹𝑘 ), where 𝑃 𝑗 and 𝐹𝑘 denote the most
+/proc/PID/clear_refs, resetting the memory tracking base-             recent process and filesystem artifacts that together form a
+line symmetrically with the filesystem reset described above.         recoverable sandbox state.
+                                                                          Figure 8 (left) illustrates this versioning. When a turn
+5.3   C/R Engine: The Data Plane                                      checkpoints both process and filesystem state, the Manager
+                                                                      publishes a full manifest (e.g., 𝐶 0 = (𝑃0, 𝐹 0 )). When a subse-
+The C/R Engine schedules checkpoint execution under dense
+                                                                      quent turn modifies only one component, the new artifact is
+co-location (R3) and ensures that only complete, consistent
+                                                                      paired with the latest valid counterpart (e.g., 𝐶 1 = (𝑃0, 𝐹 1 ));
+recovery points are published (R1). As Figure 5 shows, it
+                                                                      turns that produce no recovery-relevant change leave the
+comprises three sub-components: the Scheduler orders check-
+                                                                      manifest unchanged. In this way, the Manager maintains a
+point jobs across co-located sandboxes to minimize exposed
+                                                                      git-like version history of recoverable states even though
+latency; the Workers execute checkpoint and restore opera-
+                                                                      individual checkpoint operations update only part of the
+tions using commodity backends; and the Manager assembles
+                                                                      sandbox state. This abstraction supports rollback to any ear-
+partial artifacts into versioned, recoverable manifests.
+                                                                      lier version, readily enabling failure recovery, spot migration,
+Scheduler. Under dense co-location, checkpoint traffic from           and tree-based RL (Table 2).
+many sandboxes can arrive in bursts that exceed the available             The Manager also ensures that checkpoint publication is
+LLM wait windows (§4.1). Because LLM wait windows are                 transactional (R1). As shown in Figure 8 (right), a checkpoint
+not predictable in advance, Crab uses a reactive scheduling
+                                                                  7
+                                        C3(head)                Submitted                                           echo “a” > foo        echo “b” >> foo
+            C1=(P0, F1)
+                                        =(P3, F4)    Coord: Enqueue       Sched: Dequeue                   FS              1                     3 C4(head)
+    FS 0         1                          4                    Pending              Dumping                                                       =(P2, F3)
+                                                                                                          Proc 0                      2
+                                                                            Worker: Done
+                                                             Error/                                                                    Fast-forward – skip Turn-3
+ Proc 0                            3                                                 Versioning
+                                                           Interrupt
+   C0=(P0, F0)                C2=(P3, F1)                                   Engine: Done                  Agent Restored Progress       Previous Progress       Fault!
+        0        1        2         3       4 Turn                Failed            Succeeded
+                                                                                                                0          1          2           3            4 Turn
+                                                                                                                   CRAB avoids redoing Turn-3 after restoring:
+Figure 8. The Checkpoint Manager maintains versioned                                                        foo’s content should be “ab” at Turn-4 – instead of “abb”
+recoverable manifests over partial filesystem and process
+checkpoints (left), and enforces transactional checkpoint                                             Figure 9. An example of fast-forwarding to handle the agent-
+publication through lifecycle tracking (right).                                                       in-a-sandbox recovery, where Turn-3 must be skipped as it
+                                                                                                      otherwise makes the sandbox states inconsistent.
+request progresses through a lifecycle: “pending” upon ar-
+rival, “dumping” once assigned to a Worker, then “versioning”                                         Agent-in-a-Sandbox. In the agent-in-a-sandbox model, the
+where the Manager combines the new artifact with the latest                                           agent itself is a long-lived process inside the sandbox (e.g.,
+compatible counterpart and constructs a new manifest. Only                                            Claude Code and Codex agents in Figure 5). If the Inspector
+after versioning completes is the checkpoint marked “done”                                            were to track the agent as an ordinary sandbox process,
+and published as recoverable. If interruption or failure occurs                                       nearly every turn would appear to modify process memory,
+at any point, the checkpoint is marked “failed” and never                                             forcing an expensive process checkpoint at turn frequency
+exposed as a recovery point. This prevents partially written                                          and defeating selective checkpointing.
+or mismatched artifacts from being used during restore.                                                  Crab therefore excludes the agent process from process-
+                                                                                                      state tracking. This avoids unnecessary and expensive pro-
+6     Deployment Refinement                                                                           cess checkpoints but creates a consistency problem during
+The core runtime described above supports both deployment                                             restore: the checkpoint manifest may pair a newer filesystem
+models introduced in §2: agent-with-a-sandbox and agent-in-                                           state with an older agent in-memory state. For example, if
+a-sandbox. Each model, however, raises a distinct recovery                                            the latest manifest combines process state from turn 2 with
+challenge. In the agent-with-a-sandbox model, a sandbox                                               filesystem state from turn 3 (Figure 9), the restored agent re-
+crash can leave an in-flight command unfinished, requiring                                            sumes at turn-2 progress while observing a turn-3 filesystem.
+the runtime to mask the failure from the external agent. In the                                       Naively continuing would replay already-completed actions
+agent-in-a-sandbox model, the agent’s own in-memory state                                             and corrupt the restored state.
+may lag behind the restored filesystem, requiring the runtime                                            Crab resolves this with a fast-forward mechanism (R1).
+to reconcile the two. This section describes the mechanisms                                           The Coordinator caches all prior request–response pairs.
+that address each challenge to ensure correct, transparent                                            After restore, when the stale agent replays an earlier request,
+recovery (R1).                                                                                        the Coordinator recognizes it as a repeated interaction and
+Agent-with-a-Sandbox. In the agent-with-a-sandbox model,                                              returns a synthetic response from the cached history instead
+the agent runs outside the sandbox and interacts with it                                              of forwarding it to the LLM. This process repeats until the
+through remote execution interfaces such as terminal or                                               agent’s logical progress catches up with the checkpoint head
+command APIs (e.g., SWE agent in Figure 5). If the sandbox                                            (Figure 9), restoring a consistent execution state without
+crashes or is preempted while a command is in flight, the                                             re-executing any actual actions.
+agent observes a failed or non-returning operation, whereas
+the restored sandbox has no record of that unfinished com-                                            7   Evaluation
+mand because checkpoints are taken only at turn boundaries.                                           We evaluate whether Crab can provide correct, low-overhead
+Exposing this failure directly would break transparency and                                           checkpoint/restore for densely co-located agent sandboxes.
+force the agent to reason about sandbox crashes.                                                      Our experiments are driven by four questions. Q1 (correct-
+    Crab hides this mismatch by presenting a reliable execu-                                          ness and end-to-end overhead): Does Crab’s selective
+tion interface. Before forwarding each sandbox command,                                               checkpointing preserve full recovery correctness, and what
+the Coordinator logs it in its persistent conversation record.                                        end-to-end overhead does it add relative to fault-free exe-
+If the sandbox is restored before the command completes, the                                          cution? (§7.2) Q2 (component overhead): What per-turn
+Coordinator detects the outstanding entry and reissues the                                            latency do the Coordinator, Inspector, and checkpoint exe-
+command against the recovered sandbox. The agent there-                                               cution each contribute? (§7.3) Q3 (mechanism effective-
+fore remains transparent to the failure: from its perspective,                                        ness): How effectively does asynchronous checkpointing
+the issued command simply returns its intended result, pre-                                           hide checkpoint cost behind LLM wait time, and how much
+serving transparent recovery (R1).                                                                    does the reactive scheduler help under contention? (§7.4) Q4
+                                                                                                  8
+             Agent                                                                                        Claude-code          iFlow-cli             SWE-agent
+                                       Benchmark                      LLM                                 [Terminal Bench]     [Terminal Bench]      [SWE Bench]
+      Name      Deployment
+                                                                                            1.0                                   1.0
+ Claude-code      in sandbox          Terminal-Bench         Claude4.6-Opus [7]                            iFlow-cli: 1.8s                           iFlow-cli: 1.5s
+                                                                                                         SWE-agent: 3.7s                              SWE-agent: 0.1s
+                                                                                            0.5                                   0.5
+
+
+
+
+                                                                                      CDF
+  iFlow-cli       in sandbox          Terminal-Bench          iFlow-ROME [46]                         Claude-code: 3.1s                            Claude-code: 0.4s
+ SWE-agent        w/ sandbox            SWE-Bench            MiniMax-M2.7 [34]
+Table 3. Agents, benchmarks, and LLMs used in evaluation.                                   0.0                                   0.0
+                                                                                                  0        20     40      60            0        25       50       75
+                                                                                                      Per-Turn LLM Time (s)                 Per-Turn Tool Time (s)
+                                                                                      Figure 11. LLM and tool execution duration distributions.
+                                 Terminal Bench
+         19%           13%     11%   10%   9%     9%            29%
+
+
+          SoftwareDev            Debugging            DataSci           other         unrelated to checkpointing and add noise to the measure-
+          SysAdmin               Security             SciComp                         ments. We then record the full agent–LLM interaction trace
+                                  SWE Bench
+                                                                                      for each task, including model outputs, reasoning traces,
+                        57%                     12%     8%   5% 5% 3%    9%
+                                                                                      and tool invocations. Our experiments replay these recorded
+   0%            20%            40%        60%           80%              100%        traces deterministically. This removes LLM stochasticity and
+             django           sphinx-doc     scikit-learn             other           isolates the effect of checkpointing, restore, and scheduling
+             sympy            pytest-dev     pydata
+                                                                                      decisions from variation in model behavior. The trace details
+                                                                                      are shown in Figure 11, where Terminal-Bench is tool-heavy
+Figure 10. Task-category composition of the sampled SWE-
+                                                                                      due to its complex shell interactions and SWE-bench is LLM-
+Bench and Terminal-Bench workloads.
+                                                                                      heavy with only lightweight tools used.
+                                                                                      Baselines. We compare Crab against four baselines that
+                                                                                      span a range of recovery fidelity and cost. The first two reflect
+(case studies): Can Crab also enhance agentic execution
+                                                                                      recovery strategies common in today’s agent frameworks;
+and enable proactive rollback, spot execution, speculative
+                                                                                      the latter two are correct but expensive alternatives.
+execution, and RL rollout branching? (§7.5)
+                                                                                      • Chat-only persists only the chat history after each turn
+                                                                                        and restores no filesystem or process state. This is the
+7.1     Experimental Setup
+                                                                                        default recovery mode in most hosted agent platforms.
+Host Platform. We evaluate Crab on an Amazon AWS                                      • Chat+FS persists conversational history together with
+c6id.32xlarge [1] instance with 128 Intel Xeon Platinum                                 filesystem state, but not process or in-memory state. This
+8375C cores, 256 GB of memory, and 4 × 1.7 TB NVMe SSDs                                 approximates frameworks that snapshot the workspace
+(2.1M/1.1M Rand R/W IOPS). Crab uses commodity C/R                                      directory between turns.
+backends: runc-CRIU (v1.3.4), and OpenZFS (v2.4.1).                                   • Restart restarts a failed task from scratch and re-executes
+Agent Configurations. Table 3 summarizes our three eval-                                the lost trajectory after sandbox failures.
+uation configurations, spanning both agent-in-a-sandbox                               • Every-turn checkpoint (FullCkpt) performs a full filesys-
+(Claude-code [8], iFlow-cli [23] on Terminal-Bench [31]) and                            tem+process checkpoint at every turn boundary.
+agent-with-a-sandbox (SWE-agent on SWE-bench [53]) de-
+ployment settings. We treat all agents as black boxes and do                          7.2         Correctness and End-to-End Overhead
+not modify their internal logic.                                                      We evaluate Crab under crash recovery, the primary target
+Benchmark Characteristics. The two benchmarks used                                    use case of the C/R capability for agent sandboxes. Each task
+in our study differ in what state matters for correctness,                            trajectory is injected with one crash at a random position;
+which directly determines how much C/R must preserve.                                 all runs use the same random seed.
+Terminal-Bench [31] covers diverse terminal-centric tasks                             Recovery Correctness. Figure 12 compares Crab with
+(Figure 10) whose success criterion depends on the full sand-                         the baselines. A run is counted as correct if it satisfies the
+box state: tasks are validated inside the same sandbox using                          benchmark’s success criterion: the entire sandbox state for
+unit tests and interactive checks, so intermediate files, pro-                        Terminal-Bench, or the final patch correctness for SWE-
+cesses, and runtime state all matter. SWE-bench [53] focuses                          bench. Crab, Restart, and FullCkpt all achieve 100% correct-
+on resolving GitHub issues in real software projects. Its suc-                        ness in all settings. Restart does so by restarting the task from
+cess criterion depends primarily on the final patch, making                           scratch after failure; FullCkpt preserves a recovery point at
+intermediate runtime state less important.                                            every turn boundary; and Crab selectively checkpoints only
+Methodology. For each benchmark, we randomly sample                                   the state that the Inspector identifies as changed (accuracy
+100 tasks that the corresponding agent can solve in a failure-                        detailed below).
+free run. This filter isolates system-level C/R overhead from                            In contrast, the lightweight baselines are substantially less
+agent capability: unsolvable tasks would introduce failures                           robust. Chat+FS reaches 100% on SWE-bench, but only 28%
+                                                                                  9
+                      CRAB          Relaunch       FullCkpt          Chat+FS          Chat Only                        Skip Checkpoint      Filesystem Only               Full Checkpoint
+               100   100 100 100             100 100 100               100 100 100 100                                            Claude-code [Terminal Bench]
+Accuracy (%)
+
+
+                80                                                                                                                                 87%                             5% 8%
+                60                                         42
+                                                                                                                                                 (12400)                          (780)(1155)
+
+                40                 28                                                                                                     iFlow-cli [Terminal Bench]
+                20                      13                      8                         9                                                70%                             25%            5%
+                 0                                                                                                                        (1454)                          (510)          (99)
+                       Claude-code                 iFlow-cli                 SWE-agent                                                    SWE-agent [SWE Bench]
+                     [Terminal Bench]          [Terminal Bench]             [SWE Bench]                                                      75%                               25%
+                                                                                                                                            (3609)                            (1225)
+
+      Figure 12. Recovery correctness under sandbox crashes.
+                                                                                                        0%                     20%            40%          60%         80%               100%
+
+                                                                                                        Figure 13. Checkpointing is highly sparse in Crab, with
+                                   Exact        Detected            Acc.↑     FPR↓       FNR↓           skip ratio greater than 70%.
+         Proc. Change         4.8% (99)          4.8% (99)      100.0%         0.0%       0.0%
+          FS Change          27.9% (575)        29.5% (609)      98.3%         2.3%       0.0%                                 Agent-in-a-Sandbox                Agent-with-a-Sandbox
+                                                                                                                       60        P50 (Median)        60             P50 (Median)
+
+
+
+
+                                                                                                       Overhead (µs)
+ Table 4. Inspector accuracy on 2,063 manually la-
+
+
+
+
+                                                                                                       Per-turn Wait
+ beled turns (iFlow-cli, Terminal-Bench). Acc=(TP+TN)/All;                                                             40        P95              40 40             P95
+                                                                                                                                     30     33
+                                                                                                                               25                                        25         26        27
+                                                                                                                                                           20 14 21 15
+ FPR=FP/(FP+TN); FNR=FN/(FN+TP).                                                                                                                     18
+                                                                                                                       20 16         17     17                                 15        16
+                                                                                                                        0                                   0
+                                                                                                                            16       32 64            96         16    32 64              96
+                                                                                                                                      Density                           Density
+ and 42% on Terminal-Bench using Claude-code and iFlow-cli.                                             Figure 14. Per-turn Coordinator overhead. Even at 96-way
+ The key difference is that SWE-bench trajectories rarely cre-                                          co-location, the Coordinator adds only tens of microseconds
+ ate long-lived processes whose state must survive recovery,                                            per turn, 4–5 orders of magnitude smaller than turn latency.
+ so restoring the filesystem is usually sufficient. Terminal-
+ Bench, however, frequently depends on background or per-
+ sistent process state, making filesystem-only recovery in-                                                Restart is substantially slower, increasing completion time
+ complete. Chat-only performs the worst, achieving only 13%                                             by up to 1.52× on Terminal-Bench and 1.67× on SWE-bench,
+ and 8% on Terminal-Bench (Claude-code and iFlow-cli) and                                               because a random crash wastes roughly half of the prior
+ 9% on SWE-bench, because restoring conversation alone                                                  work in expectation and also incurs sandbox restart over-
+ treats the sandbox as stateless and loses both filesystem and                                          head. FullCkpt performs well on SWE-bench, where turns al-
+ process state after a crash.                                                                           most exclusively modify files and filesystem checkpoints are
+ Inspector Accuracy. Crab maintains full correctness be-                                                cheap. On Terminal-Bench, however, concurrent full check-
+ cause the Inspector reliably identifies which recovery-relevant                                        points become expensive because process state must also
+ state changed at each turn. Table 4 compares the Inspector                                             be preserved. For example, at densities of 64 and 96 sand-
+ against manual labels over 2,063 turns from 100 iFlow-cli                                              boxes per host, FullCkpt for Claude-code slows execution by
+ with Terminal-Bench tasks. The Inspector has zero false nega-                                          3.06× and 3.78× due to host storage bandwidth contention,
+ tives (FNs) for both process and filesystem changes, ensuring                                          respectively, even worse than restarting from scratch.
+ that no required state is missed. Process change detection                                             Checkpoint Sparsity. Crab’s performance advantage comes
+ is exact, with 100% accuracy. Filesystem detection reaches                                             from selective checkpointing. As shown in Figure 13, up to
+ 98.3% accuracy, with a 2.3% false positive rate (FPR) and zero                                         87% of turns are skipped entirely because they change neither
+ false negatives. These false positives (FPs) arise from con-                                           process nor filesystem state. On Terminal-Bench, Claude-
+ servative file-level tracking: if a turn writes content to a file                                      code requires filesystem checkpoints for only 5% of turns
+ and later deletes it, the file is still recorded as changed. This                                      and full checkpoints for 8%; iFlow-cli requires filesystem
+ over-approximation is acceptable because it only causes an                                             checkpoints for 25% and full checkpoints for 5%. On SWE-
+ extra filesystem checkpoint, which is inexpensive (only tens                                           bench, about 25% of turns require a filesystem checkpoint,
+ of milliseconds, as shown in Figure 3 (left)).                                                         while almost none require a full checkpoint.
+ End-to-End Overhead. We next measure end-to-end task
+ completion time, from the beginning of a task’s first turn to                                          7.3            Component Overhead
+ the end of its last turn, under deployment densities from 16                                          We break down the per-turn overhead of each component
+ to 96 co-located sandboxes per host. We only compare Crab                                             on Crab’s critical path: the Coordinator, the Inspector, and
+ against baselines that ensure recovery correctness, since it is                                       checkpoint execution.
+ meaningless to measure performance of incorrect baselines.                                            Coordinator Overhead. The Coordinator lies on the agent–
+ Figure 15 shows that, despite one crash and recovery per task,                                        LLM critical path and must therefore be fast. Figure 14 shows
+ Crab stays within 0–1.9% of an optimal no-fault execution                                             that its per-turn overhead remains in the tens of microsec-
+ on both Terminal-Bench and SWE-bench.                                                                 onds even at a deployment density of 96 sandboxes per host:
+                                                                                                  10
+              1.0              Density 16 Optimal (Fault-free,
+                                                    1.0
+                                                               w/oDensity
+                                                                   checkpointing)
+                                                                          32                              1.0
+                                                                                                                       CRAB DensityFullCkpt
+                                                                                                                                    64                             1.0
+                                                                                                                                                                         Restart Density 96
+Claude-code
+
+
+                Optimal: 107s                                   Optimal: 106s                                   Optimal: 111s                                             Optimal: 126s
+                 CRAB: 108s                                      CRAB: 108s                                      CRAB: 111s                                                CRAB: 127s
+    CDF
+
+
+              0.5                                             0.5                                         0.5                                                      0.5
+                                FullCkpt: 107s                                  FullCkpt: 146s                                            FullCkpt: 340s                                             FullCkpt: 476s
+                                   Restart: 160s                                 Restart: 166s                                          Restart: 169s                                             Restart: 201s
+              0.0                                             0.0                                         0.0                                                      0.0
+                          102                 103                        102                103                             102                 103                                    102               103
+              1.0                                             1.0                                         1.0                                                      1.0
+                    Optimal: 104s                                   Optimal: 103s                                      Optimal: 106s                                           Optimal: 111s
+                     CRAB: 105s                                      CRAB: 103s                                         CRAB: 108s                                              CRAB: 112s
+iFlow-cli
+   CDF
+
+
+
+
+              0.5                                             0.5                                          0.5                                                      0.5
+                                     FullCkpt: 107s                                 FullCkpt: 117s                                        FullCkpt: 179s                                            FullCkpt: 232s
+                                        Restart: 161s                                  Restart: 173s                                      Restart: 174s                                            Restart: 177s
+              0.0                                             0.0                                          0.0                                                      0.0
+                               102              103                           102             103                                 102             103                                       102            103
+              1.0                                             1.0                                          1.0                                                      1.0
+                    Optimal: 197s                                   Optimal: 197s                                      Optimal: 198s                                           Optimal: 202s
+SWE-agent
+
+
+
+
+                     CRAB: 197s                                      CRAB: 197s                                         CRAB: 198s                                              CRAB: 202s
+  CDF
+
+
+
+
+              0.5                                             0.5                                          0.5                                                      0.5
+                                       FullCkpt: 198s                                 FullCkpt: 198s                                     FullCkpt: 199s                                            FullCkpt: 202s
+                                        Restart: 304s                                  Restart: 300s                                      Restart: 317s                                             Restart: 307s
+              0.0                                             0.0                                          0.0                                                      0.0
+                         102                   103                      102                   103                           102                  103                                  102                 103
+                         Task Duration (s)                               Task Duration (s)                                  Task Duration (s)                                          Task Duration (s)
+ Figure 15. End-to-end performance comparison across benchmarks and deployment densities under a crash recovery scenario
+ for Claude-code, iFlow-cli, and SWE-agent. Crab remains within 1.9% of the no-fault, checkpoint-free optimal.
+
+                    Density:      16                     32          64         96                                 Overall Dump-Time Distribution                                      Quantile Composition
+                     Agent-in-a-Sandbox                         Agent-with-a-Sandbox                                  P50/P95/P99=0.1/0.7/1.0s 1.0
+
+
+
+
+                                                                                                                                                           Bucket mean (ms)
+      1.0                                               1.0                                                        75                                                                     total
+                                                                                                                                                                              600
+                                                                                                         Checkpoints
+                               16: 54ms                                         16: 31ms                                                                                                  process
+                               32: 55ms                                         32: 33ms                           50                          0.5                            400         filesystem
+
+
+
+
+                                                                                                                                                                 CDF
+      0.5                                               0.5
+CDF
+
+
+
+
+                               64: 65ms                                          64: 45ms
+                                96: 72ms                                         96: 47ms                          25                                                                     metadata
+                                                                                                                                                                              200
+      0.0                                               0.0
+                         102                   103                          102                                     0                          0.0                              0
+                        Duration (ms)                                 Duration (ms)                                            102        103                                       00-10 20-30 40-50 60-70 80-90
+                                                                                                                    Checkpoint dump time (ms)                                       Total-time percentile bucket
+ Figure 16. CDF of the Inspector’s per-turn overhead across
+ deployment densities for agent-in/with-a-sandbox.                                                        Figure 17. Checkpoint latency breakdown. Left: distribution
+                                                                                                          of checkpoint latency. Right: checkpoint composition by
+                                                                                                          latency quantile. Most checkpoints are fast filesystem-only
+the median overhead is 18/16 µs for agent-in/with-a-sandbox                                               dumps, while the long tail is dominated by process dumps.
+deployments, and the p95 is 40/27 µs. Compared with LLM
+and tool latency (Figure 11), this is 4–5 orders of magni-                                                fails and delay becomes exposed. Figure 17 (left) shows a
+tude smaller and contributes less than 0.02% overhead. The                                                clear bimodal distribution: one mode at roughly 20–100 ms
+Coordinator is fast because it only forwards conversation                                                 and the other at 700–1000 ms. The fast mode corresponds
+metadata and performs no data-intensive operations.                                                       to filesystem-only checkpoints, while the slow mode corre-
+Inspector Latency. The Inspector runs asynchronously after                                                sponds to process checkpoints. Overall checkpoint latency
+each turn and is typically hidden behind the LLM wait window,                                             has p50/p95/p99 of 0.1/0.7/1.0 s. The composition plot (right)
+so its latency is usually not exposed on the agent’s critical                                             shows that up to the 70th percentile, nearly all checkpoints
+path (§5.2). Even in absolute terms, it remains modest: as                                                complete within 50 ms and are filesystem-only; the near-
+shown in Figure 16, for agent-in-a-sandbox deployment (left),                                             second tail is almost entirely due to process checkpointing.
+the median inspection latency is 54–72 ms from 16 to 96
+sandboxes per host; for agent-with-a-sandbox deployment                                                   7.4            Mechanism Effectiveness
+(right), it is 31–47 ms. The p95 latency stays below 200 ms in                                            We next evaluate how effectively Crab hides checkpoint
+all settings. Agent-in-a-sandbox latency is higher because the                                            latency behind LLM waiting (§5.1), and how much the C/R
+eBPF hooks must also trace the agent process’s syscalls inside                                            Engine’s reactive scheduler (§5.3) helps when that overlap
+the sandbox, increasing event volume. This low overhead                                                   becomes scarce. We use Terminal-Bench for this study be-
+comes from a lightweight design: eBPF records only a small                                                cause it contains frequent process checkpoints and therefore
+amount of per-event state, and the daemon performs simple                                                 stresses the system more than SWE-bench, whose check-
+per-sandbox net-change analysis in C.                                                                     points are almost exclusively filesystem-only.
+Checkpoint Latency Breakdown. Checkpoint execution                                                        Async Checkpointing. We first measure, for each task, the
+is also asynchronous and is often hidden within the LLM wait                                              fraction of end-to-end runtime spent waiting at the comple-
+window, but its raw latency still determines when overlap                                                 tion gate for an unfinished checkpoint. Figure 18 (left) shows
+                                                                                                    11
+            Exposed Delay vs. Density                 Exposed Delay vs. Scheduling                           Duration vs. Preemptions 3     Token Reduction for RL
+      1.0                                          1.0                                                    1.0                                 Baseline      CRAB
+
+
+
+
+                                                                                                                                   Total Tokens (M)
+              16: 0.000%                 16                                                                                                                        -64.2%
+              32: 0.000%                                                                                                              2                      -58.0%
+      0.5                                32        0.5                                                                                                 -56.5%
+CDF
+
+
+
+              64: 0.000%                                                                                  0.5
+
+
+
+
+                                                                                                    CDF
+                                         64                           fifo-0.2     react-0.2                                 0    3            -48.7%
+              96: 0.000%
+                                         96                           fifo-0.4     react-0.4
+                                                                                                                             1    4   1 -40.0%
+      0.0                                          0.0                fifo-0.6     react-0.6
+                                                                                                                             2    5
+        0.0     2.5 5.0 7.5 10.0                         0         20         40                          0.0                         0
+               Exposed Delay (%)                              Exposed Delay (%)                                102             103        1      2       3     4     5
+                                                                                                                Task Duration (s)           Tree Branches per Trial
+Figure 18. Effectiveness of asynchronous checkpointing and
+reactive scheduling. Left: task-level exposed delay under                                           Figure 20. Case studies. Left: Task duration CDF at 1-5 pre-
+different sandbox densities. Right: task-level exposed delay                                        emption events injected to each task. Right: Token reduction
+under reduced LLM wait windows and different scheduling                                             for tree-based RL rollouts with 1-5 tree branches per trial.
+policies. The stress test scales the original LLM wait window
+to 0.2×/0.4×/0.6× of its original distribution at density 96.
+                                                                                                    C/R mechanism to the agent as a tool (sbx.rollback(ckpt))
+                                                                                                    can also enhance agentic execution by replacing expensive
+              Forward           Shell-level           Stall (unkill          rollback() API         shell-level self-recovery with a single O(1) API call when the
+              progress          rollback              -able proc.)           call (~1 s)
+                                 Case A: QEMU startup (52 steps)                                    agent corrupts its workspace. To study this question, we an-
+                                RB1 RB2           RB3 RB4 RB5 RB6 434s                              alyze two successful Terminal-Bench runs (Claude Opus-4.6)
+   Baseline                                            307s
+ w/ C/R tool                                                                                        that nonetheless spend a large fraction of their step budget
+               0         50 100 150 200 250 300 350 400                                             undoing earlier mistakes. Figure 19 presents each run as a
+                          Case B: financial-document-processor (18 steps)                           swim-lane. The Baseline lane shows the executed trajectory.
+                                         RB1            RB2 RB3           918s                      The w/ C/R tool lane replaces each detected rollback sequence
+   Baseline                                                             891s
+ w/ C/R tool                                                                                        with a single rollback() event at the measured p99 latency
+               0              200               400            600               800                (1.00 s), while keeping all forward-progress steps unchanged.
+                                              Wall-clock time (s)                                      In Case A (QEMU startup), the agent boots an Alpine ISO
+                                                                                                    using QEMU until telnet 127.0.0.1 6665 returns a login
+Figure 19. Proactive-rollback case studies: baseline vs. an
+                                                                                                    prompt. The baseline completes in 52 steps (434 s). Six roll-
+agent equipped with a rollback() tool. A: QEMU startup,
+                                                                                                    back sequences consume 17 steps, 30.7% of wall-clock time,
+434 s → 307 s (−29%); RB2/RB4 stalls (orange) can be avoided.
+                                                                                                    and 50% of the trajectory’s tokens (14.3 K of 28.7 K). The main
+B: financial document classification, −3% wall clock but −36%
+                                                                                                    inefficiency is a ~3-minute partial-cleanup (self-recovery)
+rollback tokens.
+                                                                                                    and stall in which an unkillable QEMU process keeps port
+the CDF from 16 to 96 co-located sandboxes per host. Asyn-                                          6665 occupied despite repeated kill -9 attempts (RB2/RB4).
+chronous checkpointing (§5.1) hides nearly all checkpoint                                           Replacing these sequences with rollback() shortens the
+cost: the median exposed delay is zero across all densities,                                        trajectory by 29%. More importantly, sandbox-level rollback
+meaning that for at least half of all tasks the checkpoint                                          restores a consistent known-good state and avoids such
+completes entirely within the LLM wait window. Even at the                                          partial-cleanup stalls entirely.
+95th percentile, exposed delay remains small: 0.00%, 0.37%,                                            In Case B (financial-document-processor), the agent classi-
+0.44%, and 3.65% at densities 16, 32, 64, and 96.                                                   fies 17 mixed JPG/PDF documents. It runs four successive
+Reactive Scheduling. We next stress the scheduler under                                             classifier scripts, each writing results directly into the target
+the hardest setting: 96 sandboxes per host, with the LLM                                            directories, while the first three are wrong. As a result, three
+wait window scaled down to 0.2×, 0.4×, and 0.6× of its orig-                                        rollback sequences (RB1–RB3) repeat the same cleanup boil-
+inal distribution. Smaller scaling factors both shorten the                                         erplate, mv FILES /app/documents/; rm -f summary.csv,
+time available to overlap checkpointing and increase check-                                         consuming 22.8 K of 62.9 K incremental tokens (36%). The
+point arrival rate by reducing turn duration. Figure 18 (right)                                     wall-clock savings are modest (2.9%) because these steps are
+compares the C/R Engine’s reactive scheduler with a FIFO                                            filesystem-only; runtime is dominated by reasoning about
+baseline across all three scaling factors. Overall, reactive                                        the earlier error rather than by cleanup itself. However, the
+scheduling reduces median exposed delay by up to 41.6%                                              shell-level cleanup is brittle and sensitive to path changes,
+and p95 delay by up to 31.3%. The benefit comes from pri-                                           whereas sandbox-level rollback avoids this failure risk.
+oritizing checkpoints whose LLM response has already re-                                            Speculative Execution. Another agent-facing use of C/R
+turned, so work that has become exposed on the critical path                                        is speculative execution. At each turn, a small and fast draft
+is completed before checkpoints that can still remain hidden.                                       model proposes a candidate action, which Crab executes on a
+                                                                                                    forked sandbox while the oracle model computes the ground-
+7.5         Case Study                                                                              truth action in parallel. If the two actions match, Crab com-
+Proactive Rollback. Conventional systems treat C/R as an                                            mits the fork’s post-action state and skips re-executing the
+agent-transparent safeguard. We ask whether exposing the                                            oracle action, thereby hiding the action latency behind the
+                                                                                               12
+              End-to-end Task Duration               Per-task Reject Penalty         from the saved intermediate state. Figure 20 (right) varies
+        1.0                                    1.0
+                                                                                     the number of branches per trial from 1 to 5. Across them,
+        0.5                   w/o spec         0.5                                   Crab reduces rollout tokens by 40.0–64.2%, showing that
+  CDF
+
+
+
+
+                                         CDF
+                              med=224s                                               efficient C/R can eliminate redundant prefix re-execution
+                              w/ spec                               Penalty
+                              med=206s                              med=2.18         and reduce RL post-training cost.
+        0.0                                    0.0
+                   102           103                 0          5          10
+                   Task Duration (s)                     Per-task penalty (s)
+                                                                                     8   Related Work
+Figure 21. Speculative execution on SWE-Bench tasks.
+                                                                                     Sandboxed Environments for Agents. Agent platforms
+Left: Per-task wall-clock w/ and w/o speculation (observed).
+                                                                                     execute tools inside isolated containers or microVMs [16,
+Right: Per-task penalty CDF (i.e., extra time the agent stalls
+                                                                                     22, 42, 53], focusing on provisioning, isolation, and reuse.
+due to rejected drafts.)
+                                                                                     Crab addresses an orthogonal concern: when and what to
+                                                                                     checkpoint by inferring recovery-relevant state from OS-
+oracle model’s inference time. If they differ, Crab discards                         visible effects at turn boundaries.
+the fork and executes the oracle action on the main sandbox.                         C/R and Persistent-State Recovery. Checkpoint/restore
+This use case requires efficient sandbox fork and rollback.                          has long served migration, preemption, and failure recov-
+   We evaluate this design on SWE-Bench tasks driven by                              ery at the process [4, 13, 21], container [38], VM [19], and
+SWE-agent. We emulate speculation with a draft model that                            whole-system levels [49]. Recent work targets modern work-
+is 10× faster than the oracle but achieves only about 50% ac-                        loads such as differential checkpointing for distributed train-
+ceptance. As shown in Figure 21, speculation reduces median                          ing [18, 35, 48] and resilient LLM serving [32, 44, 50–52,
+task time from 224.1 s to 206.5 s, a 17.6 s (7.9%) improvement.                      55]. These systems checkpoint either full system state or
+The median penalty from mis-speculation is only 2.2 s, or                            application-managed state (e.g., DNN weights). Crab instead
+0.9% of total task time. Since the majority of turns are state-                      infers checkpoint granularity from OS-visible turn effects—a
+less, 58.0% of fork requests during execution reuse the fork                         mechanism absent from prior C/R work.
+from the previous turn because the sandbox state has not                             Reducing Checkpoint and Snapshot Overhead. Incre-
+changed, which avoids a fresh clone and restore.                                     mental checkpointing [13, 36], asynchronous flushing [10],
+Spot Execution. We next evaluate whether Crab can sup-                               and storage-aware checkpointing [24, 37, 43] reduce per-
+port migration for preemptible spot-agent execution. In this                         snapshot cost. These techniques are also applied in cloud
+setting, each sandbox may be preempted with a 60 s advance                           serverless systems [2, 9, 11, 15] to accelerate cold starts and
+notice, with preemption events injected at random. Upon re-                          migration. Crab is complementary: rather than optimizing
+ceiving a preemption notice, Crab checkpoints the sandbox                            a single snapshot, it maintains evolving recovery points,
+on the preempted host; once a replacement instance is provi-                         overlaps C/R with LLM wait windows, and schedules check-
+sioned, the checkpoint is restored on it. Checkpoint and re-                         point traffic at host scope. Its eBPF-based Inspector draws
+store together complete in under 1 s (median/p95: 0.71/1.00 s),                      on kernel-level tracing techniques [28] but repurposes them
+so migration overhead is fully hidden whenever provision-                            to infer recovery-relevant state at agent-turn granularity.
+ing finishes within the 60 s grace period. To stress this path,
+we place sandbox storage on a shared EBS volume with                                 9   Conclusion
+only 500 MB/s peak bandwidth (substantially slower than                              Agent sandboxes accumulate OS state that existing C/R mech-
+local NVMe SSDs), fix density at 96 sandboxes per host, and                          anisms either fail to capture or capture too aggressively. The
+vary preemption frequency so that each task experiences                              root cause is an agent–OS semantic gap that leaves neither
+1–5 preemptions. Figure 20 (left) shows that, relative to a                          layer with the information needed for efficient recovery.
+no-preemption baseline, Crab adds only 0.45–3.01% median                             Crab bridges this gap by observing that most agent turns
+and 1.01–7.30% p95 time-to-solve, confirming that fast C/R                           produce no recovery-relevant state, enabling a host-side run-
+supports spot execution even under repeated preemptions                              time that infers checkpoint granularity from OS-visible ef-
+and constrained storage bandwidth.                                                   fects, overlaps C/R with LLM wait time, and schedules check-
+RL Rollouts. Finally, we evaluate whether Crab can reduce                            point traffic across co-located sandboxes. On shell-intensive
+the cost of tree-based RL post-training by reusing intermedi-                        and code-repair workloads, Crab raises recovery correct-
+ate sandbox state across branched rollouts [25]. In this set-                        ness from 8% to 100%, cuts checkpoint traffic by up to 87%,
+ting, the agent first explores one rollout branch, then forks                        and stays within 1.9% of fault-free execution time. More
+additional rollouts from a randomly chosen intermediate                              broadly, our results suggest that OS-visible effects of opaque
+point along the explored trajectory. We set the original batch                       workloads can serve as lightweight semantic signals for adap-
+size to 16, so a branching factor of 4 yields an effective batch                     tive state management—a principle applicable beyond C/R
+size of 64. Without checkpoint reuse, each new rollout must                          to scheduling, resource isolation, and security auditing of
+re-execute the shared prefix; with Crab, it resumes directly                         agent sandboxes.
+                                                                                13
+References                                                                                Smelyanskiy, and Murali Annavaram. 2022. Check-N-Run: A Check-
+ [1] Amazon Web Services. 2026. Amazon EC2 C6id Instances. https:                         pointing System for Training Deep Learning Recommendation Models.
+     //aws.amazon.com/ec2/instance-types/c6i/. Accessed 2026-03-26.                       In 19th USENIX Symposium on Networked Systems Design and Imple-
+ [2] Amazon Web Services. 2026. Improving startup performance with                        mentation (NSDI). USENIX Association, Renton, WA, USA, 929–943.
+     AWS Lambda SnapStart. https://docs.aws.amazon.com/lambda/latest/                     https://www.usenix.org/conference/nsdi22/presentation/eisenman
+     dg/snapstart.html. Accessed 2026-03-26.                                         [19] Firecracker. 2026. Firecracker Snapshotting. https://github.com/firec
+ [3] Amazon Web Services. 2026. Spot Instance interruption notices (Ama-                  racker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-
+     zon EC2 User Guide). https://docs.aws.amazon.com/AWSEC2/lates                        support.md. Accessed 2026-03-17.
+     t/UserGuide/spot-instance-termination-notices.html Documents                    [20] Wei Gao, Yuheng Zhao, Tianyuan Wu, Shaopan Xiong, Weixun Wang,
+     that interruption notices are issued two minutes before interruption.                Dakai An, Lunxi Cao, Dilxat Muhtar, Zichen Liu, Haizhou Zhao, Ju
+     Accessed: 2026-03-16.                                                                Huang, Siran Yang, Yongbin Li, Wenbo Su, Jiamang Wang, Lin Qu, Bo
+ [4] Jason Ansel, Kapil Arya, and Gene Cooperman. 2009. DMTCP: Trans-                     Zheng, and Wei Wang. 2025. RollArt: Scaling Agentic RL Training
+     parent Checkpointing for Cluster Computations and the Desktop.                       via Disaggregated Infrastructure. arXiv:2512.22560 [cs.DC] https:
+     In Proceedings of the IEEE International Parallel and Distributed Pro-               //arxiv.org/abs/2512.22560
+     cessing Symposium (IPDPS). IEEE, Rome, Italy, 12 pages. https:                  [21] Paul H Hargrove and Jason C Duell. 2006. Berkeley lab check-
+     //people.csail.mit.edu/jansel/papers/2009ipdps-dmtcp.pdf                             point/restart (blcr) for linux clusters. Journal of Physics: Conference
+ [5] Anthropic. 2025. Multi-Agent Research System. https://www.anthro                     Series 46, 1 (2006), 494–499.
+     pic.com/engineering/multi-agent-research-system. 2026-04-01.                    [22] Jialiang Huang, Mingxing Zhang, Teng Ma, Zheng Liu, Sixing Lin,
+ [6] Anthropic. 2026. Checkpointing (Claude Code Docs). https://code.cla                  Kang Chen, Jinlei Jiang, Xia Liao, Yingdi Shan, Ning Zhang, Mengting
+     ude.com/docs/en/checkpointing Accessed: 2026-03-16.                                  Lu, Tao Ma, Haifeng Gong, and Yongwei Wu. 2024. TrEnv: Trans-
+ [7] Anthropic. 2026. Claude 4.6. https://www.anthropic.com/claude.                       parently Share Serverless Execution Environments Across Different
+     Accessed 2026-03-26.                                                                 Functions and Nodes. In ACM SIGOPS Symposium on Operating Sys-
+ [8] Anthropic. 2026. Claude Code Overview (Claude Code Docs). https:                     tems Principles (SOSP). ACM, Hilton Austin, Texas, USA, 421–437.
+     //code.claude.com/docs/en/overview Accessed: 2026-03-16.                             doi:10.1145/3694715.3695967
+ [9] Lixiang Ao, George Porter, and Geoffrey M Voelker. 2022. Faasnap: Faas          [23] iFlow-cli. 2026. iFlow-cli. https://cli.iflow.cn/. Accessed 2026-03-26.
+     made fast using snapshot-based vms. In Proceedings of the Seventeenth           [24] illumos Project. 2026. Working With ZFS Snapshots and Clones (ZFS
+     European Conference on Computer Systems. ACM, Rennes, France, 730–                   Administration Guide). https://www.illumos.org/books/zfs-admi
+     746.                                                                                 n/snapshots.html Defines ZFS snapshots as read-only, near-instant,
+[10] Leonardo Bautista-Gomez, Seiji Tsuboi, Dimitri Komatitsch, Franck                    copy-on-write point-in-time filesystem copies. Accessed: 2026-03-16.
+     Cappello, Naoya Maruyama, and Satoshi Matsuoka. 2011. FTI: High                 [25] Yuxiang Ji, Ziyu Ma, Yong Wang, Guanhua Chen, Xiangxiang Chu, and
+     performance fault tolerance interface for hybrid systems. In Proceed-                Liaoni Wu. 2026. Tree Search for LLM Agent Reinforcement Learning.
+     ings of 2011 international conference for high performance computing,                arXiv:2509.21240 [cs.LG] https://arxiv.org/abs/2509.21240
+     networking, storage and analysis. ACM, Seattle, WA, USA, 1–32.                  [26] LangChain. 2026. Persistence (LangGraph Docs). https://docs.langcha
+[11] James Cadden, Thomas Unger, Yara Awad, Han Dong, Orran Krieger,                      in.com/oss/python/langgraph/persistence Describes checkpointing of
+     and Jonathan Appavoo. 2020. SEUSS: Skip Redundant Paths to Make                      graph state at every step, threads, and time-travel debugging. Accessed:
+     Serverless Fast. In European Conference on Computer Systems (EuroSys).               2026-03-16.
+     ACM, New York, NY, USA, 1 – 15. doi:10.1145/3342195.3392698                     [27] Linux Kernel Developers. 2026. Control Groups (cgroups) v2 (Linux
+[12] Yang Chen. 2015. Checkpoint and restore of micro-service in docker                   Kernel Documentation). https://docs.kernel.org/admin-guide/cgroup-
+     containers. In 2015 3rd International Conference on Mechatronics and                 v2.html Describes the unified cgroup hierarchy for resource control
+     Industrial Informatics (ICMII 2015). Atlantis Press, Zhuhai, China, 915–             and process grouping. Accessed: 2026-03-16.
+     918.                                                                            [28] Linux Kernel Developers. 2026. eBPF Syscall (Linux Kernel Documen-
+[13] CRIU Project. 2025. CRIU: Checkpoint/Restore In Userspace (Main                      tation). https://docs.kernel.org/userspace-api/ebpf/syscall.html
+     Page). https://criu.org/Main_Page Describes freezing containers/apps                 Reference for loading/attaching eBPF programs (including tracing/c-
+     and checkpointing state to disk. Accessed: 2026-03-16.                               group attachment points). Accessed: 2026-03-16.
+[14] Xinhao Deng, Yixiang Zhang, Jiaqing Wu, Jiaqi Bai, Sibo Yi, Zhuoheng            [29] Linux Kernel Developers. 2026. Soft-Dirty PTEs (Linux Kernel Doc-
+     Zou, Yue Xiao, Rennai Qiu, Jianan Ma, Jialuo Chen, Xiaohu Du, Xiao-                  umentation). https://www.kernel.org/doc/html/v5.4/admin-
+     fang Yang, Shiwen Cui, Changhua Meng, Weiqiang Wang, Jiaxing Song,                   guide/mm/soft-dirty.html Describes soft-dirty tracking. Accessed:
+     Ke Xu, and Qi Li. 2026. Taming OpenClaw: Security Analysis and Mit-                  2026-03-16.
+     igation of Autonomous LLM Agent Threats. arXiv:2603.11619 [cs.CR]               [30] LlamaIndex. 2026. Maintaining state (LlamaIndex Docs). https://deve
+     https://arxiv.org/abs/2603.11619                                                     lopers.llamaindex.ai/python/framework/understanding/agent/state/
+[15] Dong Du, Tianyi Yu, Yubin Xia, Binyu Zang, Guanglu Yan, Chenggang                    Explains that AgentWorkflow is stateless by default and uses Context
+     Qin, Qixuan Wu, and Haibo Chen. 2020. Catalyzer: Sub-millisecond                     to maintain state across runs. Accessed: 2026-03-16.
+     Startup for Serverless Computing with Initialization-less Booting. In           [31] Mike A. Merrill, Alexander G. Shaw, Nicholas Carlini, et al. 2026.
+     International Conference on Architectural Support for Programming Lan-               Terminal-Bench: Benchmarking Agents on Hard, Realistic Tasks in
+     guages and Operating Systems (ASPLOS). ACM, Lausanne, Switzerland,                   Command Line Interfaces. arXiv:2601.11868 [cs.AI]
+     467–481. doi:10.1145/3373376.3378512                                            [32] Xupeng Miao, Chunan Shi, Jiangfei Duan, Xiaoli Xi, Dahua Lin, Bin
+[16] E2B. 2026. E2B Documentation. https://e2b.dev/docs Describes                         Cui, and Zhihao Jia. 2024. SpotServe: Serving Generative Large Lan-
+     isolated sandboxes for agents to execute code, process data, and run                 guage Models on Preemptible Instances. In Proceedings of the 29th
+     tools. Accessed: 2026-03-16.                                                         ACM International Conference on Architectural Support for Program-
+[17] E2B. 2026. Sandbox Snapshots. https://e2b.dev/docs/sandbox/snaps                     ming Languages and Operating Systems, Volume 2 (La Jolla, CA, USA)
+     hots. Accessed 2026-03-17.                                                           (ASPLOS ’24). Association for Computing Machinery, New York, NY,
+[18] Assaf Eisenman, Kiran Kumar Matam, Steven Ingram, Dheevatsa                          USA, 1112–1127. doi:10.1145/3620665.3640411
+     Mudigere, Raghuraman Krishnamoorthi, Krishnakumar Nair, Misha                   [33] Microsoft. 2026. Managing State (AutoGen Docs). https://microsof
+                                                                                          t.github.io/autogen/stable/user-guide/agentchat-user-guide/tuto
+
+                                                                                14
+     rial/state.html Official tutorial on saving/loading agent/team state.            [49] Fangnuo Wu, Mingkai Dong, Gequan Mo, and Haibo Chen. 2023.
+     Accessed: 2026-03-16.                                                                 Treesls: A whole-system persistent microkernel with tree-structured
+[34] MiniMax. 2026. MiniMax M2.7. https://www.minimaxi.com/models/                         state checkpoint on nvm. In Proceedings of the 29th Symposium on
+     text/m27. Accessed 2026-03-26.                                                        Operating Systems Principles. ACM, Koblenz, Germany, 1–16.
+[35] Jayashree Mohan, Amar Phanishayee, and Vijay Chidambaram. 2021.                  [50] Li Wu, Walid A. Hanafy, Tarek Abdelzaher, David Irwin, Jesse
+     CheckFreq: Frequent, Fine-Grained DNN Checkpointing. In 19th                          Milzman, and Prashant Shenoy. 2025. FailLite: Failure-Resilient
+     USENIX Conference on File and Storage Technologies (FAST). USENIX                     Model Serving for Resource-Constrained Edge Environments.
+     Association, Virtual Event, 203–216. https://www.usenix.org/confere                   arXiv:2504.15856 [cs.DC] https://arxiv.org/abs/2504.15856
+     nce/fast21/presentation/mohan                                                    [51] Wendong Xu, Chujie Chen, He Xiao, Kuan Li, Jing Xiong, Chen Zhang,
+[36] Adam Moody, Greg Bronevetsky, Kathryn Mohror, and Bronis R                            Wenyong Zhou, Chaofan Tao, Yang Bai, Bei Yu, and Ngai Wong. 2025.
+     De Supinski. 2010. Design, modeling, and evaluation of a scalable                     AnchorTP: Resilient LLM Inference with State-Preserving Elastic Ten-
+     multi-level checkpointing system. In SC’10: Proceedings of the 2010                   sor Parallelism. arXiv:2511.11617 [cs.DC] https://arxiv.org/abs/2511.1
+     ACM/IEEE International Conference for High Performance Computing,                     1617
+     Networking, Storage and Analysis. IEEE, New Orleans, LA, USA, 1–11.              [52] Ziyi Xu, Zhiqiang Xie, Swapnil Gandhi, and Christos
+[37] Bogdan Nicolae, Adam Moody, Gregory Kosinovsky, Kathryn Mohror,                       Kozyrakis. 2025. FailSafe: High-performance Resilient Serving.
+     and Franck Cappello. 2021. VELOC: VEry Low Overhead Checkpoint-                       arXiv:2511.14116 [cs.DC] https://arxiv.org/abs/2511.14116
+     ing in the Age of Exascale. arXiv:2103.02131. https://arxiv.org/abs/21           [53] John Yang, Carlos E Jimenez, Alexander Wettig, Kilian Lieret, Shunyu
+     03.02131                                                                              Yao, Karthik Narasimhan, and Ofir Press. 2024. Swe-agent: Agent-
+[38] Open Container Initiative. 2026. runc Checkpoint/Restore Documen-                     computer interfaces enable automated software engineering. Advances
+     tation. https://github.com/opencontainers/runc/blob/main/docs/ch                      in Neural Information Processing Systems 37 (2024), 50528–50652.
+     eckpoint-restore.md Documents runc checkpoint/restore integration                [54] Naimeng Ye, Arnav Ahuja, Georgios Liargkovas, Yunan Lu, Kostis
+     with CRIU. Accessed: 2026-03-16.                                                      Kaffes, and Tianyi Peng. 2026. Speculative Actions: A Lossless
+[39] OpenAI. 2026. Codex Overview (OpenAI Codex Docs). https://open                        Framework for Faster Agentic Systems. arXiv:2510.04371 [cs.AI]
+     ai.com/codex/ Accessed: 2026-03-16.                                                   https://arxiv.org/abs/2510.04371
+[40] OpenAI. 2026. Run Long-Horizon Tasks with Codex. https://develope                [55] Songyu Zhang, Aaron Tam, Myungjin Lee, Shixiong Qi, and K. K.
+     rs.openai.com/blog/run-long-horizon-tasks-with-codex. 2026-04-01.                     Ramakrishnan. 2026. Making MoE-based LLM Inference Resilient with
+[41] OpenClaw. 2026. Sandboxing (OpenClaw Docs). https://docs.ope                          Tarragon. arXiv:2601.01310 [cs.DC] https://arxiv.org/abs/2601.01310
+     nclaw.ai/gateway/sandboxing Explains that gateway stays on host;                 [56] Yusheng Zheng, Jiakun Fan, Quanzhi Fu, Yiwei Yang, Wei Zhang, and
+     tool execution can run in Docker sandbox; sandboxing reduces blast                    Andi Quinn. 2026. AgentCgroup: Understanding and Controlling OS
+     radius but is not a perfect boundary. Accessed: 2026-03-16.                           Resources of AI Agents. arXiv:2602.09345 [cs.OS]
+[42] OpenHands. 2026. Docker Sandbox (OpenHands Docs). https://do
+     cs.openhands.dev/openhands/usage/sandboxes/docker States that
+     Docker sandbox runs the agent server inside a Docker container by
+     default/recommended. Accessed: 2026-03-16.
+[43] Ohad Rodeh, Josef Bacik, and Chris Mason. 2013. BTRFS: The Linux
+     B-Tree Filesystem. ACM Trans. Storage 9, 3, Article 9 (Aug. 2013),
+     32 pages. doi:10.1145/2501620.2501623
+[44] Foteini Strati, Sara McAllister, Amar Phanishayee, Jakub Tarnawski,
+     and Ana Klimovic. 2024. DéjàVu: KV-cache streaming for fast, fault-
+     tolerant generative LLM serving. In Proceedings of the 41st International
+     Conference on Machine Learning (Vienna, Austria) (ICML’24). JMLR.org,
+     Article 1902, 27 pages.
+[45] Taiyi Wang, Sian Gooding, Florian Hartmann, Oriana Riva, and Edward
+     Grefenstette. 2026. A Subgoal-driven Framework for Improving Long-
+     Horizon LLM Agents. arXiv:2603.19685 [cs.AI] https://arxiv.org/abs/
+     2603.19685
+[46] Weixun Wang, XiaoXiao Xu, Wanhe An, Fangwen Dai, Wei Gao,
+     Yancheng He, Ju Huang, Qiang Ji, Hanqi Jin, Xiaoyang Li, et al.
+     2026. Let It Flow: Agentic Crafting on Rock and Roll, Building
+     the ROME Model within an Open Agentic Learning Ecosystem.
+     arXiv:2512.24873 [cs.AI] https://arxiv.org/abs/2512.24873
+[47] Xingyao Wang, Boxuan Li, Yufan Song, Frank F. Xu, Xiangru Tang,
+     Mingchen Zhuge, Jiayi Pan, Yueqi Song, Bowen Li, Jaskirat Singh,
+     Hoang H. Tran, Fuqiang Li, Ren Ma, Mingzhang Zheng, Bill Qian, Yan-
+     jun Shao, Niklas Muennighoff, Yizhe Zhang, Binyuan Hui, Junyang Lin,
+     Robert Brennan, Hao Peng, Heng Ji, and Graham Neubig. 2025. Open-
+     Hands: An Open Platform for AI Software Developers as Generalist
+     Agents. arXiv:2407.16741 [cs.SE] https://arxiv.org/abs/2407.16741
+[48] Zhuang Wang, Zhen Jia, Shuai Zheng, Zhen Zhang, Xinwei Fu, T. S. Eu-
+     gene Ng, and Yida Wang. 2023. Gemini: Fast Failure Recovery in
+     Distributed Training with In-Memory Checkpoints. In ACM SIGOPS
+     Symposium on Operating Systems Principles (SOSP). ACM, Koblenz,
+     Germany, 364–381. doi:10.1145/3600006.3613145
+
+
+                                                                                 15
+

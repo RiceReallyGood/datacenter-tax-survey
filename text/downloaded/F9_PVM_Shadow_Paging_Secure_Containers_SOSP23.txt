@@ -1,0 +1,1210 @@
+   PVM: Efficient Shadow Paging for Deploying Secure
+      Containers in Cloud-native Environments
+       Hang Huang1† , Jiangshan Lai2† , Jia Rao3 , Hui Lu3 , Wenlong Hou2 , Hang Su2 , Quan Xu1 , Jiang
+      Zhong1 , Jiahao Zeng1 , Xu Wang2 , Zhengyu He2 , Weidong Han1 , Jiang Liu1 , Tao Ma1 , Song Wu4
+                                                                 1 Alibaba Group, 2 Ant Group
+                                                           3 The University of Texas at Arlington
+                                                   4 Huazhong University of Science and Technology
+
+    Email: {huanghang.huang, wutu.xq, zhongjiang.zj, zengjiahao.zjh, shaokang.hwd, liu.jiang, boyu.mt}@alibaba-inc.com,
+          {jiangshan.ljs, houwenlong.hwl, darcy.sh, gnawux, zhengyu.he}@antgroup.com, {jia.rao, hui.lu}@uta.edu,
+                                                   {wusong}@hust.edu.cn
+
+Abstract                                                                                   CCS Concepts: • Software and its engineering → Virtual
+In cloud-native environments, containers are often deployed                                machines; Virtual memory.
+within lightweight virtual machines (VMs) to ensure strong                                 ACM Reference Format:
+security isolation and privacy protection. With the grow-                                  Hang Huang, Jiangshan Lai, Jia Rao, Hui Lu, Wenlong Hou, Hang Su,
+ing demand for customized cloud services, third-party ven-                                 Quan Xu, Jiang Zhong, Jiahao Zeng, Xu Wang, Zhengyu He, Wei-
+dors are turning to infrastructure-as-a-service (IaaS) cloud                               dong Han, Jiang Liu, Tao Ma, Song Wu. 2023. PVM: Efficient Shadow
+providers to build their own cloud-native platforms, necessi-                              Paging for Deploying Secure Containers in Cloud-native Environ-
+tating the need to run a VM or a guest that hosts containers                               ments. In ACM SIGOPS 29th Symposium on Operating Systems Prin-
+                                                                                           ciples (SOSP ’23), October 23–26, 2023, Koblenz, Germany. ACM, New
+inside another VM instance leased from an IaaS cloud. State-
+                                                                                           York, NY, USA, 16 pages. https://doi.org/10.1145/3600006.3613158
+of-the-art nested virtualization in the x86 architecture relies
+heavily on the host hypervisor to expose hardware virtualiza-                              1    Introduction
+tion support to the guest hypervisor, not only complicating                                Containers have gained widespread popularity for build-
+cloud management but also raising concerns about an in-                                    ing and deploying applications in cloud-native data centers
+creased attack surface at the host hypervisor.                                             owing to their flexibility, portability, minimal resource uti-
+   This paper presents the design and implementation of                                    lization, and excellent scalability. Unlike traditional virtual
+PVM, a high-performance guest hypervisor for KVM that is                                   machine (VM)-based virtualization[23, 32], containers share
+transparent to the host hypervisor and assumes no hardware                                 the kernel with the host OS and therefore do not offer the
+virtualization support. PVM leverages two key designs: 1) a                                same level of isolation between hosted applications, opening
+minimal shared memory region between the guest and guest                                   up opportunities for attackers to cause information leak-
+hypervisor to facilitate state transition between different                                age [53], privilege escalation [45], and denial of services [11].
+privilege levels and 2) an efficient shadow page table design                              Although there has been extensive research dedicated to
+to reduce the cost of memory virtualization. PVM has been                                  improving container isolation and security, including op-
+adopted by Alibaba Cloud for hosting tens of thousands of                                  erating system (OS)-level mechanisms such as namespaces,
+secure containers on a daily basis. Our experiments demon-                                 capabilities [34], seccomp [28], and apparmor [33], as well as
+strate that PVM significantly outperforms current nested vir-                              user-level kernels like gVisor [10, 39], VM-based isolation
+tualization in KVM for memory virtualization, particularly                                 methods such as Kata Containers [6] and FireCracker [15]
+for concurrent workloads, while maintaining comparable                                     remain the preferred and widely adopted choice in produc-
+performance in CPU and I/O virtualization.                                                 tion systems. These VM-based solutions deploy containers
+                                                                                           with separate OS kernels within lightweight VMs, offering
+Permission to make digital or hard copies of all or part of this work for                  robust isolation and compatibility with legacy applications.
+personal or classroom use is granted without fee provided that copies                         The additional layer of indirection at the VM hypervi-
+are not made or distributed for profit or commercial advantage and that                    sor, however, incurs non-negligible overhead. Besides an
+copies bear this notice and the full citation on the first page. Copyrights                enlarged per-container memory footprint, a primary source
+for components of this work owned by others than the author(s) must
+be honored. Abstracting with credit is permitted. To copy otherwise, or
+                                                                                           of overhead is the crossing of multiple layers of the virtual-
+republish, to post on servers or to redistribute to lists, requires prior specific         ization stack (i.e., world switches) for CPU, memory, and I/O
+permission and/or a fee. Request permissions from permissions@acm.org.                     virtualization [19]. As the demand for user-defined, private
+SOSP ’23, October 23–26, 2023, Koblenz, Germany                                            cloud-native computing continues to grow, there is a need
+© 2023 Copyright held by the owner/author(s). Publication rights licensed                  for running lightweight VMs within VM instances leased
+to ACM.
+ACM ISBN 979-8-4007-0229-7/23/10. . . $15.00                                               †These authors contributed equally to this work and should be considered
+https://doi.org/10.1145/3600006.3613158                                                    joint first authors.
+
+
+
+
+                                                                                     515
+from public infrastructure-as-a-service (IaaS) clouds. For ex-           an excessive number of world switches, many of which are
+ample, running Kata containers with Kubernetes [22] in the               unnecessary but expensive exits to the 𝐿0 hypervisor for
+cloud requires nested VMs, allowing for greater isolation,               assisting switches between the 𝐿2 guest and 𝐿1 guest hyper-
+more flexible, and elastic Kubernetes cluster management                 visor. As the number of 𝐿2 guests increases, the complexity
+but resulting in even higher runtime overhead.                           to update and synchronize the consolidated page tables also
+   This paper analyzes state-of-the-art nested virtualization            increases, causing performance and scalability bottlenecks.
+approaches and identifies a fundamental tradeoff – while                    This paper explores the design space of a hybrid software-
+hardware virtualization support, such as Intel VT-x [40] and             hardware approach for nested virtualization and argues that
+AMD-V [47], offers superior performance and lower over-                  memory virtualization for an 𝐿2 guest should be exclusively
+head compared with software-based emulation for single-                  performed by and within the 𝐿1 hypervisor, assuming no
+level virtualization, it may result in sub-optimal performance           hardware support and being transparent to the 𝐿0 hypervisor.
+and excessive (expensive) traps to the host hypervisor (the              This design offers several advantages: 1) decoupling nested
+most privileged level) in 2-level nested virtualization, par-            virtualization from the host hypervisor does not add com-
+ticularly memory virtualization. Hardware-assisted nested                plexity, compromise security, or impact the underlying cloud
+virtualization also complicates the design of the host hyper-            management’s elasticity. 2) Handling nested virtualization
+visor, expands its potential attack surface, and introduces              entirely within the guest hypervisor enables user-specific
+new scalability issues.                                                  optimizations for security, performance, and scalability.
+   In single-level memory virtualization, a VM’s virtual ad-                This paper presents PVM, a KVM guest hypervisor opti-
+dresses need to be translated to VM physical addresses (level-           mized for nested memory virtualization. PVM is a software
+1 or 𝐿1 ) and then to host physical addresses (𝐿0 ). The two-            paravirtualization solution within the 𝐿1 VM, requiring no
+level translations can be done entirely in software or assisted          changes to the 𝐿0 host hypervisor. To gain full control over
+by hardware [25]. Without hardware support, the memory                   𝐿2 guest’s memory virtualization, PVM employs software-
+management unit (MMU) can only register a single page                    based shadow paging for translating 𝐿2 virtual addresses to
+table. To run multiple VMs, the hypervisor maintains and                 𝐿1 physical addresses and relies on hardware EPT or NPT for
+registers with MMU a shadow page table (SPT) [35] that                   the remaining translation to 𝐿0 host physical addresses. This
+translates directly from VM virtual addresses to host phys-              allows PVM to work with unmodified KVM host hypervisors
+ical addresses for each VM. Shadow paging requires that                  and allows nested and ordinary VMs to coexist. Additionally,
+any changes to a VM page table must trap to the hypervi-                 to trap all 𝐿2 guest page table updates while excluding the 𝐿0
+sor to update the shadow page table accordingly. To assist               hypervisor’s involvement, PVM avoids the use of hardware
+memory virtualization, modern x86 processors add a sec-                  virtualization extensions on x86 processors, such as Intel
+ond page table (EPT by Intel and NPT by AMD) to translate                VMX, when performing world switches [24] within the 𝐿1
+VM physical address to host physical address. This allows                VM. The nested CPU and memory virtualization based on
+both levels of translation to be performed by hardware, thus             software emulation effectively isolates an 𝐿2 guest within an
+eliminating the need for software emulation and hypervisor               𝐿1 VM, but it also raises concerns about possible performance
+involvement.                                                             degradation compared to hardware-assisted methods.
+   There have been significant studies comparing software                   PVM demonstrates that software-based world switches
+and hardware virtualization techniques and their associated              can be made as efficient (or with comparable performance)
+overhead in single-level virtualization [13]. These studies              as hardware-assisted approaches for single-level virtualiza-
+have motivated the development of a hybrid approach that                 tion. For nested memory virtualization, PVM’s combination
+leverages the advantages of both software and hardware                   of software (i.e., shadow paging and world switching within
+techniques. Nested virtualization, on the other hand, ne-                𝐿1 VM) and hardware (EPT and VMX support at the 𝐿0 hy-
+cessitates such a hybrid virtualization approach due to the              pervisor) approaches significantly outperforms hardware
+limited availability of hardware support. Nested memory                  (only)-assisted approaches. To achieve this, PVM involves
+virtualization requires the multiplexing of three levels of              three important designs: 1) the placement of the user and
+address translation, i.e., from guest virtual addresses to guest         kernel spaces of an 𝐿2 guest entirely in 𝐿1 VM’s privilege
+physical addresses (𝐿2 ), to VM physical addresses (𝐿1 ), and            level 3 (Ring 3) to ensure all privileged instructions, system
+eventually to host physical addresses (𝐿0 ) on the 2-level pag-          calls, and exceptions trap to PVM for emulation. This design
+ing hardware. One approach is to maintain an SPT at the 𝐿1               is necessary in the latest AMD processors [27] and the up-
+or guest hypervisor to handle the top two levels of transla-             coming Intel’s x86-s [9] architecture that both remove Ring
+tion. A more popular and the default approach in KVM [20]                1 and 2 for a simplified CPU instruction set [43]. 2) A piece
+is to allow the 𝐿2 guest to use its own page table while the 𝐿0          of highly-efficient assembly code, called switcher, residing
+hypervisor maintains a compressed EPT or NPT for translat-               in a shared memory region between an 𝐿2 guest and the
+ing 𝐿2 guest physical addresses to 𝐿0 physical addresses (the            𝐿1 VM to facilitate world switches among the user and ker-
+bottom two levels). Nevertheless, both approaches involve                nel spaces of an 𝐿2 guest as well as PVM, the 𝐿1 hypervisor.
+
+
+
+                                                                   516
+3) An efficient and scalable shadow page table design en-                       Bare-metal
+                                                                                                                         Secure Container
+                                                                                             VM
+abled by PVM’s nested virtualization. PVM features a parallel                                                       L2
+                                                                                                                            Container
+SPT and a pre-fault mechanism (and many optimizations) to                                         L1
+accelerate guest page fault handling.
+                                                                                                                     VMCS12
+   PVM is production-ready and has been adopted by Al-                          exit/entry                                       EPT12        exit/entry
+
+ibaba Cloud. It runs tens of thousands of secure containers                                                                       shadowing
+                                                                                      L0               virtualize
+in nested VMs daily with unmodified KVM host hypervi-
+sors. Extensive experiments with micro-benchmarks and                                        VMCS01                 VMCS02
+                                                                                                       EPT01                     EPT02
+real applications show that PVM achieves comparable perfor-
+mance in VM entry/exit, a key indicator of world switching                Figure 1. Secure containers with nested virtualization.
+overhead, compared to hardware-assisted CPU virtualization
+in single-level virtualization, and attains up to an order of           communication between a guest VM and the hypervisor oc-
+magnitude performance improvement in memory-intensive,                  curs through a set of VMX instructions – e.g., VM Exit and
+concurrent workloads.                                                   VM Entry. In the non-root mode, a VM Exit occurs when
+   In summary, this paper makes the following contributions:            a privileged instruction is executed or an interrupt is gen-
+                                                                        erated. This triggers the CPU to switch to the root mode,
+      • A comprehensive analysis of state-of-the-art nested
+                                                                        where the hypervisor handles the VM Exit via emulation. Af-
+        virtualization that reveals the drawbacks of hardware-
+                                                                        terward, the hypervisor uses the VM Entry instruction (i.e.,
+        assisted approaches and motivates the hybrid software-
+                                                                        VMLAUNCH/VMRESUME) to resume the guest VM’s execution. The
+        hardware nested architecture, as well as decoupling
+                                                                        hypervisor/guest transition involves the switching of both
+        nested VMs from the host hypervisor.
+                                                                        the execution modes (i.e., root and non-root mode) and the
+      • The design and implementation of PVM, a guest hy-
+                                                                        hypervisor and guest address spaces. Such context switches,
+        pervisor, and a general framework for nested virtual-
+                                                                        referred to as world switches, introduce nontrivial overhead.
+        ization that enables user-defined optimizations.
+                                                                           To preserve the execution contexts of a guest VM and the
+      • Optimizations for world switches, concurrent shadow
+                                                                        hypervisor during world switches, VMX maintains a VM
+        page table updates, and guest page fault handling.
+                                                                        control structure (VMCS) per virtual CPU (vCPU). Upon a
+2     Background and Motivation                                         VM Exit, the processor saves the guest VM’s CPU states
+As illustrated in Figure 1, nested virtualization enables a             (context) in the VMCS, while loading the hypervisor’s CPU
+host hypervisor (denoted as the 𝐿0 hypervisor) to run an-               states from the VMCS, and vice versa for VM entry.
+other guest hypervisor (denoted as the 𝐿1 hypervisor) within            2-level nested virtualization. The existing 2-level nested
+a VM, which can in turn run additional VMs (denoted as                  virtualization builds upon the hardware support for single-
+the 𝐿2 guest). This 2-level nested virtualization facilitates           level virtualization described above but requires additional
+the deployment of secure containers, which often run inside             software effort. The 𝐿0 hypervisor operates at the most priv-
+lightweight VMs for strong isolation, within cloud instances            ileged level – level 0 of the root mode. It manages the under-
+leased from IaaS providers. Unfortunately, current hardware             lying hardware and emulates VMX for the guest hypervisor
+(e.g., Intel VT-x [40] and AMD-V [47]) only has a single                𝐿1 . With the emulated VMX, an unmodified hypervisor can
+level of architectural support for virtualization. As a result,         run at 𝐿1 without the awareness of the lower 𝐿0 . Similar to a
+implementing nested virtualization requires complex and                 traditional hypervisor, an 𝐿1 hypervisor can create its own
+costly software efforts, especially in the 𝐿0 hypervisor. In            𝐿2 guest VMs. Both 𝐿1 and 𝐿2 operate in the non-root mode.
+this section, we compare 2-level nested virtualization with                Such a nested architecture involves complex and expen-
+traditional single-level virtualization (based on Intel VT-x)           sive transitions between multiple hypervisors and guest VMs.
+and identify the primary sources of overhead in nested virtu-           For example, in Figure 1, any privileged instruction from 𝐿2
+alization. This analysis motivates us to develop PVM, a more            will first be trapped by 𝐿0 (via a VM Exit). Since the privileged
+efficient nested virtualization approach.                               instruction needs to be handled by 𝐿2 ’s hypervisor, i.e., 𝐿1 ,
+                                                                        𝐿0 forwards the trap to 𝐿1 and uses VM Entry to switch to 𝐿1 ,
+2.1    Overview of nested virtualization                                which in turn handles the injected trap (originally from 𝐿2 ).
+Single-level virtualization. Intel VT-x [46] offers virtual-            Upon the completion of trap handling, 𝐿1 attempts to resume
+ization extensions (VMX) to support an additional non-root              running 𝐿2 using the VM Entry instruction. As the VM Entry
+operation mode, coexisting with the traditional root opera-             is a privileged instruction, 𝐿1 is trapped by 𝐿0 again, where
+tion mode, each with privilege levels ranging from 0 to 3. In           the VM Entry instruction is executed in the root mode to
+single-level virtualization, the host hypervisor operates at            finally resume 𝐿2 . As it can be seen, in 2-level nested virtual-
+privilege level 0 of the root mode with full privilege, whereas         ization, a transition between 𝐿2 and 𝐿1 (e.g., trap handling)
+the guest VM (kernel and user) operates at privilege level              requires an exit to 𝐿0 , doubling the number of world switches
+0 and 3 of the non-root mode with reduced privilege. The                compared to that in single-level virtualization.
+
+
+
+                                                                  517
+                                                                                    5   552         maps guest virtual addresses (𝐺𝑉 𝐴) to guest physical ad-
+      Normalized exec time   2
+                                       KVM
+                                       KVM (NST)                                                    dresses (𝐺𝑃𝐴); 2) the extended page table (EPT) maps 𝐺𝑃𝐴
+                                                                                                    to host physical addresses (𝐻𝑃𝐴). The hypervisor is respon-
+                             1                                                                      sible for maintaining the EPT while a guest manages its
+                                                                                                    own GPT. Since GPT is visible to the memory management
+                                                                                                    unit (MMU) and guest address translations are performed
+                             0                                                                      by hardware, guest page faults can be entirely handled by a
+                                     all stat lose t tcp inst hndl fork exec   sh uild cjbb
+                                 ll c         c   c     g                        kb spe             guest kernel in the non-root mode without exits to the hy-
+                             nu            en/ sl si sig
+                                        op
+                                                                                                    pervisor. EPT violations, i.e., entries absent in the EPT, cause
+    Figure 2. Overhead analysis of nested virtualization.                                           hypervisor page faults and are handled by the hypervisor in
+   To reduce the overhead of world switches, nested virtual-
+                                                                                                    the root mode.
+ization employs a shadowing mechanism to maintain VMCS
+                                                                                                    SPT-on-EPT. To support 2-level nested memory virtualiza-
+during switches. As depicted in Figure 1, 𝐿0 is responsible
+                                                                                                    tion, three dimensional page tables are required: one for the
+for maintaining 𝐿1 ’s VMCS, denoted as 𝑉 𝑀𝐶𝑆 01 , while 𝐿1
+                                                                                                    𝐿2 guest, one for the 𝐿1 guest hypervisor, and one for the 𝐿0
+maintains 𝐿2 ’s VMCS, denoted as 𝑉 𝑀𝐶𝑆 12 . Since 𝐿1 works
+                                                                                                    host hypervisor. One straightforward approach to achieve
+in the non-root mode, any operation it performs on 𝑉 𝑀𝐶𝑆 12 ,
+                                                                                                    this is by using shadow page tables (SPT) in 𝐿1 , while still
+such as VMREAD or VMWRITE, will cause an exit to 𝐿0 . As studied
+                                                                                                    allowing 𝐿0 to use the EPT hardware, called SPT-on-EPT.
+in [49], to handle a single world switch from 𝐿2 , 𝐿1 needs
+                                                                                                       As illustrated in Figure 3(a), 𝐿2 manages its guest page
+to access 𝑉 𝑀𝐶𝑆 12 multiple times, leading to as many as
+                                                                                                    table, GPT2, which maps GVA𝐿2 to GPA𝐿2 . 𝐿1 manages its
+40-50 exits to 𝐿0 . To avoid excessive 𝐿0 exits, VMCS shad-
+                                                                                                    guest page table, GPT1, which maps GPA𝐿2 to GPA𝐿1 . 𝐿0
+owing allows 𝐿1 to maintain a software-based 𝑉 𝑀𝐶𝑆 12 that
+                                                                                                    uses EPT01 to map GPA𝐿1 to HPA. As hardware MMU only
+is not directly used for running 𝐿2 . Instead, 𝐿0 maintains a
+                                                                                                    supports two page tables, 𝐿1 combines GPT1 and GPT2 to
+shadow 𝑉 𝑀𝐶𝑆 02 that is created by merging and synchro-
+                                                                                                    create shadow page tables, SPT12, mapping GVA𝐿2 directly
+nizing 𝑉 𝑀𝐶𝑆 01 and 𝑉 𝑀𝐶𝑆 12 . As all reads/writes to VMCS
+                                                                                                    to GPA𝐿1 . To keep SPT12 synchronized with GPT2, every
+are handled by 𝐿0 in the root mode, exits to 𝐿0 due to 𝐿1 ’s
+                                                                                                    update made to GPT2 by 𝐿2 must trigger a page fault, and
+accesses to VMCS are thus eliminated.
+                                                                                                    trap to the 𝐿1 hypervisor. To achieve this, GPT2 is made
+   Despite these optimizations, nested virtualization remains
+                                                                                                    read-only to 𝐿2 , but writable to 𝐿1 . When 𝐿2 is running, 𝐿0
+expensive, especially for memory-intensive workloads. We
+                                                                                                    provides both SPT12 and EPT01 to MMU for address transla-
+conducted performance tests using LMbench [8], Kbuild [26],
+                                                                                                    tion, where MMU first uses SPT12 to translate 𝐿2 ’s GVA to
+and SPECjbb2005 [14] within one or multiple secure contain-
+                                                                                                    𝐿1 ’s physical address; further, MMU uses EPT01 to translate
+ers and compared the performance of single-level virtual-
+                                                                                                    𝐿1 ’s physical address to 𝐿0 ’s HPA. Despite using the EPT
+ization (the secure container running in a regular VM) with
+                                                                                                    hardware, SPT-on-EPT incurs significant overhead, because
+that of 2-level nested virtualization (the secure container
+                                                                                                    each page fault in 𝐿2 requires 𝐿1 to update the shadow page
+running in an 𝐿2 guest). Note that each LMbench benchmark
+                                                                                                    tables. As described in Section 2.1, these 𝐿2 page faults/GPT2
+ran in a single container while Kbuild and SPECjbb2005 each
+                                                                                                    updates must first trap to 𝐿0 and then be forwarded to 𝐿1 ,
+used 16 containers to study the cost of nested virtualization
+                                                                                                    resulting in excessive and expensive world switches.
+for concurrent workloads. Figure 2 shows that while nested
+                                                                                                       As an example, in Figure 3(a), a page fault from 𝐿2 can
+virtualization introduces additional world switches for han-
+                                                                                                    trigger two phases of page table updates : 1) The first phase
+dling privileged instructions, its overhead for workloads that
+                                                                                                    updates 𝐿2 ’s GPT2; and 2) the second phase updates 𝐿1 ’s
+do not involve intensive memory access is negligible. On the
+                                                                                                    GPT1 and SPT12. More specifically, in the first phase, an ac-
+contrary, when dealing with memory-intensive workloads
+                                                                                                    cess to an absent GVA𝐿2 in GPT2 triggers an 𝐿2 page fault and
+like frequent updates to page tables, virtual address trans-
+                                                                                                    an exit to 𝐿0 (➀), which injects the page fault to 𝐿1 by writing
+lations, and especially simultaneous memory accesses, the
+                                                                                                    𝑉 𝑀𝐶𝑆 01 (➁) and resumes executing 𝐿1 (➂). The 𝐿1 hypervi-
+performance slowdown is substantial, reaching up to two
+                                                                                                    sor recognizes that this is an 𝐿2 page fault and injects it to 𝐿2 ’s
+orders of magnitude. In what follows, we discuss memory
+                                                                                                    𝑉 𝑀𝐶𝑆 12 (➃) and attempts to resume 𝐿2 . Resuming 𝐿2 needs
+virtualization and analyze its overhead.
+                                                                                                    to trap back to 𝐿0 (➄), which updates 𝑉 𝑀𝐶𝑆 02 (➅) before fi-
+2.2 Memory virtualization                                                                           nally resuming 𝐿2 using 𝑉 𝑀𝐶𝑆 02 (➆). The page fault handler
+Memory virtualization is currently facilitated by architec-                                         in 𝐿2 updates GPT2 with new page table entries mapping
+tural features such as Extended Page Tables (EPT) in Intel                                          GVA𝐿2 to GPA𝐿2 (➇) and finally returns to user (➈). To add
+VT-x or Nested Page Tables in AMD-V. Without loss of gen-                                           more complexity to this process – since GPT2 is read-only,
+erality, we use EPT as an example to introduce both single
+and 2-level memory virtualization.                                                                  Without loss of generality, we assume 𝐿1 is warmed up and EPT01 has been
+Single-level memory virtualization involves two dimen-                                              established (i.e., no EPT violations from EPT01) in SPT-on-EPT and all other
+sional page tables – 1) the regular guest page table (GPT)                                          memory virtualization approaches.
+
+
+
+
+                                                                                              518
+     L2 (non-root mode ring3)                                   L1 (non-root mode ring3)                            L2 (non-root mode ring3)                     L1 (non-root mode ring3)
+
+     L2 (non-root mode ring0)                                   L1 (non-root mode ring0)
+                                                                                    ❹ fix   SPT12
+                                               GPT2 (RO)            KVM PF Handler                                   L2 (non-root mode ring0)                    L1 (non-root mode ring0)
+  ⑨ iret                                                                    ④ inject #PF                             ③ iret                    ① GPT2                                       EPT12 (RO)
+                                       ⑧ fix                                                                                  PF Handler                           EPT_violation
+                       PF Handler                                                                                                                 #PF
+                                                                                                                                                                   Handler
+                                                                                VMCS12                                                                                              ❹ fix
+   ⑦ vm_resume L2                                                                                                                 ② fix GPT2
+      (real entry)                                                                                                                                                                 ❽
+                                                                          ⑤/❺ resume L2
+                                                                                                                 ❿ vm_resume L2                                                    resume L2
+                                                                                                                                                                                              ❺
+                                                                                                                   (real entry)                                                     EPT violation
+❼ vm_resume L2 EPT                                                                                               ⓭ vm_resume L2 EPT                        ⓫❶          CR3               ❼
+                                                               CR3
+  (real entry)                                   ①/❶ #PF                                                           (real entry) again      EPT violation again EPT violation             resume L1
+      L0 (root mode ring0)                                   resume L1 ③/❸                                           L0 (root mode ring0) ⓬ fix EPT02             resume L1 ❸
+
+               VMCS02                              ②/❷ inject #PF     VMCS01                                                 VMCS02                                        VMCS01
+                                                                                                                                               ❷ inject EPT violation
+           • EPTP= EPT01                                           • EPTP= EPT01                                          • EPTP= EPT02                                 • EPTP= EPT01
+           • CR3 = SPT12                                           • CR3 = GPT1                                           • CR3 = GPT2                                  • CR3 = GPT1 ❻ emulation
+                                         ⑥/❻ update & reload VMCS02
+                                                                                                                                               ❾ update & reload VMCS02
+
+
+
+                                                (a) SPT-on-EPT                                                                                 (b) EPT-on-EPT
+
+                                 Figure 3. Two approaches, (a) SPT-on-EPT and (b) EPT-on-EPT, for 2-level nested memory virtualization.
+                                                 100                     127                 562          which creates and maintains an EPT12 table mapping GPA𝐿2
+                                100
+           Execution time (s)
+
+
+
+
+                                       EPT
+                                80     SPT                                                                to GPA𝐿1 . Same as SPT-on-EPT, 𝐿0 manages EPT01, mapping
+                                       EPT-EPT                                                            GPA𝐿1 to HPA. Because MMU only supports one EPT table,
+                                60     SPT-EPT
+
+                                40                                                                        𝐿0 compresses EPT01 and EPT12 into one, EPT02, mapping
+                                20
+                                                                                                          GPA𝐿2 to HPA. Therefore, 𝐿0 can run 𝐿2 using 𝐿2 ’s GPT2 and
+                                                                                                          EPT02. The EPT-on-EPT approach allows 𝐿2 to freely update
+                                 0
+                                          1                    4                       16                 GPT2 without any traps to 𝐿0 (➀-➂), but needs multiple
+                                                       Number of processes                                world switches to build and update EPT02 ( ➊- 13 ).
+Figure 4. The performance comparison between EPT and                                                         The update of EPT02 also involves two phases: The first
+SPT w/wo nested virtualization.                                                                           phase updates EPT12 and EPT01 (➊-➓). The update of EPT12
+                                                                                                          is emulated by 𝐿0 – by making EPT12 read-only to 𝐿1 . Hence,
+every update to GPT2 needs assistance from 𝐿1 . Hence, step
+                                                                                                          step ➎-➐ may repeat multiple times – depending on the
+➇ could further cause multiple rounds of switches between
+                                                                                                          number of page table levels in EPT12. Thus, the first phase
+𝐿2 and 𝐿1 via 𝐿0 (not illustrated in Figure 3(a)), depending on
+                                                                                                          traps to 𝐿0 𝑛 + 2 times with 2𝑛 + 4 world switches (where
+the number of page table levels. For example, a 4-level GPT2
+                                                                                                          𝑛 is the number of EPT12 page table levels). The second
+needs four rounds of such switches. In the first phase, 𝐿0 can
+                                                                                                          phase updates EPT02 ( 11 - 13 ), by compressing EPT01 and
+be involved up to 2𝑛 + 2 times with 4𝑛 + 4 world switches
+                                                                                                          EPT12 (built in the first phase). It adds one more 𝐿0 trap and
+(where 𝑛 is the number of 𝐿2 page table levels).
+                                                                                                          two more world switches. In summary, a page fault from 𝐿2
+   The following access to GPA𝐿2 , which was added to GPT2
+                                                                                                          triggers 2n + 6 world switches and exit to 𝐿0 for n + 3 times.
+during the first phase, triggers a page fault in 𝐿1 since GPA𝐿2
+                                                                                                             Compared to SPT-on-EPT, EPT-on-EPT is more efficient in
+is absent from GPT1 and hence SPT12. The second phase
+                                                                                                          terms of fewer number of world switches and 𝐿0 traps [13].
+handles this 𝐿1 page fault and updates SPT12. As shown in
+                                                                                                          The performance benefit of EPT-on-EPT can be observed
+Figure 3(a), the second phase follows the same steps as the
+                                                                                                          from Figure 4. We used a memory-intensive micro-benchmark
+first phase (➊-➐), except for two differences. First, at step
+                                                                                                          running in 𝐿2 to sequentially allocate 1 MB memory spaces
+➍ the 𝐿1 kernel handles the page fault and updates SPT12.
+                                                                                                          and access pages within the allocated regions one by one
+Second, step ➐ returns directly to 𝐿2 user space without
+                                                                                                          with a total working set size of 4 GB. We varied the number
+involving the 𝐿2 guest kernel. In the second phase, there are
+                                                                                                          of benchmark instances from 1 to 16. Figure 4 shows that
+four more world switches, including trapping to 𝐿0 twice.
+                                                                                                          EPT-on-EPT significantly outperformed SPT-on-EPT in all
+   In summary, in the worst-case scenario, in which both
+                                                                                                          cases. However, a considerable performance gap persisted
+GPT2 and SPT12 need to be updated, and assuming an n-
+                                                                                                          between EPT-on-EPT and single-level memory virtualiza-
+level GPT2, an 𝐿2 page fault can lead to 4n + 8 world switches
+                                                                                                          tion (EPT only), and this gap widened as concurrency levels
+and 2n + 4 exits to 𝐿0 .
+                                                                                                          increased. We quantified the cost of world switches in EPT-
+EPT-on-EPT. The state-of-the-art nested memory virtualiza-                                                on-EPT and EPT only. For fair comparison, we measured the
+tion approach for KVM leverages the architectural support                                                 time needed to perform an 𝐿2 -to-𝐿1 world switch and that
+for 2-dimensional page tables in EPT.                                                                     due to an 𝐿1 -to-𝐿0 switch in single-level virtualization. While
+   As illustrated in Figure 3 (b), 𝐿2 has its own GPT2, which                                             both are world switches between a VM and its immediate
+maps GVA𝐿2 to GPA𝐿2 . 𝐿0 exposes EPT capabilities to 𝐿1 ,
+
+
+
+                                                                                                    519
+hypervisor, the 𝐿2 -to-𝐿1 switch involves exits to 𝐿0 to handle                       h_ring3           virtual machine (guest)
+state transition or fault injection. Our measurements showed                                             user                     kernel
+that world switches in nested virtualization (1.3 μs) is an or-                                        (v_ring3)                (v_ring0)
+der of magnitude more expensive than those in single-level                                         syscall/                          hypercall/
+
+virtualization (0.105 μs).                                                             interrupt/exception
+                                                                                                                  sysret/iret
+                                                                                                                                     interrupt/exception
+
+                                                                                      h_ring0
+2.3 Challenges and opportunities                                                                                   switcher
+While EPT-on-EPT is the state-of-the-art nested memory vir-                                               vm entry         vm exit
+                                                                                                     (function call)       (function return)
+tualization approach, it has several drawbacks that prevent
+it from being adopted in production cloud systems.                                                   kvm.ko              kvm-pvm.ko
+    First, EPT-on-EPT still leads to a large number of costly                                              CPU virtualization
+                                                                                                memory virtualization      I/O virtualization
+world switches between various levels of hypervisors and
+                                                                                                              PVM hypervisor
+VMs. For example, given a 4-level page table, a page fault
+from 𝐿2 can trigger up to 14 world switches and trapping                                 Figure 5. The PVM architecture.
+to 𝐿0 7 times. The high rate of world switches inevitably                    1) Unlike the existing nested virtualization approaches
+leads to high performance overhead in nested virtualization.              that place 𝐿2 on privilege 3 (for the guest user) and privilege
+Second, nested virtualization upon EPT-on-EPT needs to                    0 (for the guest kernel) in the non-root mode, PVM’s 𝐿1 de-
+extend hardware virtualization capabilities to 𝐿1 VMs. This               privileges 𝐿2 to completely operate in the least privilege level
+leads to increased complexity and decreased flexibility of the            3, or Ring 3, while providing isolation between the guest user
+cloud stack. Once an 𝐿2 guest is running, 𝐿1 can no longer                and kernel through the use of separate page tables. This way,
+be migrated, saved, or loaded, significantly impacting the                PVM effectively isolates secure containers while allowing for
+cluster management. Further, many cloud providers do not                  more efficient world switching (Section 3).
+support nested virtualization for cloud VM instances [31],                   2) De-privileging 𝐿2 to Ring3 further facilitates PVM to
+or have many limitations in supporting nested virtualiza-                 enable 𝐿1 to capture all privileged operations from 𝐿2 and
+tion [1, 54]. For example, nested virtualization is incompati-            serve them (via emulation) without involving 𝐿0 , thus reduc-
+ble with emerging technologies [30] such as AMD SEV [2]                   ing the number of world switches. PVM further achieves fast
+and Intel TDX [5]. Last, nested virtualization upon EPT-on-               world switches between 𝐿1 and 𝐿2 via a switcher, a piece of
+EPT heavily relies on the 𝐿0 hypervisor (e.g., maintaining                highly-efficient assembly code/data (Section 3.2).
+EPT02 and forwarding traps between 𝐿2 and 𝐿1 ). A “fat” host                 3) Upon fast world switches, PVM devises a highly-efficient
+hypervisor increases security risks by expanding the attack               shadow paging approach with a range of optimizations, lead-
+surface for cloud providers.                                              ing to fewer and faster world switches than hardware-assisted
+    These drawbacks of nested virtualization stem from its                approaches, such as EPT-on-EPT (Section 3.3).
+original design goal of supporting unmodified guest hyper-                   The primary contribution of PVM is a software-based
+visors (𝐿1 ) [19, 31]. To achieve this, the host hypervisor (𝐿0 )         nested virtualization approach that operates independently
+uses a combination of hardware (e.g., EPT and VMCS) and                   of the host (𝐿0 ) hypervisor and assumes no hardware sup-
+software approaches (EPT-on-EPT and shadowing VMCS) to                    port. PVM can co-exist with other ordinary VMs on the same
+emulate VMX. However, the goal of using nested virtualiza-                host and relies on hardware virtualization support for VM-
+tion for secure containers is entirely different. It simply needs         exit/entry between 𝐿1 and 𝐿0 . If not otherwise stated, the
+a strong-yet-lightweight isolation mechanism to make se-                  following discussions on 𝐿2 -to-𝐿1 switches are entirely han-
+cure containers “deployable” in any existing IaaS clouds. This            dled by PVM without any involvement of the 𝐿0 hypervisor.
+motivates us to develop a more efficient nested virtualiza-
+                                                                          3.1 Architecture Overview
+tion framework, which assumes no support from hardware
+virtualization and supports unmodified 𝐿0 host hypervisor.                Figure 5 depicts the architecture of PVM, which comprises
+                                                                          three key components: the 𝐿2 guest, the switcher, and the
+3 PVM: Design and Implementation                                          𝐿1 guest hypervisor, or the PVM hypervisor. 1) The 𝐿2 guest
+We propose, PVM, a high-performance, pagetable-based nested               operates entirely within the hardware Ring 3 (i.e., h_ring3
+virtualization framework built upon the KVM hypervisor.                   in the non-root mode) with the least privilege. It features se-
+The over-arching goals of PVM are to completely decouple                  cure containers in virtual Ring 3 (i.e., v_ring3) and the para-
+secure container hosting from the host hypervisor and hard-               virtualized 𝐿2 guest kernel in virtual Ring 0 (i.e., v_ring0).
+ware virtualization support to 1) enable nested virtualization            To distinguish between v_ring0 and v_ring3, both residing
+with any IaaS clouds without affecting the security, flexibility,         at h_ring3, PVM uses separate page tables for isolating the
+and complexity of the cloud platform; 2) avoid costly exits               𝐿2 guest user and kernel. 2) The switcher is responsible for
+to the host hypervisor and devise efficient world switching               “switching” the worlds between the 𝐿1 guest hypervisor, the
+mechanisms. To achieve this, PVM is developed based on the                𝐿2 guest user, and the 𝐿2 guest kernel. The world switches
+following design choices:                                                 can be triggered by a set of events, such as system calls,
+
+
+
+                                                                    520
+                                  vCPU 0         vCPU 1
+
+                                                              Guest                                   Guest                             Guest
+              CPU 0 CPU 1      Syscall CPU    Syscall CPU                                 ❶syscall/       ①interrupt/                                 ❶sysca
+                                                                Switcher                   hypercall                                                   hyper
+        IDT   Entry Entry ……   Entry Switcher Entry Switcher ……          ……                                exception
+                                                                Text
+              Area Area        Code State     Code State
+                                                                  ② iret                  msr_lstar           idtr                           ② iret   msr_ls
+
+                 PUD                            Switcher
+                                               syscall entry                                     syscall entry                       syscall entry
+                                                 (PUD)
+                                                idt entries                                       idt entries                         idt entries
+                          Host CPU Entry Area  enter_guest                                       enter_guest                         enter_guest
+                Figure 6. The PVM switcher layout.
+                                              to_hypervisor                                     to_hypervisor                       to_hypervisor          t
+                                                 switcher                                           Switcher
+                                                                                                   switcher                            switcher
+hypercalls, and interrupts/exceptions.      The call
+                                        ① function Switcher com-                                                           ① function call
+                                                                                                                 ②/❷ ret
+prises efficient and concise assembly code and     data structures
+                                                 Hypervisor                                      Hypervisor                         Hypervisor
+that map to identical addresses within the 𝐿1 hypervisor, 𝐿2
+user, and 𝐿2 kernel address spaces. 3) Finally, the PVM hy-                                     (a) VM Exit                       (b) VM Entry
+pervisor comprises two (loadable) kernel modules: kvm.ko,
+                                                                                                        Figure 7. VM Exit and Entry.
+which incorporates traditional KVM core functionality to
+ensure compatibility with the upper software stack, and kvm-                        Spectre attacks. Similar to KPTI, PVM leverages separate
+pvm.ko, which incorporates the core PVM functionality, i.e.,                        page tables for the 𝐿1 host kernel (i.e., the guest hypervisor)
+a customized virtualization implementation using a function                         and the 𝐿2 guest and consolidates the switcher’s code/data
+pointer vector of KVM . Note that PVM can support both                              (e.g., syscall entry, IDT, TSS, trampoline stack, LDT, etc.)
+nested virtualization and bare-metal machines (i.e., running                        accessed by both the 𝐿1 hypervisor and the 𝐿2 guest in a per-
+as an 𝐿0 host hypervisor). The discussion here and hereafter                        CPU entry area. Note that, PVM already uses two separate
+focuses on a 2-level nested virtualization scenario, where                          page tables for the 𝐿2 guest user and kernel. Therefore, the
+secure containers are deployed in 𝐿2 guests managed by the                          switcher, or the per-CPU entry area, needs to be mapped to
+PVM hypervisor running in an 𝐿1 VM.                                                 three page tables for the 𝐿1 host kernel, 𝐿2 guest user, and
+3.2 Switcher                                                                        𝐿2 guest kernel, respectively at an identical, unused virtual
+                                                                                    address range.
+Early 32-bit paravirtualized guests in Xen place the guest
+                                                                                    Switcher layout. As illustrated in Figure 6, there are three
+user and kernel in Ring 3 and Ring 1, respectively, to trap
+                                                                                    key elements in switcher: 1) a per-CPU syscall entry to han-
+access to privileged states and use segmentation to isolate
+                                                                                    dle syscall requests between the 𝐿1 guest hypervisor, the 𝐿2
+the guest and host space. In contrast, recent paravirtual-
+                                                                                    guest user, and the 𝐿2 kernel; 2) a per-CPU switcher state,
+ized Xen guests in 64-bit x86-64 place guest user and kernel
+                                                                                    similar to VMCS, which saves and restores 𝐿2 guest and
+in Ring 3 and use separate page tables for isolation [43].
+                                                                                    𝐿1 host states during world switches; and 3) customized
+This design is necessary due to the possible removal of Ring
+                                                                                    interrupt descriptor table (IDT) handlers for capturing in-
+1 in the upcoming x86-s architecture [9] and the limited
+                                                                                    terrupts/exceptions: PVM modifies the entries of the IDT in
+support of segmentation in x86-64. PVM draws inspiration
+                                                                                    the 𝐿2 guest (both user and kernel) address space to point
+from these paravirtualization approaches, such as Xen and
+                                                                                    to the switcher’s customized interrupt handlers. This allows
+Lguest [7], and adopts a switcher design to enable efficient
+                                                                                    switcher to capture all external interrupts or exceptions, even
+world switches between the 𝐿2 user and kernel (Ring 3), and
+                                                                                    during world switches. To ensure efficient accesses to and
+the 𝐿1 hypervisor (Ring 0) in the non-root mode.
+                                                                                    the execution of switcher, PVM sets the entire switcher to be
+   As shown in Figure 5, switcher is located between the 𝐿1
+                                                                                    global, preventing its TLB entries from being flushed.
+hypervisor and the 𝐿2 guest (user and kernel) and facilitates
+                                                                                    VM exit/entry: Without hardware support, an 𝐿2 guest
+state transitions between them. To be executed across do-
+                                                                                    traps to the 𝐿1 hypervisor in two ways: syscall/hypercall
+mains during the switchover process (i.e., involving switch-
+                                                                                    and interrupt/exception. In PVM, hypercalls in the 𝐿2 guest
+ing page tables and address spaces), switcher must be located
+                                                                                    kernel are implemented through the invocation of syscalls
+at identical virtual addresses in the 𝐿2 user, 𝐿2 kernel, and 𝐿1
+                                                                                    (i.e., via unique hypercall numbers).
+guest hypervisor. Previous methods [7] place a switcher in
+                                                                                        As illustrated in Figure 7(a), when an 𝐿2 guest executes
+a high address space (e.g., 0xFFC00000/0xFFE00000); both the
+                                                                                    a syscall instruction or an interrupt/exception occurs, the
+user and kernel can access it using the same page table.
+                                                                                    CPU transitions to h_ring0 and enters the switcher through
+   On the other hand, PVM adopts a more secure approach
+                                                                                    a pre-defined handler in CPU registers (e.g., MSR_LSTAR
+by utilizing the Linux Kernel Page Table Isolation (KPTI)
+                                                                                    or IDTR). Inside the switcher, the to_hypervisor function
+design, which helps to mitigate certain types of security
+                                                                                    performs the world switch from the 𝐿2 guest user (or kernel)
+vulnerabilities, such as those exploited by the Meltdown and
+                                                                                    to the 𝐿1 hypervisor. The switch function saves the 𝐿2 guest
+The function pointer vector, or the vCPU run structure, is a data structure         states and restores the 𝐿1 host states to/from the per-CPU
+that contains function pointers to various KVM operations, such as context          switcher state (shown in Figure 6). Once the exit has been
+switching, interrupt handling, and device emulation.                                completed (e.g., via emulation as discussed in Section 3.3.1),
+
+
+
+                                                                              521
+                           Guest User                              Guest Kernel                           L1 (non-root mode ring3)                    v_ring3
+                            (v_ring3)                               (v_ring0)
+                                                                                                                                                      v_ring0
+                                                                                                                                                                                ⑥ fixGPT2 (RO)
+                                                                                                                                                            PF Handler
+                                                                                                                                                                  ⑦
+      h_ring3                                                             sysret                                                                   ①/❶ iret hypercall
+                syscall                                                                                                                            #PF
+      h_ring0                                                            hypercall
+                                                                                                          L1 (non-root mode ring0)      iret ❺              ⑤ iret                       ⑩ iret
+                            ❸ sysretq           switcher         ❶ turn to %rip                                                                  switcher
+                                           .code syscall_entry                                                                   ②/❷ vm exit                  ⑧ handle iret
+                                                                                                                  ③ inject #PF
+                                           .data state                                                                                                                        Hypercall Handler
+                    ① turn to %rip                             ③ sysretq
+                                                                                     ⑤ iret                           PVM PF Handler    ④/❹ vm_entry ⑨ vm_entry                             prefault
+                                         direct switch
+                            ❷ switch to • switch hCR3 ② switch to                                                                                           ❸ fix
+                                                                                                                                                                               SPT12
+                                        • switch cpl, stack
+                                           and gs_base
+                                                                                                                      EPT                      CR3
+                          v_ring3_hw_cr3                          v_ring0_hw_cr3
+                                                                                                          L0 (root mode ring0)                                      VMCS01
+                                                                                                                                                               • EPTP= EPT01
+       Figure 8. The direct switching within switcher.                                                                                                         • CR3 = GPT1/SPT12
+
+
+                                                                                                                                 Figure 9. PVM-on-EPT.
+the enter_guest function in the 𝐿1 hypervisor rebuilds the
+𝐿2 guest context by saving the 𝐿1 host states and restoring
+                                                                                                    and segment states, and the execution of privileged CPU in-
+the 𝐿2 guest states to/from the per-CPU switcher state, as
+                                                                                                    structions must be intercepted by the PVM hypervisor. PVM
+shown in Figure 7(b). This way, the CPU switches from the
+                                                                                                    adopts a hybrid approach based on instruction emulation
+𝐿1 host (h_ring0) to the 𝐿2 guest (h_ring3). Additionally, to
+                                                                                                    and paravirtualization for CPU virtualization. It currently
+mitigate the security risk that arises due to mapping switcher
+                                                                                                    focuses on supporting the 64-bit mode with paging for 𝐿2
+into different address spaces, PVM clears all general purpose
+                                                                                                    guest vCPUs, as this is the most frequently used mode.
+registers except for RSP and RAX during a VM-exit to prevent
+                                                                                                       Specifically, when an 𝐿2 vCPU executes a privileged in-
+speculative use of a guest’s CPU states. This prevents an 𝐿2
+                                                                                                    struction, it leads to a general protection exception and trig-
+guest from accessing saved CPU states of another guest or
+                                                                                                    gers an exit to the 𝐿1 hypervisor. The PVM hypervisor em-
+the guest hypervisor.
+                                                                                                    ploys an instruction simulator to emulate instruction ex-
+Direct switch: PVM has also devised a novel direct switch
+                                                                                                    ecution for the 𝐿2 guest. As the process of trap and emu-
+mechanism in the switcher, as shown in Figure 8. This direct-
+                                                                                                    lation is expensive, PVM uses hypercalls to handle a total
+switch mechanism allows 𝐿2 guests to achieve fast user/kernel
+                                                                                                    of 22 frequently invoked privileged instructions (e.g., iret,
+switches due to syscalls without hypervisor intervention.
+                                                                                                    write_msr, and read_msr). Non-privileged but sensitive in-
+   Specifically, when an 𝐿2 guest user invokes a syscall from
+                                                                                                    structions also need to be restricted because of their capa-
+h_ring3, the CPU transitions to h_ring0 and enters switcher.
+                                                                                                    bility to modify/observe privileged host states. PVM uses
+Switcher emulates the syscall instruction by 1) saving the
+                                                                                                    the Linux paravirtualization (PV) mechanism – initially pro-
+state of the 𝐿2 guest user; 2) restoring the state of the 𝐿2
+                                                                                                    posed by Xen [18] – to manage both sensitive and privileged
+guest kernel; and 3) constructing a syscall frame where the
+                                                                                                    instructions via pv_cpu_ops, pv_mmu_ops, and pv_irq_ops in-
+𝐿2 guest kernel can invoke the requested syscall function. At
+                                                                                                    terfaces. These interfaces enable PVM to capture and handle
+the end of the syscall emulation, switcher directly switches
+                                                                                                    any sensitive instructions even though x86 is not fully virtu-
+to the 𝐿2 guest kernel for executing the syscall. By default,
+                                                                                                    alizable [42].
+the kernel returns a syscall via the sysret instruction. As
+                                                                                                    3.3.2 Memory virtualization. PVM seeks to handle memory
+sysret is a privileged instruction while the 𝐿2 guest kernel is
+                                                                                                    virtualization of an 𝐿2 guest exclusively by and within the
+running in h_ring3, the execution of sysret by the 𝐿2 guest
+                                                                                                    𝐿1 hypervisor and employs a software-based approach, i.e.,
+kernel will trap to h_ring0. To enable direct switch, PVM uses
+                                                                                                    shadow page tables (SPT). As stated in Section 3, PVM uses
+a sysret hypercall in the 𝐿2 guest kernel to return a syscall.
+                                                                                                    separate page tables for the 𝐿2 guest user and 𝐿2 kernel,
+The sysret hypercall will enter the switcher (no traps to the
+                                                                                                    preventing any access from the guest user to the guest kernel
+𝐿1 hypervisor), which switches the execution worlds and
+                                                                                                    address. Accordingly, PVM constructs separate shadow page
+directly returns the 𝐿2 guest user.
+                                                                                                    tables for the 𝐿2 guest kernel and user, simulating KPTI for 𝐿2
+3.3    PVM Hypervisor                                                                               guests at the 𝐿1 hypervisor level, achieving strong isolation.
+3.3.1 CPU virtualization. PVM relies entirely on the soft-                                             However, as discussed in Section 2.2, both SPT (single
+ware emulation for CPU virtualization. PVM virtualizes a                                            memory virtualization) and SPT-on-EPT (2-level nested mem-
+vCPU by maintaining its state in the vCPU data structure                                            ory virtualization) incur significant poor overhead due to a
+(similar to VMCS) stored in the per-CPU entry area (see                                             large number of expensive world switches. To address this
+Figure 6) in switcher. As stated in Section 3, 𝐿2 guest vC-                                         challenge, PVM devises a new and highly-efficient SPT ap-
+PUs are restricted to operate solely on h_ring3 for security                                        proach with various optimizations, called PVM-on-EPT, as
+considerations. The PVM hypervisor simulates v_ring0 and                                            illustrated in Figure 9. Compared with the EPT-on-EPT ap-
+v_ring3 using a switcher state flag for the 𝐿2 guest. As 𝐿2                                         proach (Section 2.2), PVM-on-EPT leads to fewer and cheaper
+guest vCPU works on h_ring3, access to privileged registers                                         world switches, making it possible for a software-based SPT
+
+
+
+                                                                                              522
+approach to achieve comparable (or better) performance as                  In a traditional SPT approach, the hardware uses hier-
+(than) the hardware-assisted approach.                                  archical address space ID for TLB (e.g., EPTP, VPID, and
+PVM-on-EPT. Figure 9 shows that, the 𝐿2 guest operates its              PCID), and all processes running in the same 𝐿2 guest share
+guest page table (GPT2), mapping GVA𝐿2 to GPA𝐿2 , while the             the same higher granular VPID. This means that any TLB
+𝐿1 hypervisor maintains the guest shadow page table (SPT12)             flushes to the 𝐿2 (user or kernel) cause the higher granular
+for 𝐿2 , mapping GVA𝐿2 to GPA𝐿1 . Note that, 𝐿1 maintains               VPID to be flushed rather than the specific PCID, resulting in
+two shadow page tables – one for the 𝐿2 guest user and one              a costly cold-start penalty as all TLB entries associated with
+for the 𝐿2 guest kernel. To ensure that any updates from                the 𝐿2 guest are flushed whenever there is a 𝐿2 flush request.
+GPT2 are synchronized with SPT12, GPT2 is made read-only                To eliminate these TLB flushes for 𝐿2 , PVM employs a PCID
+to 𝐿2 . Finally, to run the 𝐿2 guest, the underlying host 𝐿0            mapping mechanism. It assigns unused PCID values (e.g.,
+hypervisor simply uses both SPT12 and EPT01 (which maps                 32-63) from 𝐿1 to the 𝐿2 guest (e.g., 32-47 for guest v_ring0
+GPA𝐿1 to HPA) to translate GVA𝐿2 to HPA. Since EPT01 for                and 48-63 for guest v_ring3) and maps them with the 𝐿2
+an 𝐿1 VM appears identical to that of other regular VMs,                guest’s PCID. This allows the TLB hardware to recognize
+the 𝐿0 hypervisor remains unaware of the nested memory                  individual SPTs for each process in 𝐿2 , thereby eliminating
+virtualization within 𝐿1 , and thus, requires no modifications          TLB flushes during world switches.
+to support PVM-on-EPT.                                                     In addition, a traditional SPT approach relies on a global
+   We use the handling process of a page fault from 𝐿2 to               read-write lock, namely “mmu_lock”, to serialize updates to
+demonstrate the world switches due to PVM-on-EPT. First,                SPT data structures. In contrast, PVM employs a fine-grained
+an 𝐿2 page fault occurring from the guest user space traps              locking mechanism that provides more precise data protec-
+to the 𝐿1 hypervisor via the switcher (➀-➁) with one world              tion and enables greater concurrency in handling page faults.
+switch. The page fault handler of the PVM hypervisor injects            First, PVM identifies tasks that can be processed without
+the page fault back to 𝐿2 (➂) and switches to the 𝐿2 kernel             holding the “mmu_lock” or can be delayed (such as walking
+via one world switch (➃-➄). Then, the 𝐿2 kernel starts updat-           shadow pagetables), thereby reducing the sequential execu-
+ing GPT2 (➅). As GPT2 is read-only, each update needs the               tion time caused by “mmu_lock”. Further, PVM categorizes
+assistance of 𝐿1 , causing 2n (where n is the number of GPT2            SPT related data into three sub-groups: 1) inter-shadow pages
+levels) world switches between the 𝐿2 kernel and 𝐿1 (not                (e.g., shadow page collections or parent/child relationships),
+depicted in Figure 9). After all related page table entries in          2) intra-shadow pages (e.g., shadow page-table entries), and
+GPT2 have been updated, the 𝐿2 guest kernel returns (➆ via              3) reverse mappings (between a guest frame number and its
+the iret hypercall). Instead of returning to the 𝐿2 guest user          SPT entry) allowing for faster location of the SPT entries
+via direct switch, PVM adopts a prefault optimization and               given a guest frame number. PVM uses separate locks to pro-
+switches to 𝐿1 (with one world switch), which proactively up-           tect each data group – i.e., a “meta-lock” for inter-shadow
+dates SPT12 (➇), preventing future traps due to subsequent              pages, a per-shadow page “pt_lock” for intra-shadow pages,
+page faults on SPT12 due to the missing of the correspond-              and a per-guest frame number, per-page “rmap_lock” for
+ing GVA𝐿2 recently updated in GPT2. Finally, 𝐿1 returns to              reverse mappings.
+𝐿2 guest user with one more world switch. In summary, an
+𝐿2 page fault causes 2n + 4 world switches under PVM-on-                3.3.3 Interrupt virtualization. Unlike CPU and memory
+EPT, fewer than EPT-on-EPT which triggers 2n + 6 world                  virtualization that can be entirely handled by PVM within 𝐿1 ,
+switches. Note that, PVM-on-EPT exclusively handles of 𝐿2               interrupt virtualization requires the involvement of the 𝐿0
+page faults within 𝐿1 , while EPT-on-EPT heavily relies on 𝐿0 .         hypervisor. Whenever an interrupt for an 𝐿2 guest occurs,
+Although PVM-on-EPT only saves two world switches com-                  regardless of KVM or PVM, an 𝐿2 guest will first need to exit
+pared to EPT-on-EPT, the world switches in PVM-on-EPT                   to the 𝐿0 hypervisor because in both scenarios the interrupt
+are substantially cheaper. The world switches in PVM en-                will cause a VM exit from the non-root mode to the root
+tail state transitions within switcher and ring level changes           mode at 𝐿0 . This first world switch is enabled by VMCS and
+in the non-root mode while those in EPT-on-EPT require                  handled (automatically and transparently to software) by
+state transitions across the non-root and root mode. Our                the CPU hardware. Subsequently, the 𝐿0 hypervisor injects
+measurements show that it takes on average 0.179 μs to per-             the interrupt to the 𝐿1 VM, from where PVM handles the
+form a world switch in PVM, almost an order of magnitude                interrupt differently from the existing approaches. In KVM,
+cheaper than that in EPT-on-EPT (1.3 μs) and close to that              since the 𝐿1 VM is unable to manage the VMCS for the 𝐿2
+in single-level virtualization (0.105 μs).                              guest and the 𝐿0 hypervisor manages a shadow copy 𝑉 𝑀𝐶𝑆 02
+Optimizations. In addition to the prefault optimization, we             for 𝐿2 (as discussed in Section 2.1), the following interrupt
+devise two other important optimizations in PVM-on-EPT: 1)              handling requires multiple exits to L0. In contrast, after in-
+a process context identifiers (PCID) mapping mechanism that             terrupt injection to the 𝐿1 VM, PVM uses a customized IDT
+eliminates TLB flushes for 𝐿2 ; and 2) a fine-grained locking           to handle the interrupt entirely between 𝐿1 and 𝐿2 without
+mechanism for fast SPT updates.                                         any involvement of 𝐿0 .
+
+
+
+                                                                  523
+   PVM relies on 𝐿0 solely for interrupt injection to 𝐿1 and                                 kvm         pvm         kvm         pvm
+                                                                          Configurations
+adopts software-based interrupt virtualization afterwards. If                                (BM)        (BM)       (NST)       (NST)
+an interrupt occurs while an 𝐿2 guest is running, the default             Hypercall        0.46/0.46   0.54/0.54 7.43/7.87    0.48/0.48
+                                                                          Exception        1.66/1.65   1.67/1.65 9.20/9.01    2.21/2.2
+interrupt descriptor table (IDT) handler for this 𝐿2 guest,
+                                                                          MSR access       0.87/0.87   2.53/2.51 8.18/8.47    2.88/2.86
+which is pointed by the hardware IDTR register located in
+                                                                          CPUID            0.54/0.54   0.60/0.59 7.10/7.16    0.51/0.51
+the 𝐿2 guest address space, cannot handle it appropriately.               PIO              3.79/3.39   4.91/4.54 29.34/28.27 12.94/12.03
+To address this issue, PVM maps a customized IDT at the
+address to where the IDTR points in the 𝐿2 address space.                Table 1. Average round-trip latency (μs) of VM exits/entries
+The customized IDT initiates a transition to the PVM hyper-              with KPTI enabled/disabled.
+visor (equivalent to a VM exit from 𝐿2 to 𝐿1 ) to handle the             root and non-root modes, EPT, and VMCS Shadowing. The
+interrupt. Note that as PVM shifts the starting address of               VM instance had no hardware virtualization support and did
+the guest’s CPU entry area back by one PUD size, both the                not colocate with other VMs. Hence, its performance was
+customized IDT and the 𝐿2 guest’s original IDT can co-exist.             solely affected by nested virtualization.
+Within the 𝐿1 VM, PVM reuses the interrupt controller (APIC)                We ran benchmarks and workloads using Kata contain-
+virtualization in KVM to convert the interrupt to a virtual              ers, namely the secure containers where regular containers
+interrupt and injects it back to the 𝐿2 guest, from where the            are deployed and running in lightweight VMs, controlled
+virtual interrupt handle is identical to that in a regular VM.           by KVM or PVM. A secure container can run as an 𝐿2 guest
+   To capture all interrupts for an 𝐿2 guest, the PVM hyper-             on the general-purpose VM instance or directly on the bare-
+visor enables hardware interrupts at h_ring3, where the 𝐿2               metal instance. All secure containers were managed by the
+guest operates. This requires setting the RFLAGS.IF flag in              RunD [36] runtime. Both the 𝐿1 guest hypervisor and 𝐿0 host
+the iret frame for each VM entry in switcher. However,                   hypervisor ran Linux kernel 4.19. For I/O virtualization, we
+read/write to the interrupt configuration from within an 𝐿2              used paravirtualization: virtio-blk for disk and vhost-net
+guest does not cause an exit to the 𝐿1 hypervisor and thus the           for network. All Linux kernels had Kernel Page Table Isola-
+latter does not know whether a virtual interrupt can be in-              tion (KPTI) enabled, if not otherwise stated.
+jected into an 𝐿2 guest, i.e., whether the interrupt is enabled             We considered five scenarios for the deployment of secure
+in 𝐿2 . To overcome this, PVM introduces an 8-byte shared                containers: 1) Bare-metal (BM) instance with full hardware
+data structure between an 𝐿2 guest and the 𝐿1 hypervisor                 virtualization support, denoted as kvm-ept (BM). This is the
+to virtualize RFLAGS.IF. As such, the 𝐿1 hypervisor is able to           single-level virtualization case with the hardware VMX and
+directly query interrupt configuration inside an 𝐿2 guest.               EPT support. 2) Bare-metal instance with shadow paging
+                                                                         (kvm-spt (BM)). This is the baseline for software-based mem-
+4   Evaluation                                                           ory virtualization. 3) PVM on bare-metal hardware (pvm
+We have thoroughly evaluated the effectiveness of PVM. As                (BM)). 4) 2-level nested (NST) virtualization with full hard-
+PVM does not require hardware virtualization support and                 ware support (kvm-ept (NST)). This is a state-of-the-art ap-
+is compatible with KVM’s virtualization interface, it can                proach for deploying secure containers in VM instances. 5)
+run both as 1) an 𝐿1 guest hypervisor for nested virtualiza-             PVM within VM instances with nested virtualization (pvm
+tion and 2) an 𝐿0 hypervisor on bare-metal hardware for                  (NST)). Note that we exclude the shadow-on-shadow (SPT-
+single-level virtualization. We compared PVM with two ex-                on-SPT) scenario as it is not a viable approach in practical
+isting approaches: hardware-assisted and shadow page table-              systems due to unacceptable performance.
+based (software) approaches in both single-level (bare-metal)            4.1 Micro-benchmarks
+and nested (2-level) virtualization. Specifically, we first used         VM exit and entry cause world switches between a VM and
+micro-benchmarks to investigate the performance of PVM’s                 its underlying hypervisor(s). With VMX hardware support,
+switcher in performing world switches and PVM’s shadow                   VM exits directly trap to ring-0 in root mode, i.e., the 𝐿0
+paging (i.e., PVM-on-EPT) in handling various types of guest             hypervisor in nested virtualization. In contrast, PVM uses
+page table updates. Further, we used real-world applications             hypercalls or instruction emulation to trap privileged in-
+to assess the overall performance and scalability of PVM.                structions due to the absence of hardware support, but VM
+   Without loss of generality, we conducted the experiments              exits only trap to the 𝐿1 guest hypervisor, i.e., PVM (instead
+using Intel processors. We used two Intel x86 instances from             of the 𝐿0 hypervisor). We evaluated the effectiveness of PVM
+Alibaba Cloud – 1) a bare-metal instance and 2) a general-               in handling VM exits compared to the hardware-assisted
+purpose (VM) instance with identical software and hardware               approach in single-level and nested virtualization. As both
+configurations. Each instance was configured with two Intel              kvm-spt and kvm-ept use VMX for CPU virtualization, their
+Xeon Platinum CPUs (i.e., model 8269CY with 26 cores at                  results are similar and are collectively referred to as kvm.
+2.50GHz and hyperthreading enabled), 385 GB RAM, and a                      We used a set of micro-benchmarks to perform privileged
+500 GB SATA SSD. The bare-metal instance was equipped                    guest operations to trigger VM exits and measured the round-
+with Intel virtualization technology (VT), supporting VMX                trip time until VM entries, both with KPTI enabled/disabled.
+
+
+
+                                                                   524
+      Configurations       Optimization       Syscall (μs)                                            150                                            194
+                                                                                                                kvm-ept (BM)
+
+
+
+
+                                                                                 Execution Time (s)
+      kvm-ept (BM)                             0.22/0.06                                              120       kvm-spt (BM)
+      kvm-spt (BM)                             2.09/0.06                                                        pvm (BM)
+                                                                                                      90        kvm-ept (NST)
+      pvm (BM)             none                1.91/1.91                                                        pvm (NST)
+                           direct-swicth       0.29/0.29                                              60        pvm (NST-prefault)
+      kvm (NST)                                0.23/0.06                                                        pvm (NST-pcid)
+                                                                                                      30        pvm (NST-lock)
+      pvm (NST)            none                1.93/1.93
+                           direct-swicth        0.3/0.3                                                0
+                                                                                                            1        2        4      8         16   32
+Table 2. Execution time (μs) of syscall get_pid with KPTI                                                                Number of processes
+enabled/disabled.                                                        Figure 10. The performance of guest page faults handling.
+                                                                            We observed that with KPTI disabled, both kvm-ept (BM)
+Table 1 lists the average round-trip latency under five privi-           and kvm (NST) executed the get_pid syscall faster due to
+leged guest operations: no-op hypercall, invalid opcode ex-              reduced world switches between the guest user and kernel,
+ception, MSR access of MSR_CORE_PERF_GLOBAL_CTRL, CPUID,                 e.g., the syscall latency dropped from 0.22 to 0.06 microsec-
+port-mapped I/O (PIO). For each case, the average round-trip             onds. However, this improvement was not observed in PVM,
+latency was determined based on ten million operations.                  e.g., the latency remained around 0.30 microseconds (with
+   In single-level virtualization, VM exits/entries were effi-           direct switching). The main reason is that disabling KPTI
+ciently handled by hardware: pvm (BM) offered performance                in PVM does not reduce its world switches: After a system
+comparable to kvm (BM) in most guest operations, except                  call completes via sysret, there remains the necessity to exit
+for MSR access. It is due to KVM’s capability to directly                either to switcher or to the PVM hypervisor. Both change the
+access MSR registers in non-root mode, avoiding VM ex-                   ring level from h_ring3 to h_ring0 in non-root mode. We are
+its. In nested virtualization, PVM significantly outperformed            in the process of developing an advanced direct switching
+hardware-assisted approaches: pvm (NST), compared to kvm                 optimization that can return sysret at h_ring3. This can save
+(NST), reduced VM exit/entry latency by an average of over               one exit to h_ring0 during syscalls and achieve comparable
+75%. This clearly demonstrates the benefit of PVM’s software-            syscall latency as that in the KVM baselines without KPTI.
+based VM exit/entry: kvm (NST) triggered two expensive                   Page faults. In nested virtualization, PVM is transparent to
+exits to the 𝐿0 hypervisor for each privileged 𝐿2 guest opera-           the 𝐿0 hypervisor. Consequently, any violations in EPT01 –
+tion, while PVM needed one and less expensive VM exit to the             i.e., responsible for translating 𝐿1 VM’s physical addresses
+𝐿1 guest hypervisor. From these results, we did not discern              to 𝐿0 host’s physical addresses – are handled by the 𝐿0 hy-
+any considerable impact from KPTI on VM exits/entries.                   pervisor (out of PVM’s control). Thus, we assume that the 𝐿1
+System calls, or syscalls, cause the transition between guest            VM has been sufficiently warmed up and there are very few
+user and kernel space. Unlike other privileged operations,               EPT violations. This is a reasonable assumption as general-
+most syscalls can be handled without VM exits in hardware-               purpose VM instances usually stay up for hours, if not for
+assisted, nested virtualization – i.e., no exits to the 𝐿1 or 𝐿0         days. We focus on evaluating guest page faults, i.e., those
+hypervisor. In contrast, without the VMX hardware support,               due to launching short-lived secure containers.
+PVM emulates the syscall instruction through its switcher,                  We used a micro-benchmark to repeatedly allocate and
+where a guest syscall causes an exit to the PVM hypervisor.              release 1MB of memory in a guest’s virtual address space and
+   To gauge PVM’s efficiency in handling guest syscalls, we              access the allocated data at page granularity. This process
+measured the execution time of the get_pid syscall. This                 continued until the accessed data reached 4GB. This bench-
+syscall is simple and mostly involves a user/kernel transition.          mark caused frequent updates to the guest page table and
+In Table 2, regardless of single-level or nested virtualization,         thus stress-tested memory virtualization. To examine scala-
+kvm-ept (BM) and kvm (NST) achieved similar and superior                 bility, we adjusted the number of benchmark processes from
+performance because the syscall can be handled exclusively               1 to 32 within a single container. Figure 10 illustrates the per-
+and quickly by the guest. We then analyzed two PVM vari-                 formance of various approaches, among which kvm-ept (BM)
+ants: one with direct switching and the other without. Com-              achieved the best performance and scalability. This is because
+pared with hardware-assisted approaches, PVM noticeably                  the existing 2-level paging hardware can efficiently handle
+slowed down syscall execution – e.g., by up to 7x without                guest page table updates. While pvm (BM) shows similar scal-
+direct switching (with KPTI enabled). The direct switching               ability, its performance lags. This is expected for a software-
+feature can reduce PVM’s overhead, narrowing the syscall                 based approach. Notably, pvm (NST) significantly outper-
+execution time gap between PVM and its hardware-assisted                 formed kvm-ept (NST), and the performance gap widened
+counterparts to around 1.3x (with KPTI enabled). kvm-spt                 with increasing concurrency. This clearly demonstrates the
+was the least efficient of all tested methods because a user-            benefits of PVM’s shadow paging (i.e., PVM-on-EPT) and
+kernel transition in the guest requires a costly trap to the             its optimizations – prefault, PCID mapping, and fine-grained
+hypervisor to switch the corresponding shadow page tables.               page table locking. As depicted in Figure 10, by applying
+
+
+
+                                                                   525
+           null       open slct sig sig fork exec sh                     also performed tests on network latency and bandwidth and
+ Config #C       stat
+           I/O        close TCP inst hndl proc proc proc                 obtained similar results as those in the file system tests.
+kvm-ept 1 0.27 0.72 25.07 2.16 0.29 1.01 82.13 422.33 1.6k
+ (BM) 32 6.5 14.6 289.5 2.16 0.3 4.005 513.5 4.62k 7.64k                 4.3 Real-world Applications
+kvm-spt 1 2.15 2.66 32.63 4.09 2.16 2.95 504.67 1.5k 4.2k
+                                                                         We continued the evaluation of PVM using four representa-
+ (BM) 32 6.325 14.2 266 4.115 2.17 3.995 32k 76k 171k
+                                                                         tive real-world applications with distinct characteristics: 1)
+  pvm   1 0.33 0.78 30.83 2.18 0.32 1.71 436.67 1.29k 3.58k
+  (BM) 32 6.475 14.95 314 2.18 0.33 4.25 5.38k 12.5k 29.5k               Kbuild [26] builds the Linux kernel from the source involv-
+kvm-ept 1 0.28 0.76 36.43 2.24 0.30 1.07 113.00 725.67 2.29k             ing a mixture of compute and file I/O; 2) Blogbench [16] is a
+ (NST) 32 7.03 16 578.5 2.495 0.35 4.295 812.5 14k 28k                   filesystem benchmark that reproduces the load of a busy file
+  pvm   1 0.33 0.79 25.73 2.22 0.33 1.72 466.33 1.33k 3.55k              server; 3) SPECjbb2005 [14] is a Java benchmark involving
+ (NST) 32 5.96 10.45 335.5 2.25 0.33 4.52 7.04k 15k 32.5k                the use of a Java virtual machine (JVM); 4) Fluidanimate is a
+                                                                         benchmark with a large dataset selected from the PARSEC
+Table 3. LMbench: Processes - time in μs (smaller is better).            benchmark suite [21]. We ran multiple instances of the same
+                0K File      10K File          Prot Page 100fd           benchmark, each in a separate secure container, and varied
+   Config                                Mmap
+             create/delete create/delete      Fault Fault select         the concurrency level from 1 to 16.
+kvm-ept(BM) 86.83/55.37 139.37/59.43 85.93k 0.66 0.15 2.02                  We made the following observations from the results as
+kvm-spt(BM) 115.97/73.10 190.77/80.57 125.9k 3.17 0.93 3.96              shown in Figure 11. First, for all applications, PVM offered per-
+  pvm(BM) 112.83/73.83 172.30/73.57 115.20k 2.65 0.88 2.05               formance close to the hardware-assisted approach for single-
+kvm-ept(NST) 148.73/98.87 221.63/98.77 128.03k 0.69 0.19 2.09
+                                                                         level virtualization. Further, the performance of kvm-ept
+  pvm(NST) 108.03/69.33 161.20/68.50 118.20k 2.69 1.01 2.08
+                                                                         (NST) collapsed in all cases when concurrency was high, sug-
+Table 4. File & VM system latencies in μs (smaller is better).           gesting that the 𝐿0 hypervisor became the bottleneck. This
+                                                                         discovery reinforces that only utilizing hardware-assisted
+the fine-grained page table locking optimization alone, PVM
+                                                                         approaches to traverse multiple layers in the virtualization
+achieves superior scalability; the use of prefault and PCID
+                                                                         stack is neither efficient nor adaptable. In comparison, PVM
+mapping further enhances PVM’s performance.
+                                                                         achieved consistently good performance and, in many cases,
+4.2 System Benchmarks                                                    close to that of single-level virtualization. PVM even out-
+Beyond our hand-crafted micro-benchmarks, we also used                   performed the hardware-assisted approach in fluidanimate
+system benchmarks targeting different guest subsystems to                due to more efficient handling of the HALT instruction. PVM
+more comprehensively evaluate PVM. We selected 32 bench-                 executes the HALT instruction via a hypercall and performs
+marks in LMbench [8], including process management, file                 the sleep and wakeup process without a switch between the
+systems, and network I/O. Table 3 and 4 present the results              non-root and root modes, leading to higher overall CPU uti-
+for process management and file system I/O, respectively.                lization for parallel programs with blocking synchronization.
+For process management, we present results with a single                    PVM achieves superior concurrent performance due to two
+process and 32 processes. Networking results are similar to              main factors. First, PVM incurs only one VM exit to 𝐿0 when
+that of file systems and thus not presented.                             handling an interrupt, eliminating the need for VM exits to
+   Table 3 shows that pvm (BM) consistently outperformed                 𝐿0 when managing 𝐿2 guest page faults. As a result, there
+kvm-spt in most cases and achieved close yet slightly worse              is less strain on 𝐿0 by minimizing the frequent switching
+performance than that of kvm-ept (BM) except for fork, exec,             between non-root and root modes. Instead of overwhelming
+and sh. We found that these three benchmarks intensively                 𝐿0 with these tasks, PVM enables interrupts and 𝐿2 guest
+created new page tables without actually accessing them.                 page faults to be individually and concurrently handled by
+Therefore, these benchmarks caused guest page faults that                their corresponding 𝐿1 hypervisors. Second, PVM devises 𝐿0-
+never needed to update the 𝐿0 hypervisor’s EPT. In such                  transparent optimizations for page fault handlings, such as
+cases, hardware-assisted approaches are always more effi-                prefault, PCID mapping, and fine-grained shadow page table
+cient and page faults can be handled solely by the guest.                locks. These mechanisms together achieve up to two orders
+A similar pattern was observed for nested virtualization –               of magnitude performance improvements when compared
+pvm (NST) was consistently better than kvm-ept (NST) except              to hardware-assisted virtualization with multiple 𝐿2 guests.
+for the three tests for the same reason. Table 4 shows the                  We further increased the density of secure container de-
+performance of the file system I/O and virtual memory man-               ployment to the maximum capacity the two cloud instances
+agement. As PVM largely relies on KVM for I/O virtualization,            can handle. Figure 12 shows the performance of fluidan-
+its performance on file and network I/O was close to KVM,                imate – the most memory-intensive one among the four
+whether in single-level or nested virtualization. The only               applications. Interestingly, under high load conditions, all
+exceptions were observed in the two page fault benchmarks                approaches converged to similar performance except for
+– similar to the fork benchmark, guest page faults occurred              kvm-ept (NST), which crashed due to a failure to connect to
+without updates in the hypervisor-managed page table. We                 the RunD container runtime. Last, we evaluated PVM with
+
+
+
+                                                                   526
+                                                                                      1421                                                                                              80                                                                                        213
+                         800                                                                                   1500                                                                          kvm-ept (BM)    kvm-spt (BM)                              120
+
+
+
+
+                                                                                                                                                           Average throughput (kbops)
+                                          kvm-ept (BM)                                                                  kvm-ept (BM)       kvm-spt (BM)                                                                                                      kvm-ept (BM)
+                                                                                                                                                                                             pvm (BM)        kvm-ept (NST)                                   kvm-spt (BM)
+                                          kvm-spt (BM)
+ Average exec time (s)
+
+
+
+
+                                                                                                                                                                                                                               Average exec time (s)
+                                                                                                                        pvm (BM)           kvm-ept (NST)
+                         600                                                                                   1200                                                                     60   pvm (NST)                                                       pvm (BM)
+                                          pvm (BM)                                                                                         pvm (NST)
+
+
+
+
+                                                                                               Average score
+                                          kvm-ept (NST)                                                                                                                                                                                                 80   kvm-ept (NST)
+                                          pvm (NST)                                                             900                                                                                                                                          pvm (NST)
+                         400                                                                                                                                                            40
+                                                                                                                600
+                                                                                                                                                                                                                                                        40
+                         200                                                                                                                                                            20
+                                                                                                                300
+
+                           0                                                                                      0                                                                      0                              0.03
+                                                                                                                                                                                                                                                         0
+                                         1                              4            16                                1              4          16                                          1          4          16                                        1           4       16
+                                                                  Concurrency                                                    Concurrency                                                       Concurrency                                                     Concurrency
+
+                           (a) Kbuild (lower is better)                                                        (b) Blogbench (higher is better)                                 (c) Specjbb2005 (higher is better)                             (d) Fluidanimate (lower is better)
+
+                                                                    Figure 11. The performance of real-world applications under different levels of concurrency.
+                                                        1000
+                                                                            kvm-ept (BM)
+                               Average exec time (s)
+
+
+
+
+                                                         800                kvm-spt (BM)                                                                                                in-memory data processing and analytics workloads from
+                                                                            pvm (BM)
+                                                         600                kvm-ept (NST)
+                                                                                                                                                                                        bare-metal servers to PVM servers with nested virtualization.
+                                                                            pvm (NST)                                                                                                   These PVM servers have shown an average performance
+                                                         400
+                                                                                                                                                                                        boost of 22.6% for Spark workloads. It is worth noting that
+                                                         200
+                                                                                                                                                                                        the PVM servers are equipped with newer generation pro-
+                                                              0
+                                                                            50               100
+                                                                                                                             o
+                                                                                                                           150
+                                                                                                                                                                                        cessors than the bare-metal ones in Alibaba Cloud. We ex-
+                                                                                          Concurrency                                                                                   pect PVM to offer comparable performance with bare-metal
+Figure 12. The performance of fluidanimate under high load.                                                                                                                             servers if both were deployed on the same platform.
+                                                        1.5
+                                                                       kvm-ept (BM)            kvm-spt (BM)
+                               Normalized performance
+
+
+
+
+                                                                       pvm (BM)                kvm-ept (NST)
+                                                                       pvm (NST)                                                                                                         5   Discussions and Future Work
+                                                        1.0
+                                                                                                                                                                                        Security of PVM. Secure containers running in PVM share
+                                                                                                                                                                                        the common isolation assumptions as traditional VMs: We
+                                                        0.5
+                                                                                                                                                                                        trust hardware-based protection (e.g., page tables), which
+                                                                                                                                                                                        ensure strong isolation between processes, or “worlds” in
+                                                        0.0                                                                                                                             PVM; we focus on deficiencies in software (e.g., kernels and
+                                                                  data analytics    graph analytics in memory analytics
+                          Figure 13. The performance of cloud benchmarks.                                                                                                               hypervisors) that could be exploited through exposed in-
+                                                                                                                                                                                        terfaces like system calls or hypercalls. Hence, the threat
+three representative workloads with large datasets from the
+                                                                                                                                                                                        model assumes that one malicious tenant (running in 𝐿2 )
+Cloud Bench Suite [4]. This experiment stress-tested PVM’s
+                                                                                                                                                                                        may attempt to breach the isolation boundaries by compro-
+capability of executing data-intensive applications at a rel-
+                                                                                                                                                                                        mising the exposed interfaces and exploiting vulnerabilities
+atively low concurrency level. Figure 13 shows that PVM
+                                                                                                                                                                                        in its host kernels or hypervisors (running in 𝐿1 ), resulting
+achieved close performance to bare-metal approaches and
+                                                                                                                                                                                        in information leakage, privilege escalation, and denial of
+significantly outperformed kvm-ept (NST).
+                                                                                                                                                                                        services. Two main metrics are used to evaluate the attack
+   To summarize, PVM is currently the most practical solution
+                                                                                                                                                                                        surface: 1) the size of the exposed interfaces and 2) the extent
+for nested virtualization across various workloads, delivering
+                                                                                                                                                                                        of code accessible through the interfaces.
+comparable performance to single virtualization.
+                                                                                                                                                                                           Secure containers running with PVM provide stronger iso-
+4.4 Cloud Adoption                                                                                                                                                                      lation (i.e., more secure) than traditional containers that are
+PVM has been adopted by Alibaba Cloud, a major IaaS cloud                                                                                                                               deployed directly on the (𝐿1 ) host and share the same host
+provider, as an alternative to bare-metal instances for hosting                                                                                                                         kernel. There are two main reasons: 1) Narrow attack sur-
+secure containers. Presently, PVM operates more than 100K                                                                                                                               face: secure containers interact with the (𝐿1 ) host kernel via
+secure containers with over 400K vCPUs on a daily basis.                                                                                                                                a minimal set of hypercalls, typically around 10s. In contrast,
+These secure containers are deployed for a range of tasks,                                                                                                                              traditional containers rely on a much larger system-call in-
+such as user-defined serverless functions, data analytics via                                                                                                                           terface, e.g., 250+ system calls under the default seccomp
+Spark, and offline batch jobs. PVM has effectively supported                                                                                                                            configuration. 2) Defense in depth: a malicious user in secure
+users in addressing traffic spikes by promptly launching                                                                                                                                containers needs to comprise both the (𝐿2 ) kernel and (𝐿1 )
+general-purpose instances with nested virtualization.                                                                                                                                   hypervisor before being able to comprise the (𝐿1 ) host kernel,
+   The adoption of PVM has continued to grow over the                                                                                                                                   making it challenging for attackers to breach the isolation
+past year. It has led to a 36% user shift from bare-metal in-                                                                                                                           boundaries and escalate privileges. Moreover, PVM leads to
+stances to general-purpose instances for secure container                                                                                                                               a thin L0 hypervisor compared to hardware-based nested
+hosting and substantial cost-savings for cloud tenants. No-                                                                                                                             virtualization, which further reduces the security risks and
+tably, there has been a steady migration of Spark–based                                                                                                                                 minimizes the attack surface for IaaS clouds.
+
+
+
+                                                                                                                                                      527
+Limitations of PVM. As a software-based approach for                    guest page fault bypassing, virtual EPT, and PV VMCS, to
+nested virtualization, PVM could introduce considerable over-           cut down the overhead of nested guests. BrFusion [17] and
+head for certain workloads, such as fork and the allocation             Hostlo [17] address two networking issues of nested virtual-
+of many small memory areas. These workloads lead to a                   ization. nOSV [44] presents a lightweight VMM based on the
+high number of 𝐿2 guest page faults that the PVM hypervisor             microkernel that can house multiple Xen hypervisors with
+needs to handle. In contrast, a guest can handle these page             minimal runtime overhead. In contrast, PVM introduces a
+faults exclusively in hardware-assisted approaches. Even                pure software-based design and implementation for nested
+though these access patterns are rare in real-world applica-            virtualization with significantly improved performance.
+tions, we aim to address this issue by allowing PVM’s switcher          Software-based virtualization. Without hardware support,
+to distinguish between guest and shadow page table faults.              the hypervisor must implement VM entry/exit and memory
+By doing this, the former can be directly injected back to an           virtualization via software [7, 13, 24, 25, 29, 50]. By com-
+𝐿2 guest, saving one exit to PVM.                                       bining trap-and-emulate techniques with binary translation,
+   PVM ensures isolation between the guest user and ker-                VMware Workstation 1.0 [24] provides an efficient way to
+nel by using separate page tables for each, resulting in dual           virtualize x86 architectures and enable the operation of mul-
+shadow page tables. We are continuously refining PVM in                 tiple virtual machines on a single physical host. Lguest [7]
+two directions. First, write protection (WP) is currently em-           employs shared memory to enable the mapping of code in
+ployed by PVM to synchronize the guest and shadow page                  the host and guest address spaces simultaneously, facilitating
+tables (GPT and SPT). However, WP-induced VM exits cause                VM entry/exit. HVX [29] leverages instruction replacements
+a significant overhead with dual shadow page tables. We                 and simulation to enhance virtualization. Xen-blanket [50]
+are exploring the possibility of removing WP by allowing                provides blanket hypercalls for guests, replacing the origi-
+the guest and hypervisor to collaboratively construct these             nal vmcall-based hypercalls, thus avoiding the execution of
+page tables through an efficient synchronization approach.              privileged vmcall instructions. These approaches rely on the
+Second, we are working towards implementing a Xen-like                  shadow paging mechanism for memory virtualization. How-
+“direct paging” solution on KVM by mapping the GPA->HPA                 ever, recent widely adopted secure container technologies
+relationship to the guest.                                              rely heavily on the KVM hypervisor, which can effectively
+6   Related Work                                                        utilize Linux subsystems by co-existing with the Linux ker-
+Secure containers [6, 10, 15] host containerized workloads              nel and providing support for many advanced cloud-native
+in lightweight VMs. They can be crafted with both hardware              features (e.g., hotplugging, memory balloon, large pages,
+support [3, 12, 46] and software optimizations [15, 51, 52],            and virtio). PVM, as a practical approach for cloud-native
+leading to minimized performance overhead. For instance,                environments, is built upon the KVM hypervisor and seam-
+Intel CPUs support Virtualization Technology (VT-x) [3, 46]             lessly integrates with the existing software stack of secure
+and Virtualization Technology for Direct I/O (VT-d) [12] to             containers. In addition, PVM’s PVM-on-EPT significantly
+reduce the performance overhead of CPU, memory, and I/O                 outperforms existing paging-based approaches.
+virtualization. AWS’s Firecracker [15] tailors a VM’s guest
+kernel and virtual machine monitor (VMM) with minimal
+                                                                        7   Conclusion
+                                                                        This paper presents PVM, a minimal, high-performance, and
+components and a simplified I/O model. NEC’s LightVM [51]
+                                                                        software-based hypervisor for nested virtualization. PVM
+links a hosted application into a tiny unikernel image un-
+                                                                        does not assume any hardware virtualization support and
+der a single address space for improved efficiency. With
+                                                                        thus is portable to any cloud systems based on KVM. As a self-
+such support/optimizations, secure containers allow appli-
+                                                                        contained nested virtualization approach, PVM is transparent
+cations to run efficiently with high-density deployment and
+                                                                        to the underlying host hypervisor and does not affect the
+high-concurrency startup [36]. PVM introduces a novel high-
+                                                                        security, complexity, or management of cloud platforms. We
+performance nested virtualization framework to run secur-
+                                                                        have demonstrated that PVM is the only viable approach
+ing containers in VMs more efficiently.
+                                                                        with superior performance than hardware-assisted nested
+Nested virtualization. There has been significant research
+                                                                        virtualization. PVM has been adopted in Alibaba Cloud for
+in performance improvement via both software and hard-
+                                                                        hosting secure containers, providing a more performant and
+ware approaches. Turtles [20] and Neve [37] are two early
+                                                                        cost-effective option for cloud users.
+implementations of nested virtualization on x86 and ARM.
+DVH [38] provides four mechanisms (e.g., virtual passthrough,           8   Acknowledgements
+virtual timers, virtual inter-processor interrupts, and virtual         We thank the anonymous reviewers and our shepherd, Edouard
+idle) enabling 𝐿0 to directly expose virtual hardware to 𝐿2             Bugnion, for their constructive feedback and suggestions.
+curtailing exit multiplication. SVT [48] runs different VMs             This work is supported by Alibaba Innovative Research, Ant
+and hypervisors on separate hardware threads, reducing the              Group Research Fund, and National Science Foundation of
+costly context switches of VM traps via simple thread stall.            China under grant No.62032008. The corresponding authors
+NestCloud [41] introduces three optimizations that include              are Jia Rao, Hui Lu, Jiangshan Lai, Tao Ma, and Song Wu.
+
+
+
+                                                                  528
+References                                                                                   Transactions on Computer Systems (TOCS) 15, 4 (1997), 412–447.
+ [1] About nested virtualization. https://cloud.google.com/compute/docs/                [24] Bugnion, E., Devine, S., Rosenblum, M., Sugerman, J., and Wang,
+     instances/nested-virtualization/overview.                                               E. Y. Bringing virtualization to the x86 architecture with the original
+ [2] Amd secure encrypted virtualization (sev). https://www.amd.com/                         vmware workstation. ACM Transactions on Computer Systems (TOCS)
+     en/developer/sev.html#:~:text=AMD%20Secure%20Encrypted%                                 30, 4 (2012), 1–51.
+     20Virtualization%2DEncrypted,to%20a%20CPU%20register%                              [25] Bugnion, E., Nieh, J., Tsafrir, D., and Martonosi, M. Hardware and
+     20state.                                                                                software support for virtualization. Springer, 2017.
+ [3] Amd virtualization (amd-v).               https://www.techtarget.com/              [26] Canillas, J. M. Kbuild: the linux kernel build system. Linux Journal
+     searchitoperations/definition/AMD-V-AMD-virtualization.                                 2012, 222 (2012), 1.
+ [4] CloudSuite. https://github.com/parsa-epfl/cloudsuite.                              [27] Devices, A. M. Amd64 architecture programmer’s manual volume 2:
+ [5] Intel® trust domain extensions (intel® tdx). https://www.intel.                         System programming. 2023 (2023).
+     com/content/www/us/en/developer/articles/technical/intel-trust-                    [28] Edge, J. A seccomp overview. Linux Weekly News (2015).
+     domain-extensions.html.                                                            [29] Fishman, A., Rapoport, M., Budilovsky, E., and Eidus, I. HVX:
+ [6] Kata Containers. https://github.com/kata-containers.                                    Virtualizing the cloud. In 5th USENIX Workshop on Hot Topics in
+ [7] Lguest: The simple x86 hypervisor. http://lguest.ozlabs.org/.                           Cloud Computing (HotCloud 13) (San Jose, CA, June 2013), USENIX
+ [8] LMbench - Tools for Performance Analysis.                 https://lmbench.              Association.
+     sourceforge.net/.                                                                  [30] Ge, X., Kuo, H.-C., and Cui, W. Hecate: Lifting and shifting on-
+ [9] X86-s external architectural specification. https://cdrdv2-public.intel.                premises workloads to an untrusted cloud. In Proceedings of the 2022
+     com/776648/x86s-EAS-v1-4-17-23-1.pdf.                                                   ACM SIGSAC Conference on Computer and Communications Security
+[10] gVisor. https://gvisor.dev/, 2023.                                                      (2022), pp. 1231–1242.
+[11] Abal, I., Brabrand, C., and Wasowski, A. 42 variability bugs in                    [31] Gopalan, K., Kugve, R., Bagdi, H., Hu, Y., Williams, D., and Bila,
+     the linux kernel: a qualitative analysis. In Proceedings of the 29th                    N. Multi-Hypervisor virtual machines: Enabling an ecosystem of
+     ACM/IEEE international conference on Automated software engineering                     hypervisor-level services. In 2017 USENIX Annual Technical Conference
+     (ASE) (2014), pp. 421–432.                                                              (USENIX ATC 17) (Santa Clara, CA, July 2017), USENIX Association,
+[12] Abramson, D., Jackson, J., Muthrasanallur, S., Neiger, G., Regnier,                     pp. 235–249.
+     G., Sankaran, R., Schoinas, I., Uhlig, R., Vembu, B., and Wiegert, J.              [32] Govil, K., Teodosiu, D., Huang, Y., and Rosenblum, M. Cellular
+     Intel virtualization technology for directed i/o. Intel technology journal              disco: Resource management using virtual clusters on shared-memory
+     10, 3 (2006).                                                                           multiprocessors. In Proceedings of the seventeenth ACM symposium on
+[13] Adams, K., and Agesen, O. A comparison of software and hardware                         Operating systems principles (1999), pp. 154–169.
+     techniques for x86 virtualization. ACM Sigplan Notices 41, 11 (2006),              [33] Gruenbacher, A., and Arnold, S. Apparmor technical documenta-
+     2–13.                                                                                   tion, 2007.
+[14] Adamson, A. Specjbb2005-a year in the life of a benchmark. In 2007                 [34] Hallyn, S. E., and Morgan, A. G. Linux capabilities: Making them
+     SPEC Benchmark Workshop (2007).                                                         work.
+[15] Agache, A., Brooker, M., Iordache, A., Liguori, A., Neugebauer, R.,                [35] Kivity, A., Kamay, Y., Laor, D., Lublin, U., and Liguori, A. kvm: the
+     Piwonka, P., and Popa, D.-M. Firecracker: Lightweight virtualization                    linux virtual machine monitor. In Proceedings of the Linux symposium
+     for serverless applications. In 17th USENIX Symposium on Networked                      (2007), vol. 1, Dttawa, Dntorio, Canada, pp. 225–230.
+     Systems Design and Implementation (NSDI 20) (Santa Clara, CA, Feb.                 [36] Li, Z., Cheng, J., Chen, Q., Guan, E., Bian, Z., Tao, Y., Zha, B., Wang,
+     2020), USENIX Association, pp. 419–434.                                                 Q., Han, W., and Guo, M. RunD: A lightweight secure container
+[16] Ahuja, S. P., and Deval, N. System level benchmarks for the cloud.                      runtime for high-density deployment and high-concurrency startup
+     Computer and Information Science 8, 2 (2015), 58.                                       in serverless computing. In 2022 USENIX Annual Technical Confer-
+[17] Bacou, M., Todeschi, G., Hagimont, D., and Tchana, A. Nested                            ence (USENIX ATC 22) (Carlsbad, CA, July 2022), USENIX Association,
+     virtualization without the nest. In Proceedings of the 48th International               pp. 53–68.
+     Conference on Parallel Processing (2019), pp. 1–10.                                [37] Lim, J. T., Dall, C., Li, S.-W., Nieh, J., and Zyngier, M. Neve: Nested
+[18] Barham, P., Dragovic, B., Fraser, K., Hand, S., Harris, T., Ho, A.,                     virtualization extensions for arm. In Proceedings of the 26th Symposium
+     Neugebauer, R., Pratt, I., and Warfield, A. Xen and the art of                          on Operating Systems Principles (2017), pp. 201–217.
+     virtualization. ACM SIGOPS operating systems review 37, 5 (2003),                  [38] Lim, J. T., and Nieh, J. Optimizing nested virtualization performance
+     164–177.                                                                                using direct virtual hardware. In Proceedings of the Twenty-Fifth In-
+[19] Ben-Yehuda, M., Day, M. D., Dubitzky, Z., Factor, M., Har’El, N.,                       ternational Conference on Architectural Support for Programming Lan-
+     Gordon, A., Liguori, A., Wasserman, O., and Yassour, B.-A. The tur-                     guages and Operating Systems (2020), pp. 557–574.
+     tles project: Design and implementation of nested virtualization. In 9th           [39] Lingayat, A., Badre, R. R., and Gupta, A. K. Integration of linux con-
+     USENIX Symposium on Operating Systems Design and Implementation                         tainers in openstack: An introspection. Indonesian Journal of Electrical
+     (OSDI 10) (Vancouver, BC, Oct. 2010), USENIX Association.                               Engineering and Computer Science 12, 3 (2018), 1094–1105.
+[20] Ben-Yehuda, M., Day, M. D., Dubitzky, Z., Factor, M., Har’El, N.,                  [40] Neiger, G., Santoni, A., Leung, F., Rodgers, D., and Uhlig, R. Intel
+     Gordon, A., Liguori, A., Wasserman, O., and Yassour, B.-A. The                          virtualization technology: Hardware support for efficient processor
+     turtles project: Design and implementation of nested virtualization.                    virtualization. Intel Technology Journal 10, 3 (2006).
+     In Osdi (2010), vol. 10, pp. 423–436.                                              [41] Pan, Z., He, Q., Jiang, W., Chen, Y., and Dong, Y. Nestcloud: Towards
+[21] Bienia, C., Kumar, S., Singh, J. P., and Li, K. The parsec benchmark                    practical nested virtualization. In 2011 International Conference on
+     suite: Characterization and architectural implications. In Proceed-                     Cloud and Service Computing (2011), IEEE, pp. 321–329.
+     ings of the 17th international conference on Parallel architectures and            [42] Popek, G. J., and Goldberg, R. P. Formal requirements for virtualizable
+     compilation techniques (2008), pp. 72–81.                                               third generation architectures. Communications of the ACM 17, 7 (1974),
+[22] Brewer, E. A. Kubernetes and the path to cloud native. In Proceedings                   412–421.
+     of the sixth ACM symposium on cloud computing (2015), pp. 167–167.                 [43] Pratt, I., Fraser, K., Hand, S., Limpach, C., Warfield, A., Magen-
+[23] Bugnion, E., Devine, S., Govil, K., and Rosenblum, M. Disco: Run-                       heimer, D., Nakajima, J., and Mallick, A. Xen 3.0 and the art of
+     ning commodity operating systems on scalable multiprocessors. ACM                       virtualization. In Linux symposium (2005), vol. 2, Citeseer, pp. 65–78.
+
+
+
+
+                                                                                  529
+[44] Ren, J., Qi, Y., Dai, Y., Xuan, Y., and Shi, Y. Nosv: A lightweight            [50] Williams, D., Jamjoom, H., and Weatherspoon, H. The xen-blanket:
+     nested-virtualization vmm for hosting high performance computing                    Virtualize once, run everywhere. In Proceedings of the 7th ACM Eu-
+     on cloud. Journal of Systems and Software 124 (2017), 137–152.                      ropean Conference on Computer Systems (New York, NY, USA, 2012),
+[45] Tunde-Onadele, O., He, J., Dai, T., and Gu, X. A study on container                 EuroSys ’12, Association for Computing Machinery, p. 113–126.
+     vulnerability exploit detection. In 2019 IEEE International Conference         [51] Williams, D., Koller, R., Lucina, M., and Prakash, N. Unikernels as
+     on Cloud Engineering (IC2E) (2019), IEEE, pp. 121–127.                              processes. In Proceedings of the ACM Symposium on Cloud Computing
+[46] Uhlig, R., Neiger, G., Rodgers, D., Santoni, A. L., Martins, F. C.,                 (New York, NY, USA, 2018), SoCC ’18, Association for Computing
+     Anderson, A. V., Bennett, S. M., Kagi, A., Leung, F. H., and Smith,                 Machinery, p. 199–211.
+     L. Intel virtualization technology. Computer 38, 5 (2005), 48–56.              [52] Young, E. G., Zhu, P., Caraza-Harter, T., Arpaci-Dusseau, A. C.,
+[47] Van Doorn, L. Hardware virtualization trends. In ACM/Usenix Inter-                  and Arpaci-Dusseau, R. H. The true cost of containing: A gvisor case
+     national Conference On Virtual Execution Environments: Proceedings                  study. In 11th {USENIX} Workshop on Hot Topics in Cloud Computing
+     of the 2 nd international conference on Virtual execution environments              (HotCloud 19) (2019).
+     (2006), vol. 14, pp. 45–45.                                                    [53] Zahka, D., Kocoloski, B., and Keahey, K. Reducing kernel surface ar-
+[48] Vilanova, L., Amit, N., and Etsion, Y. Using smt to accelerate nested               eas for isolation and scalability. In Proceedings of the 48th International
+     virtualization. In Proceedings of the 46th International Symposium on               Conference on Parallel Processing (ICPP) (2019), pp. 1–10.
+     Computer Architecture (2019), pp. 750–761.                                     [54] Zhang, X., Zheng, X., Wang, Z., Yang, H., Shen, Y., and Long, X.
+[49] Wasserman, O.               Nested virtualization: shadow turtles.                  High-density multi-tenant bare-metal cloud. In Proceedings of the
+     https://www.linux-kvm.org/images/e/e9/Kvm-forum-2013-nested-                        Twenty-Fifth International Conference on Architectural Support for Pro-
+     virtualization-shadow-turtles.pdf.                                                  gramming Languages and Operating Systems (2020), pp. 483–495.
+
+
+
+
+                                                                              530
+

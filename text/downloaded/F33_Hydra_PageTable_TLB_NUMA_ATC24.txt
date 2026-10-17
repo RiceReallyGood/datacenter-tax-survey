@@ -1,0 +1,1381 @@
+          Scalable and Effective Page-table
+       and TLB management on NUMA Systems
+ Bin Gao, Qingxuan Kang, and Hao-Wei Tee, National University of Singapore;
+Kyle Timothy Ng Chu, Horizon Quantum Computing; Alireza Sanaee, Queen Mary
+      University of London; Djordje Jevdjic, National University of Singapore
+        https://www.usenix.org/conference/atc24/presentation/gao-bin-scalable
+
+
+
+
+        This paper is included in the Proceedings of the
+          2024 USENIX Annual Technical Conference.
+                    July 10–12, 2024 • Santa Clara, CA, USA
+                                 978-1-939133-41-0
+
+
+
+
+                                        Open access to the Proceedings of the
+                                      2024 USENIX Annual Technical Conference
+                                                  is sponsored by
+    Scalable and Effective Page-Table and TLB Management on NUMA Systems
+
+Bin Gao1 , Qingxuan Kang1 , Hao-Wei Tee1 , Kyle Timothy Ng Chu2 , Alireza Sanaee3 , and Djordje Jevdjic1
+
+        1 National University of Singapore      2 Horizon Quantum Computing         3 Queen Mary University of London
+
+
+
+
+Abstract                                                          pings from the page-tables. Since TLBs must be accessed
+                                                                  before every memory operation, their latency is critical to the
+Memory management operations that modify page-tables, typ-        performance of the entire system, which is why they must be
+ically performed during memory allocation/deallocation, are       small and tightly integrated into every CPU core. Given that
+infamous for their poor performance in highly threaded appli-     every core has its own TLB that independently caches page-
+cations, largely due to process-wide TLB shootdowns that the      table entries (PTE), a mechanism that enforces coherence of
+OS must issue due to the lack of hardware support for TLB co-     PTEs across all TLBs that cache them is required for correct-
+herence. We study these operations in NUMA settings, where        ness. Unfortunately, most modern multi-core architectures do
+we observe up to 40x overhead for basic operations such as        not provide hardware support for TLB coherence, but instead
+munmap or mprotect. The overhead further increases if page-       provide privileged instructions for invalidation of TLB entries,
+table replication is used, where complete coherent copies         which the operating system (OS) calls upon any change to
+of the page-tables are maintained across all NUMA nodes.          the page-tables. Such instructions can invalidate TLB entries
+While eager system-wide replication is extremely effective        only on the core that executes them; to invalidate TLBs on
+at localizing page-table reads during address translation, we     all other cores, OSes use an expensive, IPI-based mechanism
+find that it creates additional penalties upon any page-table     to send an interrupt to each core individually due to the lack
+changes due to the need to maintain all replicas coherent.        of support for flexible multi-cast delivery [38, 50], in a proce-
+   In this paper, we propose a novel page-table management        dure that’s called TLB Shootdown. Furthermore, when a PTE
+mechanism, called Hydra, to enable transparent, on-demand,        changes, the OS lacks the information about which TLB in the
+and partial page-table replication across NUMA nodes in           system currently caches the modified PTE, and thus must send
+order to perform address translation locally, while avoid-        shootdowns indiscriminately to all cores that currently run a
+ing the overheads and scalability issues of system-wide full      thread of the same process, and it must do so synchronously
+page-table replication. We then show that Hydra’s precise         for correctness, causing delays of several microseconds or
+knowledge of page-table sharers can be leveraged to signifi-      even tens of microseconds on big machines [38].
+cantly reduce the number of TLB shootdowns issued upon any
+memory-management operation. As a result, Hydra not only             The TLB coherence operations particularly affect multi-
+avoids replication-related slowdowns, but also provides signif-   socket and multi-node systems, which data centers have
+icant speedup over the baseline on memory allocation/deallo-      shifted towards in order to continue to scale up the CPU
+cation and access control operations. We implement Hydra in       performance and memory capacity in the post-Moore’s law
+Linux on x86_64, evaluate it on 4- and 8-socket systems, and      era. These systems connect multiple CPUs to multiple mem-
+show that Hydra achieves the full benefits of eager page-table    ory modules in a NUMA fashion. Unfortunately, this has a
+replication on a wide range of applications, while also achiev-   dramatic impact on TLB coherence. To illustrate, Figure 1
+ing a 12% and 36% runtime improvement on Webserver and            shows the performance of mprotect, a Linux syscall that
+Memcached respectively due to a significant reduction in TLB      changes the permission bits in page-table, when called for a
+shootdowns.                                                       4KB page on an 8-socket machine. This experiment is per-
+                                                                  formed using the testbed explained in Section 5.1. In this ex-
+                                                                  periment, a single thread runs mprotect in a loop, repeatedly
+1   Introduction                                                  flipping a single bit in a single PTE. Additionally, we run a
+                                                                  varying number of spinning threads on every socket. The spin-
+Translation Lookaside Buffers (TLBs) are tiny hardware struc-     ning threads mimic the ideal behavior of scale-out workloads
+tures that cache recently used virtual-to-physical address map-   where numerous threads perform independent computations
+
+
+
+USENIX Association                                                          2024 USENIX Annual Technical Conference           445
+    Normalized Runtime (Slowdown)
+
+
+
+
+                                                                                                                                    Normalized Runtime (Slowdown)
+                                         Runtime                 TLB Shootdown                                                                                                     TLB Shootdown
+                                    40      Linux                   Linux                                                                                                             Linux-6.5
+
+
+
+
+                                                                                                       Triggered TLB Shootdowns
+
+
+
+
+                                                                                                                                                                                                                                          Triggered TLB Shootdowns
+                                                                                                                                                                    40
+                                            Mitosis                 Mitosis                                                                                                           Linux-6.5 w/o TLB Opt
+                                            Hydra w/o TLB Opt       Hydra w/o TLB Opt
+                                                                                              10×107                                                                                  Linux-6.5 with TLB Opt                     10×107
+                                    30      Hydra with TLB Opt      Hydra with TLB Opt                                                                              30 15.5X       Runtime
+                                                                                                                                                                                      Linux-6.5
+                                                                                                                                                                                      Linux-6.5 w/o TLB Opt
+                                    20                                                                                                                              20                Linux-6.5 with TLB Opt
+                                                                                              5×107                                                                                                                              5×107
+
+                                    10                                                                                                                              10
+
+
+                                     0                                                        0                                                                      0                                                           0
+                                            0        1          2          4         8   16                                                                                    0     1          2         4          8      16
+                                                         Spinning Threads Per Socket                                                                                                     Spinning Threads Per Socket
+
+
+  a) mprotect on baseline Linux(v4.17), Mitosis, and Hydra                                                                                                          b) mprotect on baseline Linux(v6.5.7) and Hydra
+
+Figure 1: Impact of page-table replication, and the TLB shootdown optimization on mprotect. Hydra reduces the run time slow
+down by up to 40x, and mitigates the TLB shootdown overhead by leveraging the information about page tables on each socket.
+All values in both plots are normalized to the baseline Linux v4.17 without replication.
+with limited data-sharing and synchronization among them.                                No spinning threads
+                                                                                         7 spinning threads on local socket            Linux
+As Figure 1 shows, the TLB shootdowns cause a 40x per-                                   7 spinning threads across remote sockets      Mitosis
+                                                                                         7 remote spinning threads + Hydra TLB Opt     Hydra TLB Opt
+formance degradation for mprotect on the baseline Linux
+
+
+                                                                                                                                  Normalized Runtime
+
+
+
+
+                                                                                                                                                                                                                                                                     Normalized Runtime
+                                                                                                         8.13x                                        5
+                                                                                    8
+v4.17 when spinning threads are added to other sockets. This                                                                                          4
+                                                                                    6
+problem persists in newer kernels, such as v6.5.7, with up                                                                                            3
+                                                                                    4                                                 2.30x
+to 15.5x performance degradation as shown in Figure 1b.                                         2.62x                                                 2
+                                                                                    2                                           1.00x
+Note that the new kernel shows nominally better scalability,                            1.00x                    0.99x                          0.36x 1
+as it degrades performance by only 15.5x, vs. 40x with v4.17.                       0                                                                 0
+                                                                                                      a)                                b)
+However, this is due to the fact that the baseline mprotect
+performance (without spinning threads) is about 3x worse                      Figure 2: a) The slowdown of mprotect on Linux with lo-
+compared to Linux v4.17.1 Also note that the impact of shoot-                 cal threads spinning on the local vs. remote sockets, b) The
+downs sent to spinning threads on remote sockets is signif-                   slowdown of Mitosis and Hydra over Linux when the range
+icantly higher compared to the shootdowns sent to threads                     of mprotect is 512KB; note that Mitosis sees a slowdown,
+that are spinning on the same socket as where mprotect runs,                  while Hydra experiences a speedup.
+as Figure 2a shows. This suggests that the performance of
+virtual memory (VM) operations is undesirably held back by
+the number of threads, even in the idealized scale-out sce-                   page being remote; this is particularly true for big data appli-
+nario wherein these threads do not exhibit any data sharing                   cations that experience high TLB miss rates [35, 62].
+and perform no synchronization operations such as barriers
+                                                                                 In this work, we introduce a novel page-table management
+or locks. As data centers scale beyond multi-socket systems
+                                                                              mechanism, called Hydra, that seeks to simultaneously im-
+to multi-node systems where a single process can span over
+                                                                              prove the performance of both page-table READ and UPDATE
+multiple compute nodes connected via remote memory proto-
+                                                                              operations in NUMA systems. Hydra enables transparent,
+cols like CXL [41, 45], ensuring TLB coherence across the
+                                                                              partial, and on-demand page-table replication across NUMA
+logical process becomes increasingly expensive. Moreover, as
+                                                                              nodes to ensure that address translations for local data is sat-
+VM abstraction continues to play an ever more important role
+                                                                              isfied within the same NUMA node. Hydra achieves this by
+in simplifying programming models for emerging systems
+                                                                              creating replicas of individual PTEs on the NUMA node that
+such as heterogeneous and disaggregated memory architec-
+                                                                              requests them. In doing so, Hydra avoids costly and inef-
+tures [29, 30, 60, 62], keeping the overhead of VM operations
+                                                                              fective system-wide page-table replication along with any
+low is crucial to guarantee future performance.
+                                                                              coherence actions that would arise from such replication, as
+   Apart from being over-conservative on TLB coherence op-
+                                                                              it limits the scope of replication and the related coherence
+erations upon page-table updates, page-table reads, which
+                                                                              actions only to nodes that actually share the same PTEs.
+happen during page walks as a result of TLB misses, are also
+significantly affected by the NUMA architecture. Mitosis [1]                     We further observe that Hydra’s precise and coherently
+demonstrated that the performance penalty of the requested                    maintained knowledge of which sockets contain copies of any
+page-table entry (PTE) being allocated on a remote NUMA                       individual page-table can be leveraged to reduce the scope
+node is often higher than the penalty of the requested data                   of TLB shootdowns sent upon any change to that page-table
+                                                                              — an effective solution to the scalability bottleneck due to
+   1 Linux v4.17 performs better in absolute terms for all our workloads, and sending IPIs indiscriminately to all cores running the same
+unless otherwise mentioned, all results we show are based on v4.17.           process. Namely, Hydra’s lazy on-demand replication of page-
+
+
+
+446                                 2024 USENIX Annual Technical Conference                                                                                                                                              USENIX Association
+            Translation    Selective    Implicit     Lazy          Efficient   Efficient    NUMA                                   Page Table Walking   Non Page Table Walking
+ System
+           Performance    Replication    Policy    Replication   PTE Updates   Migration   Scalability
+
+
+
+
+                                                                                                         Normalized Runtime
+                                                                                                                              3
+ Linux          ✗             ✗          N/A          N/A            ✗            ✗            ✗
+ Mitosis        ✓             ✗           ✗            ✗             ✗            ✓            ✗
+ Hydra          ✓             ✓           ✓            ✓             ✓            ✓            ✓
+
+
+
+
+                                                                                                                              2
+Table 1: Comparison of state-of-the-art solutions in NUMA
+
+
+
+
+                                                                                                                              1
+support for page-table management.
+
+
+
+
+                                                                                                                              0
+                                                                                                                                    LPLD
+                                                                                                                                    LPRD
+                                                                                                                                   LPRDI
+                                                                                                                                    RPLD
+                                                                                                                                   RPILD
+                                                                                                                                   RPRD
+                                                                                                                                  RPIRDI
+
+                                                                                                                                                   LPLD
+                                                                                                                                                   LPRD
+                                                                                                                                                  LPRDI
+                                                                                                                                                   RPLD
+                                                                                                                                                  RPILD
+                                                                                                                                                  RPRD
+                                                                                                                                                 RPIRDI
+
+                                                                                                                                                                   LPLD
+                                                                                                                                                                   LPRD
+                                                                                                                                                                  LPRDI
+                                                                                                                                                                   RPLD
+                                                                                                                                                                  RPILD
+                                                                                                                                                                  RPRD
+                                                                                                                                                                 RPIRDI
+
+                                                                                                                                                                                   LPLD
+                                                                                                                                                                                   LPRD
+                                                                                                                                                                                  LPRDI
+                                                                                                                                                                                   RPLD
+                                                                                                                                                                                  RPILD
+                                                                                                                                                                                  RPRD
+                                                                                                                                                                                 RPIRDI
+
+                                                                                                                                                                                              LPLD
+                                                                                                                                                                                              LPRD
+                                                                                                                                                                                             LPRDI
+                                                                                                                                                                                              RPLD
+                                                                                                                                                                                             RPILD
+                                                                                                                                                                                             RPRD
+                                                                                                                                                                                            RPIRDI
+                                                                                                                                   Btree           XSbench          Graph500      Canneal   Hashjoin
+tables ensures that the following invariant holds by design:
+if there is no replica of a given page-table on a given socket,
+                                                                                                         Figure 3: Impact of data and page-table placement on per-
+there can be no thread running on that socket that currently
+                                                                                                         formance of various applications; L - local, R - remote, P -
+has the corresponding PTE in its TLB; if any core on the
+                                                                                                         page-tables, D - data, I - with the interference of other appli-
+socket has the PTE in its TLB, then the PTE must also exist
+                                                                                                         cations on inter-socket traffic. The impact of page-table walks
+in a local replica by design. As a consequence of this invari-
+                                                                                                         on the run time is significantly high often higher than data
+ant, expensive TLB shootdowns do not need to be sent to
+                                                                                                         access. Detailed settings are show in Table 2.
+any thread running on a socket that does not have a copy of
+the corresponding page-table. This allows Hydra to safely
+filter out many TLB shootdowns, dramatically improving the                                               the growth of main memory capacity has far outpaced the
+performance of memory management operations that change                                                  growth of TLB sizes in recent years. As a result, TLB cov-
+page-tables, as well as improving the performance of threads                                             erage has stagnated which results in a higher TLB miss rate
+that avoid receiving unnecessary TLB shootdowns.                                                         [6, 19, 23, 36, 54, 55]. When a TLB miss occurs, the Memory
+    We implement Hydra in Linux (v4.17 and v6.57) and show                                               Management Unit (MMU) has to perform a page-table walk
+that Hydra achieves the full benefits of page-table replication                                          to retrieve the appropriate Page-Table Entry (PTE). This is
+for page-table READs, as well as a 12% and 36% improve-                                                  a time-consuming process that can take several hundreds of
+ment in runtime on Apache Webserver and Memcached due                                                    cycles to complete [59]. As a result, it is not unusual to see
+to more efficient page-table UPDATES. Hydra minimizes                                                    applications spending anywhere from 10-93% of CPU cycles
+the memory footprint and page-table coherence overheads,                                                 servicing TLB misses [6, 24, 36, 44], especially on NUMA
+and avoids the scalability limitations of eager replication. As                                          systems [1, 51]. In addition to TLBs, modern CPUs also use
+shown in Figure 1, Hydra is able to entirely eliminate the                                               Page Walk Caches (PWCs) to cache intermediate nodes of
+NUMA effect of operations such as mprotect, whose per-                                                   the page-tables that are frequently accessed. This allows the
+formance is improved by nearly 40x. We are open-sourcing                                                 MMU to bypass some of the upper levels of the page-table.
+Hydra to encourage more research in this area.                                                           However, the number of entries in such caches is normally
+    The rest of the paper is organized as follows. Section 2                                             limited to several dozen entries due to hardware constraints,
+presents the background on page-table management on                                                      which limits their effectiveness [50, 64].
+NUMA systems. Sections 3 and 4 describe the design princi-
+ples and implementation details of Hydra. Section 5 presents
+our evaluation methodology and results. Section 6 provides                                               2.2                      NUMA Architectures
+discussion and directions for future work. Section 7 discusses
+                                                                                                         NUMA architectures have historically come in many forms,
+related work and Section 8 concludes the paper.
+                                                                                                         but their defining feature is that accessing memory attached
+                                                                                                         to a local node will have higher bandwidth and lower latency
+2     Background                                                                                         and energy compared to accessing memory on a remote node.
+                                                                                                         NUMA systems are particularly popular in data centers and
+2.1        Virtual Memory                                                                                cloud systems in the form of multi-sockets, as they scale well
+                                                                                                         with larger memory capacity. The NUMA paradigm is today
+Page-tables are a key component of most modern operating                                                 further driven by the emerging architectures based on chiplets
+systems and are used to map the virtual address space of a                                               and multi-chip modules [3, 15, 17, 18, 21, 32, 34, 65].
+process to the physical memory available on the hardware                                                     Because of the large latency, bandwidth, and energy gap
+platform. As page-tables are hierarchically organized in mul-                                            between accesses to local and remote NUMA nodes, the per-
+tiple levels, conducting a full page-table walk usually requires                                         formance of NUMA systems largely depends on the ability
+multiple memory accesses [22] and on most systems it is done                                             of the system to maximize the chances that a piece of data
+by hardware for performance reasons.                                                                     is located in the same NUMA node as the thread requests
+   Translation Lookaside Buffers (TLBs) are used to acceler-                                             it [11,20,24,33], with most modern operating systems provid-
+ate the process of address translation by caching virtual-to-                                            ing some form of support for optimizing data page placement
+physical mappings that are frequently used. Unfortunately,                                               on NUMA systems. For example, Linux employs AutoN-
+
+
+
+USENIX Association                                                                                                                   2024 USENIX Annual Technical Conference                           447
+UMA which migrates data pages to sockets that are closer to             Config       CPU     Data   Interference        Kernel
+the threads that access them. Linux also provides first-touch           LP-LD        0        0         N/A             Linux
+and interleaved allocation policies which affect the initial            LP-RD        0        1         N/A             Linux
+placement of data. Under the first-touch policy, memory is              LP-RDI       0        1          1              Linux
+                                                                        RP-LD        1        1         N/A             Linux
+allocated on the first node to access it while an interleaved
+                                                                        RPI-LD       1        1          0              Linux
+policy alternates memory allocation across a set of nodes that          RP-RD        1        0         N/A             Linux
+can be defined by the user.                                             RPI-RDI      1        0         0,1             Linux
+                                                                        RPI-LD-M     1        1          0             Mitosis
+                                                                        RPI-LD-H    0⇒1       1          0              Hydra
+2.3    Eager Page-table Replication                                     RPI-LD-HP   0⇒1       1          0         Hydra-Prefetching
+
+Modern operating systems such as Linux offer little control         Table 2: Configuration settings for benchmarks. L (local), R
+over the page-table placement and mostly allocate page-tables       (remote) denote two different NUMA nodes in the system
+and directories on the NUMA node that touched the cor-              (e.g., L: socket 0, R: socket 1). D and P denote data and page-
+responding data first [1], which is a policy known as first         tables, respectively. Note that page-table is fixed on socket 0 if
+touch [40]. When any other NUMA node accesses the same              no replication involved. CPU/Data/Interference columns iden-
+or neighboring data, the resulting page-table traversal will lead   tify the socket where the application executes/where the data
+to expensive cross-socket memory accesses, regardless of the        is located/where the interfering application executes, respec-
+location of the data. The hierarchical page-table organization      tively. H: Hydra, M: Mitosis, HP: Hydra with Prefetching.
+with 4-5 levels present in most commercial architectures fur-                                       .
+ther exacerbates the problem; in the worst case, during a page
+walk, the requested entries at every page-table level could be
+                                                                    explicit policies from the provider/developers, whose mainte-
+allocated on a different NUMA node.
+                                                                    nance can be cumbersome in multi-tenant scenarios. Table 1
+   The impact of page-table placement on the performance
+                                                                    summarizes the key differences between Hydra compared
+of NUMA systems was first studied in Mitosis [1]. Their
+                                                                    Mitosis and the baseline Linux.
+work showed that page-table placement can have a signifi-
+cant impact on how well a NUMA system performs and can
+even have a bigger impact than the placement of data pages          3     Hydra: Design Principles
+in some workloads. We have successfully reproduced their
+results on a larger, 8-socket machine by running the same           In this section, we discuss the high-level goals, principles, and
+experiments using the provided scripts. The results can be          major design decisions behind Hydra.
+seen in Figure 3, where we can see that page-tables being
+remote (RP) degrades performance almost as much as data
+                                                                    3.1     Replication Policies
+being remote (RD), and the interference of other applications
+on the inter-socket traffic further increases the overhead of       Eager replication of complete page-tables on all NUMA sock-
+remote accesses dramatically.                                       ets, as done in Mitosis, is highly effective at avoiding any
+   To mitigate the overheads caused by poor placement of            remote page-table accesses. This style of replication is also
+page-tables, Mitosis proposes the use of eager page-table           the least complex to implement. However, maintaining com-
+replication where the page-table of a process is fully repli-       plete page-table trees in all sockets and keeping them coherent
+cated across all NUMA nodes. While this method may work             results in memory and coherence overheads that grow with
+well for applications where almost all data is shared between       the number of sockets.
+all threads, it could also result in unnecessary overheads due to      To reduce these overheads in the future, Mitosis envisions
+the need to maintain page-table coherence across all replicas       the use of explicit page-table allocation policies, by which the
+even if a portion of the address space is not shared between        user would be able to specify a subset of the NUMA nodes
+threads. Furthermore, while the memory footprint of page-           on which the page-tables will be fully replicated; the other
+tables is usually negligible relative to the size of the data       NUMA nodes would not have any page-tables of that pro-
+allocated (~0.2%), our experiments show that the memory             cess. We call this style of replication selective replication,
+footprint due to the additional replicas is usually around 1.5%     where the user (or the system) can select the NUMA nodes
+of the data addressed which could translate to several giga-        they want to limit the replication to. We argue against such
+bytes of additional memory overhead in some workloads and           policies, because they put the burden on the user and/or the
+grows linearly with the number of sockets.                          system to ensure that both the execution threads and the cor-
+   On the other hand, Hydra is able to achieve high scalability     responding page-tables are co-located on the same NUMA
+using selective and lazy replication, where it only replicates      node throughout the execution of the process. In case of any
+page-tables on the NUMA nodes that the accessing threads            deviation, e.g., when some threads migrate, the system would
+live on. Using this approach, Hydra does not require any            need to decide if, how, and when to establish a complete new
+
+
+
+448   2024 USENIX Annual Technical Conference                                                                  USENIX Association
+                  a) System-wide Full replication with Mitosis      3.2    Page-Table Coherence Protocol
+ node 0                                node 1
+                                                                    The challenge with lazy and partial page-table replication is
+                                                                    that at the time when the requested PTE is missing, the OS
+ node 2                                node 3
+                                                                    needs to find out which node, if any, has a copy of the target
+                                                                    PTE. Therefore, a mechanism that finds at least one existing
+                                                                    sharer is needed, and if such a sharer does not exist, Hydra
+                                                                    needs to know that.
+                   b) Lazy and partial replication with Hydra
+                                                                       One solution would be to statically designate one node to
+ node 0                                 node 1                      hold an entire copy of all page-tables, in which case partial
+                                                                    replicas can be built lazily on the other nodes by copying the
+                                                                    PTEs from the designated node on demand. However, the
+                                                                    main problem with such a solution is that every page-table
+ node 2                                 node 3
+                                                                    used has an extra sharer (the master node) that generally does
+                                                                    not need that page-table for the translation of its own data, but
+                                                                    nonetheless must be kept up to date. Other problems include
+                                                                    load imbalance and the fact that the traffic to the destina-
+Figure 4: An abstract illustration of replication of hierarchical
+                                                                    tion node can easily become congested, either because of too
+page-tables on Mitosis (a) and Hydra (b). Different memory
+                                                                    much translation-related traffic or due to interference of other
+allocations (VMAs) are colored differently. Mitosis eagerly
+                                                                    applications, slowing down the whole system. Furthermore,
+replicates allocated page-tables on all NUMA nodes (sock-
+                                                                    a single source node becomes a single point of failure and
+ets), whereas Hydra performs lazy and partial replication
+                                                                    presents a scalability bottleneck.
+on-demand simultaneously instead.
+                                                                       We instead propose an efficient and decentralized page-
+                                                                    table coherence protocol in which every memory allocation
+copy of the page-tables on a new node, to support local ad-         (e.g., virtual memory area or VMA in Linux) is assigned an
+dress translation on the new socket. The system would also          owner; the owner of each allocation area is the NUMA socket
+need to decide how and at which point to shut down a full           that requested its allocation. We maintain the following in-
+copy of page-tables on a socket that a number of threads (or        variant: if a valid PTE for a given page exists, the owner node
+all threads) migrated from, in order to reduce memory and           must have it. This invariant is needed because a circular list
+coherence overheads. While these policies could be imple-           of sharers is efficiently maintained at the level of individual
+mentable and would reduce some of the Mitosis overhead,             page-tables [1], and we would not be able to reach that list of
+they put a lot of burden on the user and/or the system to follow    sharers if we do not know at least one node that is currently in
+them and promptly adjust to any deviations. Although these          the list. When the requested PTE does not exist on the local
+policies could reduce the overheads compared to full-system         node, the entry is copied from the owner node as part of the
+replication by reducing the number of replicas, each replica        page-fault handler, and the new entry is added to the list of
+still remains complete, resulting in memory and coherence           sharers of that page-table. If the owner does not have that
+overheads that eager replication cannot reduce any further.         entry, then it means that the page has not yet been touched,
+   Hydra, in contrast, uses lazy and partial replication, by        so the PTE is created by taking a page fault on that page, and
+which only the individual PTE entries that are demanded             the entry is then inserted into both the owner’s and replica’s
+are allocated and copied to a new node. This automatically          copy of the page-table and the two copies of the page-tables
+ensures 1) the minimum amount of memory spent on repli-             are linked in a circular list, if they were not linked before (for
+cation, 2) the minimum amount of activity needed to keep            example, due to other PTEs in the same page-table).
+the replicas coherent, 3) the minimum overhead of aggre-               In the case of system-wide full page-table replication [1],
+gating dirty/accessed bits written by hardware in different         any changes to page-tables must be propagated to all repli-
+PTE replicas, which happens when these bits are read by             cas on every socket in the system. Because each replica
+the OS. Importantly, our lazy approach that piggybacks on           is located on a different socket, updating all of them can
+the standard page-fault procedure automatically ensures that        take a significant amount of time. Furthermore, these updates
+PTEs are replicated wherever the thread is executed; when           must be performed while holding already contended memory-
+the thread is migrated the new PTE copies will be automat-          management locks, significantly affecting other page-table
+ically established. In other words, Hydra enables selective         management operations happening concurrently, as we will
+(only on relevant nodes) and partial (only the relevant PTEs)       show in Section 5. In the case of Hydra, upon any change
+replication in a lazy manner that automatically guarantees the      to a page-table, only the replicas found in the list of sharers
+co-location of execution threads and page-tables, sidestepping      for that particular page-table are updated, if any. The coher-
+the problems of eager replication and explicit policies.            ence actions are therefore limited only to page-tables that are
+
+
+
+USENIX Association                                                            2024 USENIX Annual Technical Conference            449
+actually shared, and the cost of the actions is limited by the                     (a)                                (b)
+number of nodes that actually share the page-table.                     owner          replica             owner              replica
+                                                                      page-table     page-table   PTE    page-table         page-table
+                                                                                                   X
+3.3    Replication and Partitioning
+As an illustrative example, assume that a process with four
+threads runs on a 4-socket NUMA machine, one thread per                                           PTE
+socket. Also, assume that each thread is allocating a chunk                                       X+1
+                                                                               VMA A                        VMA B            VMA C
+of memory in its local memory and accesses only the data
+it allocated. This is an ideal scenario from a NUMA system
+                                                                    Figure 5: (a) Prefetching with a degree of 1 with PTE X + 1
+point of view, as it enables perfect data parallelism. Figure 4a
+                                                                    prefetched. (b) Maximum degree prefetching when the target
+illustrates a potential state of page-tables in such a scenario
+                                                                    page-table covers multiple VMAs is limited by both the page-
+in case of eager system-wide page-table replication, while
+                                                                    table boundaries and boundaries of the encompassing VMA.
+Figure 4b shows the state of page-tables in case of Hydra.
+For simplicity of illustration, the page-table is depicted as a     cess to a given page by a new socket; any subsequent accesses
+radix-tree with three levels of the hierarchy and an out-degree     to any part of that page by any core running on the same
+of four (in practice, there are 4-5 levels with an out-degree       socket will find that PTE in the local memory. As the average
+of 512). As shown in Figure 4a, full and eager replication          number of times a page is accessed during its residence in
+will replicate all parts of the page-tables on all sockets. On      memory is significantly higher than one for all the workloads
+the other hand, Hydra’s protocol assigns ownership based on         we experimented with, we conclude that the performance
+the allocation to the node that allocated the VMA, and as a         penalty for laziness is negligible for most applications.
+result, each node is by default the owner of its own page-table        However, there are applications with low temporal reuse
+replica. Unless a thread from one node tries to access data         of pages that could benefit from a less lazy approach (we
+allocated by a thread on a different node, there will be no page-   construct such a worst-case microbenchmark in Section 5).
+table replication in the system except for the root node. This      Furthermore, as we will show in Section 5, extreme sharing of
+effectively partitions the page-table into four independent         data where every page ends up being shared on every socket,
+partitions, each co-located with its data and accessed and          and every page-table is correspondingly allocated on every
+managed locally without any cross-socket coherence activity         socket could effectively turn Hydra into Mitosis, with full
+between them, and this is all achieved automatically without        replicas present on every socket. To improve Hydra’s perfor-
+intervention from the user or the system.                           mance in such scenarios and reduce its laziness, we provide a
+   Apart from support for perfect data partitioning, Hydra          low-cost support for prefetching a configurable number neigh-
+also enables data sharing much more efficiently compared to         boring page-table entries together with the requested PTE, to
+Mitosis. Let’s assume that node 3 accesses a piece of data          maximize the chance of a local page-table access upon the
+located on node 0 for the first time. In Hydra, this will lead to   very first access to that page by a new node. In our imple-
+the allocation of a single page-table on node 3 and the missing     mentation, we provide an additional kernel parameter that
+PTE will be copied, as shown in Figure 4b. Any updates to           allows the user to indicate the desired degree d of prefetching.
+this page-table would limit the coherence activity only to two      Prefetching degree of d will fetch 2d neighboring entries in-
+nodes involved, as opposed to system-wide.                          cluding the desired PTE (for d=0, in total 20 =1 entry will be
+                                                                    fetched, i.e., the requested PTE only). The prefetching is lim-
+3.4    Configuring Laziness                                         ited to the full page-table, as logically consecutive page-tables
+                                                                    in the virtual address space are not necessarily physically ad-
+When the requested PTE entry does not exist on the local            jacent. We also limit prefetching to the VMA boundaries, as
+node, Hydra copies only the requested PTE entry from the            other neighboring VMAs are not necessarily logically related,
+owner. This is the laziest form of Hydra that we support, as        which is illustrated in Figure 5b.
+no PTE is replicated unless demanded by a NUMA node.
+However, one could expect that such extreme laziness has a
+                                                                    3.4.1   Prefetching Overheads
+price, as the very first access to a page from a new node is
+guaranteed to result in a remote page-table access; this is in      The overhead of physically copying additional consecutive
+contrast to Mitosis, which eagerly replicates every page-table      PTEs from the same page-table is negligible and we could
+entry before it gets to be used for the first time and always       not observe it in our measurements. At the same time, PTE
+ensures local page-table access.                                    prefetching also does not cause any PTE coherence overheads;
+   Interestingly, we have found that extreme laziness incurs        to understand why, let’s look at Figure 5a, which shows an
+virtually no penalty in our workloads. The simple reason is         example of one page-table that covers a fraction of single
+that Hydra’s laziness is penalized only upon the very first ac-     virtual memory area VMA A. Assume that the replica requests
+
+
+
+450   2024 USENIX Annual Technical Conference                                                                 USENIX Association
+PTE X that exists in the owner node but not in the replica. Also     have the PTE in any of their TLBs.
+assume that the replica does not have this exact page-table
+allocated yet. Upon a page-fault on PTE X on the replica
+                                                                     4     Implementation Details
+node, Hydra would by default fetch only PTE X from the
+owner, but in this example we choose a degree of d=1, with a         In this section, we discuss at a high level the modifications to
+total of 21 =2 PTEs to be fetched, one of which, PTE X + 1, is       the Linux kernel made to implement Hydra on x86_64.
+prefetched. Assume that PTE X + 1 ends up never being used
+by the replica. The question is whether fetching PTE X + 1
+causes any additional coherence action that otherwise would          4.1    Lazy replication
+not have happened.                                                   We added the following fields into the appropriate kernel
+   Recall that Hydra does not keep the list of sharers at the        structures:
+level of individual PTE entries, which would be impractical
+and unnecessary, but at the level of individual page-tables,         • An owner node field in struct vm_area_struct, the
+similar to Mitosis [1, 51]. As a result, when PTE X + 1 is             structure that represents each allocation (VMA).
+modified by the owner, the owner node cannot know if the             • A next replica field in struct page, the structure repre-
+replica has PTE X + 1 or not; it only knows that the replica           senting each physical page, similarly to Mitosis [1]. This
+has some PTE entries from the page-table in question. There-           field is used only in the structures representing physical
+fore, the replica must be updated regardless of whether or not         pages containing page-table pages to construct a circular
+PTE X + 1 exists on the replica, and prefetching PTE X + 1             linked list of page-table replicas.
+does not cause any additional coherence actions. Given the           • A boolean flag controlling replication for a particular pro-
+negligible overheads of prefetching and potentially sizeable           cess in struct mm_struct, the structure containing all
+benefits in some applications, we suggest to Hydra users to            the information about a process’s address space. This flag
+set the degree of prefetching to maximum by default.                   enables/disables replication for the process using a new
+                                                                       system call that we added for this purpose.
+                                                                     • An array of pointers to page global descriptors (PGDs) in
+3.5    Reducing TLB shootdowns                                         struct mm_struct, each pointing to the root of a page-
+When page-table entries are changed for any reason (e.g.,              table replica.
+due to the mprotect system call, munmap, a page is swapped             Next, we modify a few parts of the memory management
+out, etc.), the corresponding entries in the TLBs of each core       component of Linux.
+that currently runs a thread of the same process have to be
+invalidated to ensure that stale cached page-table entries are       • When an allocation is created using mmap, a VMA is created
+not used in translation. This is done by sending an inter-             representing that allocation in the function mmap_region.
+processor interrupt (IPI) to each core that is running a thread        We extended this function to set the owner node of the VMA
+from the same process, which causes significant overhead for           to be the node that created the allocation.
+all involved cores, particularly so for the initiating core. This    • When a context switch occurs, the page-table base register
+process is known as a TLB shootdown. TLB shootdowns are                (the CR3 register on x86 and x86_64) is updated in the
+known to be very expensive in general [38, 50] and particu-            function switch_mm_irqs_off. We modified this function
+larly so for NUMA systems [4], where they pose a scalability           to set the base to the correct replica page-table (from the
+challenge.                                                             array mentioned earlier), if replication is enabled for the
+   The reason that TLB shootdowns must be sent to every                process.
+thread of the same process is that the OS cannot know which          • We modified the page fault mechanism in Linux to perform
+TLBs contain any given entry. However, Hydra has precise               lazy replication. In handle_pte_fault, a core function in
+information about what which NUMA nodes contain a copy                 the page fault handling mechanism, if the faulting page is
+of any given page-table. Also note that, by design, it is not          located in a VMA that is not owned by the current node,
+possible for any NUMA node to contain a given PTE entry                instead of performing a normal page fault, we attempt to
+in any of its TLBs unless the NUMA node is in the list of              copy the page-table entry from the owner node’s page-table.
+sharers for the page-table encompassing that PTE (if any TLB           If the entry is not present, the current node will perform the
+contained the PTE in question, then that TLB entry must be             page fault on behalf of the owner node, and then copy the
+have been filled from a local copy, or the local copy would            entry again from the owner. If prefetching is enabled, we
+be filled together with the TLB). Therefore, Hydra can use             may copy surrounding entries at this point as well, depend-
+the sharer information to safely reduce the scope of the TLB           ing on the level of prefetching set, if this is the first time we
+shootdowns and not issue them to any cores on those NUMA               are accessing memory mapped by the current page-table
+nodes that are not in the list of sharers for the particular page-     page. When this copying is done, we also check that both
+table, because these nodes are guaranteed by design not to             corresponding page-table pages are linked to each other
+
+
+
+USENIX Association                                                             2024 USENIX Annual Technical Conference             451
+  via the next replica field; if they are not, they are linked by       Workload            Description
+  merging the circular linked lists.                                    XSBench [61]        Monte Carlo neutron transport computational kernel ap-
+                                                                                            plications. Dataset = 85GB, p=50M, g=200k. Only used
+• Finally, we modified the functions that modify page-table                                 in multi sockets experiment.
+  entries to copy all modifications to replica page-tables by           Graph500 [48]       Benchmark for generation, compression and search of
+  traversing the circular linked lists formed by the next replica                           large graphs. Dataset = 160GB, s=30, e=20.
+  fields. We also modified the functions that read the page-            Redis [39]          Single thread in-memory data structure store. Dataset =
+                                                                                            256GB, key size = 25, element size = 64, element number
+  table entries for dirty and referenced bits written by hard-                              = 1B, 100% reads. Only use in workload migration.
+  ware to take the union of those bits from all replicas, just          Btree [1]           Benchmarks for measuring the index lookup perfor-
+  like in Mitosis [1]. Note that this involves accessing mem-                               mance in large applications. Dataset = 110GB, 1M keys,
+  ory in every socket that has the copy of the page-table that                              10B lookups.
+                                                                        HashJoin [12]       Benchmark for hash-table probing in database. Dataset
+  contains the same PTE. Also note that these bits are typi-                                = 145GB, 10B elements.
+  cally read in page replacement routines, which in modern              Canneal [8]         Simulates routing cost optimization in chip design.
+  operating systems are guarded by highly contended kernel                                  Dataset = 110GB, 400M elements.
+  locks [13, 37]. Compared to Mitosis, Hydra here has the
+  advantage of not having to read PTE copies from all NUMA                    Table 3: Detailed description of the workloads.
+  nodes, only the ones that share the page-table in question
+  and therefore avoids additional lock contention in critical        Workloads                             Graph500   Btree   HashJoin   XSBench   Canneal
+                                                                     Program Size (GB)                       160      110       145         85      110
+  page replacement routines. However, we do not evaluate the                                     Linux       0.31     0.22      0.28       0.17     0.22
+  differences between Hydra and Mitosis in out-of-memory             page-table footprint (GB)   Mitosis     2.51     1.72      2.27       1.33     1.72
+                                                                                                 Hydra       0.67     0.44      0.4        1.32     0.32
+  scenarios due to the enormous amounts of memory on our                                         Linux        0.2      0.2      0.2         0.2      0.2
+                                                                     page-table overhead (%)     Mitosis     1.56     1.57      1.57       1.57     1.57
+  evaluation platform.                                                                           Hydra       0.42      0.4      0.28       1.55     0.29
+
+   Let us illustrate the replication mechanism with an example.     Table 4: Page-table footprint (GB) in the baseline (no replica-
+Suppose there are two NUMA nodes, N1 and N2 . Both nodes            tion), Mitosis [1], and Hydra for various benchmarks.
+create a small allocation each, which we will call A1 and A2 ,
+respectively. Node N1 is the owner of allocation A1 , and N2 is
+the owner of A2 . At first, each node only accesses their own          We only perform this optimization when the VMA in ques-
+allocation, so each node’s page-table only contains entries         tion falls within a single last-level page-table page, in order
+for the respective allocation. Note that at this point, even        to avoid having to traverse the list of replicas for multiple
+if the allocations fall within the same last-level page-table       page-table pages, which potentially means multiple remote
+page, if there has not been any other cross-node access at this     memory accesses per node and which may end up costing
+point, the corresponding page-table pages from both replicas        more than simply sending the shootdowns.
+will not yet be linked. Suppose now node N1 accesses A2
+(owned by node N2 ). There are no mappings for A2 in N1 ’s
+page-table, so N1 will take a page fault, and copy the relevant     5      Evaluation
+PTE from N2 ’s page-table. At this point, we check if the two
+corresponding page-table pages are linked, and if they are not,     5.1       Evaluation Platform
+we link them together in a circular linked list using the next      We conducted all measurements on an eight-socket NUMA
+replica field, thereby ensuring any changes to the page-table       machine with 8TB DDR4 physical memory in total. Every
+entries are made to all replicas.                                   socket is equipped with 1TB DDR4 memory and one Intel
+                                                                    Xeon E7-8890 v3 processor with 18 cores operating at a
+4.2    Reducing TLB shootdowns                                      base frequency of 2.5 GHz and with two hyper-threads per
+                                                                    core. Each processor has a unified 45MB L3 cache, a unified
+By virtue of Hydra’s lazy page-table replication, only nodes        256 KB L2 cache, a unified L2 TLB with 1024 entries and a
+that have accessed a particular page will have entries for that     private L1 TLB with 64 entries for each core. Hyper-threading
+page in their page-tables. Therefore, we implemented our            is enabled and turbo-boost is disabled in all our experiments.
+TLB shootdown optimization by modifying the TLB shoot-
+down function, flush_tlb_mm_range, to walk the replica              5.2       Page-table Footprint
+lists of the pages of the page-table that map the region being
+shot down, and collect the nodes that have replicas. The TLB        Table 4 shows the program size and total page-table foot-
+shootdown IPI is then only sent to CPUs in those nodes that         print for various workloads running on an 8-socket machine
+are running a thread from the same process, as opposed to the       for three configurations: the baseline (no replication), Mito-
+Linux default, which is to send the shootdown to all CPUs           sis, and Hydra. As expected, Mitosis consistently results in
+running a thread from the same process.                             8x larger page-table footprint compared to the baseline (7x
+
+
+
+452   2024 USENIX Annual Technical Conference                                                                                  USENIX Association
+                     14                                                                                            Page Table Walking                Non Page Table Walking
+
+
+
+
+                                                                                                         2.0
+                                                                                   Normalized Runtime
+                     12                                                                                                     ↑10%                                   ↑0.2%
+                                                                                                                                                ↑0.7%                                ↑6.7%       ↑2.5%
+
+
+
+
+                                                                                                         1.5
+                     10
+ Runtime (seconds)
+
+
+
+
+                                                                                                         1.0
+                     8
+                     6
+
+
+
+
+                                                                                                         0.5
+                     4
+
+
+
+
+                                                                                                         0
+                                                                                                                  LPLD
+                                                                                                                 RPILD
+                                                                                                                RPILDM
+                                                                                                                RPILDH
+                                                                                                               RPILDHP
+
+                                                                                                                                      LPLD
+                                                                                                                                     RPILD
+                                                                                                                                    RPILDM
+                                                                                                                                    RPILDH
+                                                                                                                                   RPILDHP
+
+                                                                                                                                                        LPLD
+                                                                                                                                                       RPILD
+                                                                                                                                                      RPILDM
+                                                                                                                                                      RPILDH
+                                                                                                                                                     RPILDHP
+
+                                                                                                                                                                            LPLD
+                                                                                                                                                                           RPILD
+                                                                                                                                                                          RPILDM
+                                                                                                                                                                          RPILDH
+                                                                                                                                                                         RPILDHP
+
+                                                                                                                                                                                                 LPLD
+                                                                                                                                                                                                RPILD
+                                                                                                                                                                                               RPILDM
+                                                                                                                                                                                               RPILDH
+                                                                                                                                                                                              RPILDHP
+                     2
+
+                     0
+                                                                                                                 Btree             Redis             Graph500            Canneal              HashJoin
+                          0
+
+                               1
+
+                                    2
+
+                                         3
+
+                                              4
+
+                                                    5
+
+                                                          6
+
+                                                              7
+
+                                                                   8
+
+                                                                        9
+
+                                                                             sis
+                          H-
+
+                               H-
+
+                                    H-
+
+                                         H-
+
+                                              H-
+
+                                                   H-
+
+                                                        H-
+
+                                                              H-
+
+                                                                   H-
+
+                                                                        H-
+
+                                                                          ito
+                                                                         M
+                                              Configuration                        Figure 7: Normalized performance in the workload migration
+Figure 6: The time taken to traverse all pages in a large seg-                     scenario for Mitosis, Hydra, and Hydra with a prefetching
+ment exactly once in a random order for various configura-                         degree of 9. All of the configurations shown on X-axis are
+tions. H-i refers to Hydra with a degree of prefetching i.                         listed in Table 2.
+                                                                                                               Normalized Data Loading Time                                 +21%
+                                                                                              120%
+                                                                                                                  +3.7%             +4.2%               +4.7%                                   +7.5%
+overhead). In contrast, the page-table footprint overhead in                                  100%
+Hydra is only between 0.5x-1x and corresponds to the level of                                           1.0
+
+                                                                                   Normalized Runtime
+actual data sharing across sockets. The only exception is XS-
+
+
+
+                                                                                                                   1.04x
+
+
+
+
+                                                                                                                                             1.06x
+                                                                                                                                     1.06x
+                                                                                                                           1.06x
+
+
+
+
+                                                                                                                                                                                                         1.11x
+                                                                                                                                                                                                 1.11x
+                                                                                                                                                         1.14x
+                                                                                                                                                                 1.15x
+
+
+
+
+                                                                                                                                                                                      1.19x
+                                                                                                                                                                             1.22x
+bench, which has extreme data sharing and every page-table
+is replicated on every socket, producing the same page-table                                            0.5
+footprint in the case of Hydra and Mitosis. In this case, Hydra
+effectively converges to Mitosis.
+   Note that Hydra’s PTE prefetching has no impact whatso-                                               0
+ever on page-table memory footprint, because the prefetching                                                    L M H              L M H              L M H                L M H               L M H
+                                                                                                                  Btree            XSbench           Graph500              Canneal            Hashjoin
+is limited to the page boundaries surrounding the requested
+PTE. At the time of prefetching the replica page for the re-
+quested PTE has already been allocated and the whole page                          Figure 8: The lower part shows performance of Mitosis and
+is accounted for in the footprint, regardless of prefetching.                      Hydra for the workloads in a multi-socket setting, normalized
+                                                                                   to the baseline Linux. L, M and H indicate Linux, Mitosis, and
+                                                                                   Hydra, respectively. The upper part shows the data loading
+                                                                                   time in the same setting, also normalized to the base Linux.
+5.3                       PTE Prefetching
+                                                                                   5.4                         Workload Migration
+To demonstrate the potential of PTE prefetching, we construct
+a microbenchmark that traverses, in a random order, a 1GB                          Figure 7 shows the behavior of Linux, Mitosis and Hydra in a
+array such that every page is accessed exactly once, which is                      scenario where a thread migrates to a different socket, where
+the worst case for Hydra. The array is set up and initialized on                   the data resides. In the case of Linux, the page-tables will
+one node, and then it is accessed on the other. The benchmark                      remain on a remote socket, and the thread will be accessing
+is designed to achieve a near-zero hit ratio in caches and                         the remote socket only for translation. This causes a signifi-
+TLBs, and therefore nearly every data access results in a                          cant slowdown in the presence of applications that interfere
+remote memory access for the purpose of translation.                               with inter-socket traffic (RPILD). However, Mitosis doesn’t
+   Figure 6 shows the time it takes to traverse the array in                       suffer from this problem as it pre-replicates the page-tables
+the random order in the case of Hydra with multiple levels of                      system-wide. Hydra suffers from a small performance penalty
+PTE prefetching (from 0 - no prefetching, to 9 - maximum                           due to lazy replication (RPILDH), but that penalty is largely
+prefetching of 29 =512 PTEs). We also show the results for                         eliminated through prefetching.
+Mitosis for comparison. We can see that prefetching within
+a page-table is enough to eliminate any laziness penalty that                      5.5                         General Applications
+Hydra experiences by lazily copying PTEs one by one. Also
+note that subsequent traversals of this array would lead to                        Figure 8 shows the performance of multiple real-world appli-
+identical behavior in the case of Hydra and Mitosis regardless                     cations, listed in Table 3, running on our 8-socket machine.
+of the level of prefetching, because at that point all page-tables                 The workloads consist of two phases: 1) data setup/load-
+are constructed and replicated where they are needed.                              ing, which exercises page-table updates, and 2) the execution
+
+
+
+USENIX Association                                                                                                2024 USENIX Annual Technical Conference                                                   453
+ Normalized Runtime
+
+                                  2.39x                 Linux
+                                                                                              5.6.1   TLB Shootdowns
+                                                        Mitosis
+                      2                                 Hydra
+                                                                              1.68x
+                                                                                              We next measure the overhead of Mitosis, Hydra without the
+                                                                                              TLB optimization, and Hydra with the TLB optimization, on
+                      1
+                          1.00x           1.01x   1.00x 1.04x 0.99x   1.00x           0.99x   the performance of the mprotect. The size of the mprotect
+                                                                                              range is a single 4KB page. The mprotect syscall simply
+                                                                                              flips a single bit in one PTE, and does this in a loop. Ad-
+                      0                                                                       ditionally, we run a varying number of spinning threads on
+                            mprotect                 mmap               munmap
+                                                                                              every socket. The spinning threads have nothing to do with
+Figure 9: mprotect, mmap, and munmap overhead on Linux,                                       the mprotect thread; they simply increase a private counter
+Mitosis and Hydra when operating on a 128K memory range.                                      in an infinite loop, and we measure the impact of mprotect
+                                                                                              on the performance of spinning threads and vice versa. The
+                                                                                              results are shown in Figure 1.
+phase with the pre-loaded in-memory data, which stresses                                         When there are no spinning threads, Mitosis results in a
+page-table reads. During the loading time (the upper plot),                                   25% slowdown on 8-sockets, because it must update all repli-
+all page-tables are constructed, and in the case of Mitosis,                                  cas upon every mprotect operation, whereas Hydra has no
+replicated system-wide. The execution phase (the lower plot)                                  overhead due to the absence of coherence activity. However,
+exhibits a significant amount of data sharing and benefits from                               as we add spinning threads and increase their number per
+page-table replication across sockets; once the data is loaded,                               socket, all systems, including the baseline Linux, Mitosis, and
+there are very few page-table modifications. Note that the                                    Hydra (without the TLB optimization) will result in signif-
+data setup phase is time-consuming and takes several hours,                                   icant overheads, up to 40x. This is despite the fact that the
+whereas the subsequent execution is benchmarked for 5 min-                                    spinning threads have nothing to do with data covered by
+utes. We show three configurations: baseline (no replication),                                mprotect. Hydra without TLB optimization is only slightly
+Hydra (maximum PTE prefetching enabled), and Mitosis.                                         better than Mitosis, as it avoids updating any replicas, but
+   From the lower part of Figure 8 we can see that in all                                     still suffers a significant slowdown. This is due to the TLB
+benchmarks the performance of Hydra matches that of Mito-                                     shootdowns that must be sent to every running thread of the
+sis despite its laziness. In some workloads, such as Btree and                                process, despite the fact that these are spinning threads. In
+Graph500, Hydra even achieves a tiny speedup compared to                                      contrast, Hydra enabled with the TLB shootdown optimiza-
+Mitosis due to more efficient page-table coherence, to the ex-                                tion avoids sending shootdowns to any other socket, leading
+tent to which these workloads exercise memory management.                                     to substantial performance improvements.
+The biggest advantage Mitosis has over Hydra is for Canneal,                                     Figure 10 shows similar results in the same setup, except
+where Mitosis achieves 1.22x speedup over Linux, whereas                                      that instead of mprotect we use munmap, the underlying im-
+Hydra achieves 1.19x. However, this advantage seems to be                                     plementation of memory freeing. The range of munmap is
+coming at the expense of the data loading time, during which                                  set to a single 4KB page. With no spinning threads, Hydra
+Mitosis creates 5x more replicas than needed, according to Ta-                                does not experience any slowdowns, but Mitosis experiences
+ble 4 which compares the page-table footprints of all applica-                                a 23% slowdown. As we add spinning threads, the overhead
+tions. This unnecessary replication results in a 21% slowdown                                 of Mitosis grows to almost 30x, whereas Hydra with the TLB
+compared to Linux. Hydra, on the other hand, always matches                                   shootdown optimization results in only 2.6x overhead. The
+the performance of Linux when it comes to data loading time,                                  effect of replication on mmap is less pronounced due to the ad-
+because it does not perform any replication in that phase.                                    ditional work that mmap does that overshadows the coherence
+                                                                                              overhead.
+
+5.6                   Memory Management                                                       5.6.2   Case Study: Memory Allocation
+Figure 9 shows the overhead of the basic memory manage-                                       Figure 11 and Figure 12 show the overall impact of repli-
+ment operations, mmap, munmap, and mprotect as a function                                     cation on memory allocation (malloc) on various numbers
+of the size of the input range when executed on an 8-socket                                   of sockets, with one thread per socket. We use three promi-
+machine with three different designs: baseline (no replica-                                   nent malloc implementations: mmap, glibc, and tcmalloc.
+tion), Mitosis (system-wide eager replication), and Hydra                                     We develop two malloc benchmarks. The first benchmark is
+(partial and lazy replication). Note that there are no interfer-                              stateless: the benchmark will repeatedly allocate a segment
+ing/spinning threads. We see that mmap is largely unaffected                                  of random size following the Gamma distribution with a mean
+by replication, as page-table updates are a small part of its                                 allocation size of about 3.3MB, and then free the allocated
+functionality. In contrast, for mprotect and munmap, Mitosis                                  segment. The second benchmark follows the same allocation
+pays a significant cost for page-table coherence, which Hydra                                 size distribution, but it first allocates 256 segments, and then
+avoids.                                                                                       in a loop frees one segment and allocates another, such that
+
+
+
+454                   2024 USENIX Annual Technical Conference                                                                          USENIX Association
+                                                                                                                                                    25×105
+
+
+
+
+                                                                                                                                                                                             Normalized Runtime (Slowdown)
+Normalized Runtime (Slowdown)
+
+
+                                       Runtime                                     TLB Shootdown                                                                                                                                                              Linux                    Mitosis                 Hydra
+
+
+
+
+                                                                                                                                                                  Triggered TLB Shootdowns
+                                  30      Linux                                       Linux                                                                                                                                                                                                                                          1.88X
+
+
+
+
+                                                                                                                                                                                                                                        0 1 20 1 2
+                                                                                                                                                                                                                                                                                     1.61X                   1.71X           1.60X
+                                          Mitosis                                     Mitosis                                                       20×105                                                                                                   1.42X
+                                                                                                                                                                                                                                                                             1.13X           1.09X
+                                                                                                                                                                                                                                                                                                     1.26X           1.19X
+                                                                                                                                                                                                                                                                                                                                             1.46X
+                                          Hydra w/t TLB Opt                           Hydra w/t TLB                                                                                                                          mmap                    1.00X           1.01X
+                                          Hydra with TLB Opt                          Hydra with TLB Opt
+                                  20                                                                                                                15×105
+                                                                                                                                                                                                                                                                                                                                     1.89X
+                                                                                                                                                                                                                                                                                     1.61X                   1.61X           1.57X           1.47X
+                                                                                                                                                                                                                                                             1.42X
+                                                                                                                                                    10×105                                                                                                           1.02X   1.11X           1.11X
+                                                                                                                                                                                                                                                                                                     1.34X           1.24X
+                                                                                                                                                                                                                                                     1.00X
+                                  10
+                                                                                                                                                                                                                              glibc
+                                                                                                                                                    5×105
+                                                                                                                                                                                                                                                                                     1.65X                   1.67X                   1.71X
+                                                                                                                                                                                                                                                             1.40X                                   1.26X                   1.39X           1.33X
+                                                                                                                                                                                                                                                                             1.17X           1.16X                   1.25X
+                                   0                                                                                                                0                                                                                                1.00X           1.01X
+                                                                                                                                                                                                                             tcmalloc
+
+
+
+
+                                                                                                                                                                                                                                        1
+                                           0                       1            2         4          8                                   16
+                                                                         Spinning Threads Per Socket
+
+
+
+
+                                                                                                                                                                                                                                        0
+                                                                                                                                                                                                                                                              1                       2                        4                      8
+Figure 10: Impact of page-table replication and the TLB shoot-
+down optimization on munmap. Existing solution are unable                                                                                                                                    Figure 12: The impact of replication on state f ul memory
+to quickly deallocate page-tables while Hydra does this ef-                                                                                                                                  allocation for various configurations. The x axis indicates the
+ficiently. All values are normalized to the baseline without                                                                                                                                 socket number.
+replication.
+                                                                                                                                                                                             is why constructed a synthetic benchmark that performs the
+  Normalized Runtime (Slowdown)
+
+
+
+
+                                                                          Linux                    Mitosis                 Hydra                                                             webserver functionality without using a NIC, similar to prior
+                                               0 1 20 1 20 1 2
+
+
+
+
+                                                                                                                                                  1.78X
+                                                                         1.39X
+                                                                                                 1.62X
+                                                                                                                 1.20X
+                                                                                                                         1.66X
+                                                                                                                                 1.19X
+                                                                                                                                          1.52X           1.40X                              work [10, 49].
+                                                                                         1.07X           1.06X
+                                  mmap                           1.00X           1.00X
+                                                                                                                                                                                                Figure 13a shows the throughput of the webserver bench-
+                                                                                                                                                                                             mark on unmodified Linux, Mitosis, Hydra without the TLB
+                                                                                                                         1.77X                    1.81X
+                                                                         1.41X
+                                                                                                 1.65X
+                                                                                                                 1.22X           1.16X
+                                                                                                                                          1.53X           1.44X                              optimization, and Hydra with the TLB optimization. We run
+                                                                 1.00X           1.01X   1.08X           1.09X
+                                   glibc                                                                                                                                                     the benchmark with a varying number of threads (up to 32)
+                                                                                                                                                                                             uniformly distributed across four sockets. Figure 13b shows
+                                                                                                                                                  1.82X
+                                                                         1.42X                   1.49X
+                                                                                                                 1.18X
+                                                                                                                         1.66X            1.54X           1.43X                              the number of TLB shootdowns (in millions per second) as
+                                                                 1.00X           1.03X   1.07X           1.02X                   1.12X
+                                  tcmalloc                                                                                                                                                   we vary the number of threads. Because this application does
+                                                                                                                                                                                             not exhibit any data sharing, the impact of page-table repli-
+                                                                          1                       2                        4                       8                                         cation on the performance of page-table reads is negligible.
+                                                                                                                                                                                             Similarly, we see that Linux, Mitosis, and Hydra experience a
+Figure 11: The impact of replication on stateless memory                                                                                                                                     similar rate of TLB shootdowns, indicating a similar overhead
+allocation for various configurations. The x axis indicates the                                                                                                                              of page-table updates. As such, Mitosis and Hydra (without
+socket number.                                                                                                                                                                               the TLB optimization) achieve similar performance to Linux.
+                                                                                                                                                                                             However, as we can see in Figure Figure 13b, Hydra with
+there are 256 concurrent allocations at any time for every                                                                                                                                   the TLB optimization incurs about 45% reduction in TLB
+thread. We can see that Mitosis results in an overhead that                                                                                                                                  shootdowns. This reduction in TLB shootdowns results in
+ranges from 1.4X to 1.9X in both malloc benchmarks. At the                                                                                                                                   about 18-20% increase in throughput, as shown in Figure 13a.
+same time, Hydra achieves a speedup compared to both Linux
+and Mitosis, thanks to Hydra’s minimal page-table coherence.
+                                                                                                                                                                                             5.6.4                                Case Study: In-memory key-value store.
+
+5.6.3                                  Case Study: Web Server                                                                                                                                In-memory key-value stores, such as Memcached [46], are
+                                                                                                                                                                                             widely used in storing keys and values in memory to achieve
+Webserver, such as Apache, is an important and widely                                                                                                                                        low latency and high throughput. To protect the data store
+used application that is known to have problems with TLB                                                                                                                                     from data leakage, sensitive information corruption, or arbi-
+shootdowns. Webserver application (e.g., Apache Webserver)                                                                                                                                   trary accesses, mprotect is applied to the critical data section
+spawns a large number of threads, each of them serving a                                                                                                                                     to protect the stored data [28, 53, 66]. We create 8 client
+web request, which in our case is a web page the same as                                                                                                                                     threads that use libMemcached to send SET/GET requests.
+in [4, 38]. For each request, the webserver serving thread                                                                                                                                   The proportion of SET and GET are 0.1 and 0.9. The size
+allocates memory for the web page using mmap and subse-                                                                                                                                      of the keys and values are 32B and 256B, respectively. The
+quently frees it using munmap, generating many unnecessary                                                                                                                                   Memcached instances allow up to 1024 concurrent connec-
+TLB shootdowns along the way. Previous work has demon-                                                                                                                                       tions. The memory used for Memcached storage is 10GB in
+strated that techniques that reduce TLB shootdowns can sig-                                                                                                                                  this experiment. To maximize the scalability, we employ a
+nificantly improve the Apache’s throughput [38]. Because                                                                                                                                     varying number of Memcached processes, with two threads
+of the complex NUMA impact of the NICs [10, 49], Apache                                                                                                                                      per process. The threads are evenly distributed across four
+Webserver scales very poorly beyond a single socket, which                                                                                                                                   sockets.
+
+
+
+USENIX Association                                                                                                                                                                                                                    2024 USENIX Annual Technical Conference                                                                        455
+                                                   16                                                                                                                                                               Linux
+
+
+
+
+                                                                                                                                                                                TLB Shootdowns (106/s)
+                          Throughput (Req*105/s)
+                                                   15                                                                                                                                                    25         Mitosis
+                                                   14                                                                                                                                                               Hydra w/t TLB
+                                                   13                                                                                                                                                    20         Hydra with TLB Opt
+                                                   12
+                                                   11
+                                                                                                                                                                                                         15
+                                                   10
+                                                    9
+                                                    8                                                                                      Linux                                                         10
+                                                    7                                                                                      Mitosis
+                                                    6                                                                                      Hydra w/t TLB                                                  5
+                                                    5                                                                                      Hydra with TLB Opt
+                                                    4                                                                                                                                                     0
+                                                        1 2   4    6     8        10 12 14 16 18 20 22 24 26 28 30 32                                                                                         1 2    4   6   8   10 12 14 16 18 20 22 24 26 28 30 32
+                                                                                        Threads Number                                                                                                                               Threads Number
+                               a)                                                           b)
+Figure 13: a, b: Impact of page-table replication and the TLB shootdown optimization on webserver, normalized to the baseline
+without replication. The threads are evenly distributed across four sockets.
+
+                    160                                                                                           1400
+                                              Linux
+                                              Mitosis
+                                                                                                                                  Linux
+                                                                                                                                  Mitosis
+                                                                                                                                                                            be the best choice [2, 16, 47, 52, 58], especially for NUMA
+                    140                                                                                           1200
+                                              Hydra w/t TLB                                                                       Hydra w/t TLB                             systems [27, 63].
+                                                                                             TLB Shootdowns (105/s)
+
+
+
+
+                    120                       Hydra with TLB Opt                                                                  Hydra with TLB Opt
+Throughput (MB/s)
+
+
+
+
+                                                                                                                  1000
+                    100
+                                                                                                                      800
+                                                                                                                                                                            Support for Virtualization. Virtualized systems are another
+                    80
+                                                                                                                      600
+                                                                                                                                                                            potential area for future work to explore. These systems typi-
+                    60
+                                                                                                                      400
+                                                                                                                                                                            cally make use of hardware-based nested paging [25, 51] to
+                    40
+
+                                                                                                                      200
+                                                                                                                                                                            translate the guest virtual address to the guest physical address
+                    20
+
+                     0
+                                                                                                                                                                            and from the guest physical address down to the host physi-
+                          1 2                       4     6    8    10       12    14   16                                  1 2       4     6     8    10    12   14   16
+                                                          Threads Number                                                                    Threads Number                  cal address. Recent work has shown that virtualized systems
+                                                                                                                                                                            are particularly sensitive to poor page-table placement [51].
+Figure 14: Impact of page-table replication and TLB shoot-                                                                                                                  While Mitosis has been extended to support 2D page-tables
+down optimization on Memcached running on four sockets.                                                                                                                     under vMitosis, vMitosis still works based on explicit policies
+                                                                                                                                                                            given by the developers or providers. Unfortunately, it is chal-
+   Figure 14 shows the normalized Memcached throughput                                                                                                                      lenging to maintain particular policies per applications and
+and TLB shootdown rate of Mitosis and Hydra over unmodi-                                                                                                                    workloads. Furthermore, vMitosis also suffers from the same
+fied Linux. Hydra with TLB optimization always gains con-                                                                                                                   performance and memory overheads that Mitosis has since
+sistent speed-ups with a geomean improvement of 36% across                                                                                                                  they both make use of eager replication. Thus, we believe
+all thread counts, while Mitosis suffers a slowdown, due to                                                                                                                 that we will continue to see positive results once Hydra is
+the overhead of synchronously keeping all page replicas co-                                                                                                                 extended to support the lazy replication of both the guest and
+herent upon every page-table modification. The performance                                                                                                                  host page-tables.
+improvements of Hydra come from the reduction in TLB                                                                                                                        Reducing intra-socket TLB shootdowns. While the remote
+shootdowns, shown in Figure 14. Hydra with TLB optimiza-                                                                                                                    (inter-socket) shootdowns are significantly more costly, the
+tion reduces the occurrence of shootdowns by 50% to 96%.                                                                                                                    overhead of local (intra-socket) shootdowns remains non-
+                                                                                                                                                                            negligible (Figure 2). Hydra can be adapted to solve this
+                                                                                                                                                                            problem by logically partitioning the cores of a socket into
+6                         Discussion and Future Work                                                                                                                        several domains based on their physical proximity (similarly
+                                                                                                                                                                            to how scale-out processors physically partition a chip [42,
+Support for Transparent Huge Pages. Transparent Huge                                                                                                                        43]), while being mindful of the underlying cache architecture,
+Pages (THPs) are known to improve system performance                                                                                                                        and enabling lazy replication across logical domains.
+by reducing the number of page-table levels that need to be
+traversed when performing a translation and increasing the
+amount of memory that can be mapped by a single TLB entry.
+However, THPs will still suffer from limited TLB reach in                                                                                                                   7                            Related Work
+systems with large amounts of main memory. As a result,
+THPs would still benefit from the faster address translations                                                                                                               In this section we discuss the related work that has not been
+that Hydra provides. Extending Hydra to support THPs is a                                                                                                                   covered in earlier sections. Surprisingly, the problem of re-
+relatively straightforward task as we would simply need to                                                                                                                  mote page-table accesses in NUMA systems is an issue that
+implement the same duplication and coherence mechanisms                                                                                                                     has not received much attention. However, there is a body of
+that we had previously implemented on the THPs. However,                                                                                                                    related work that indirectly addresses the problem by either
+support for THPs was not considered a priority for this ver-                                                                                                                (1) minimizing the need for address translations or by (2)
+sion of Hydra as prior work has shown that THPs may not                                                                                                                     speeding up the address translation process.
+
+
+
+456                                         2024 USENIX Annual Technical Conference                                                                                                                                                                   USENIX Association
+7.0.1   Segmented Address Spaces                                    orthogonal to our work.
+                                                                       RadixVM [14] proposes a number of radical changes of
+Corey [9] is an experimental operating system designed for
+                                                                    the memory management, including lazy replication of mem-
+many-processor systems. In Corey, the address space of each
+                                                                    ory management structures across all cores, which allows it to
+process is partitioned into two a shared region and a private
+                                                                    eliminate unnecessary TLB shootdowns, similarly to Hydra.
+one. While this method ensures that page-tables for the private
+                                                                    Unfortunately, RadixVM is not scalable due to the per-core
+partition are located locally, accesses to the shared partition
+                                                                    page-table replication, which results in huge memory over-
+might still result in a remote page-table access since the shared
+                                                                    heads. For example, on our machine with 288 cores, around
+page-tables are not replicated. In addition, Corey requires the
+                                                                    60% of the entire memory would be occupied by page-tables.
+application to explicitly partition the address space which
+                                                                    RadixVM also requires a complete redesign of the kernel
+places an unnecessary burden on the programmer that makes
+                                                                    architecture and cannot be easily integrated into commercial
+unlikely for this technique to see widespread adoption.
+                                                                    OSes such as Linux. LATR [38] modifies a number of mem-
+                                                                    ory management system calls to introduces lazy and batched
+7.0.2   Minimizing the Need for Address Translations                issuance of TLB shootdowns and is orthogonal to our work.
+The related work below aims to reduce the need for address             Prefetched Address Translation [44] takes advantage of
+translations through various means, which can help reduce           the structure of page-tables to prefetch the lower levels of
+the performance penalties of remote pages by reducing the           the page-table during a TLB miss. This reduces page-table
+need to do page-table walks. However, these approaches are          walk latency without significant changes to existing systems.
+generally either (1) too disruptive and compromise key func-        Barrelfish [7] relies on message passing instead of IPIs to
+tionalities of existing VM implementations or (2) incremental       shoot down TLBs in remote cores, eliminating inter-processor
+changes whose effectiveness is fundamentally limited by the         interrupts and lowering the latency of TLB shootdowns. Amit
+existing system design.                                             et al. [5] present a solution to accelerate the TLB shootdown
+   Memory Segmentation - Memory segmentation is a mem-              performance by avoiding synchronous TLB shootdown calls
+ory management technique that was used in early x86 ma-             mainly. Unfortunately, this approach is entirely oblivious to
+chines and allowed the OS to allocate variable sized segments       page-table replication design, and it won’t be able to pre-
+to programs. While it has long since fallen out of popularity in    vent extra TLB shootdown calls introduced by replicas. Nev-
+favour of paging, some recent works have decided to explore         ertheless, Hydra can achieve even higher performance if it
+the idea as a possible way to extend the reach of TLBs [6, 36].     integrates such TLB shootdown acceleration solutions.
+However, such methods prevent the use of mechanisms such
+as Copy-on-Write, demand-paging and per-page protection.
+Furthermore, these works may experience fragmentation as            8   Conclusions
+they require the segments to be allocated in contiguous blocks.
+   Direct and Set-associative mappings - Set-associative            We have presented Hydra, a novel on-demand partial page-
+mappings restrict the range of physical addresses a partic-         table replication mechanism for NUMA systems that simul-
+ular virtual address can map to [56, 57]. In more extreme           taneously optimizes both read and update accesses to page-
+cases, some of these methods directly map physical to vir-          tables. We have shown that page-table replication, if done
+tual addresses [31]. While these methods virtually eliminate        lazily, can be leveraged to improve rather than degrade the
+the overhead associated with address translation, they do not       performance of memory management operations. Using the
+support important mechanisms like Copy-on-Write and de-             extra knowledge of the sharers of a page-table afforded by
+mand paging in some cases [31]. In addition, such methods           our lazy replication, Hydra is also to reduce unnecessary TLB
+may also compromise the security of a system as it might            shootdowns and improve the runtime of memory management
+impact the functionality of memory-protection mechanisms            operations by up to 40x. At the same time, Hydra reaps all
+like address space layout randomization.                            the benefits of page-table replication, providing a 20% im-
+   Multi-page mapping - Multi-page mappings allow trans-            provement over a wide range of applications, and provides
+lations with contiguous physical addresses to be mapped to          scalability to any number of NUMA nodes.
+a single entry in the TLB [54, 55]. While these methods do
+increase the reach of TLBs, the improvement is still not suffi-
+cient to support modern systems that have several hundreds          Acknowledgments
+of gigabytes of memory [26].
+                                                                    This research was supported by the Advanced Research and
+7.0.3   Speeding Up Address Translation                             Technology Innovation Centre (ARTIC) at the National Uni-
+                                                                    versity of Singapore under grant FCT-RP1 A-0008129-00-
+The following body of related work seeks to improve the             00, and by the Ministry of Education in Singapore grants
+speed of address translation in various ways and is largely         A-0008143-00-00 and A-0008024-00-00.
+
+
+
+USENIX Association                                                           2024 USENIX Annual Technical Conference         457
+References                                                        [11] Irina Calciu, Siddhartha Sen, Mahesh Balakrishnan, and
+                                                                       Marcos K. Aguilera. Black-box concurrent data struc-
+ [1] Reto Achermann, Ashish Panwar, Abhishek Bhattachar-               tures for numa architectures. In International Confer-
+     jee, Timothy Roscoe, and Jayneel Gandhi. Mitosis:                 ence on Architectural Support for Programming Lan-
+     Transparently self-replicating page-tables for large-             guages and Operating Systems, ASPLOS, 2017.
+     memory machines. In International Conference on Ar-
+     chitectural Support for Programming Languages and            [12] Shimin Chen, Anastassia Ailamaki, Phillip B Gibbons,
+     Operating Systems, ASPLOS, 2020.                                  and Todd C Mowry. Improving hash join performance
+                                                                       through prefetching. ACM Transactions on Database
+ [2] Ibrar Ahmed. Settling the myth of transparent hugepages           Systems, 2007.
+     for databases. https://www.percona.com/blog/2
+     019/03/06/settling-the-myth-of-transparent                   [13] Austin T. Clements, M. Frans Kaashoek, and Nickolai
+    -hugepages-for-databases/.                                         Zeldovich. Scalable address spaces using rcu balanced
+                                                                       trees. In International Conference on Architectural Sup-
+ [3] AMD. The next generation amd enterprise server prod-              port for Programming Languages and Operating Sys-
+     uct architecture. https://www.hotchips.org/wp-c                   tems, ASPLOS, 2012.
+     ontent/uploads/hc_archives/hc29/HC29.22-T
+     uesday-Pub/HC29.22.90-Server-Pub/HC29.22.9                   [14] Austin T Clements, M Frans Kaashoek, and Nickolai
+     21-EPYC-Lepak-AMD-v2.pdf.                                         Zeldovich. Radixvm: Scalable address spaces for mul-
+                                                                       tithreaded applications. In ACM European Conference
+ [4] Nadav Amit. Optimizing the tlb shootdown algorithm                on Computer Systems, EuroSys, 2013.
+     with page access tracking. In USENIX Annual Technical
+     Conference, ATC, 2017.                                       [15] Taiwan Semiconductor Manufacturing Company.
+                                                                       Cowos services. http://www.tsmc.com/english/d
+ [5] Nadav Amit, Amy Tai, and Michael Wei. Don’t shoot                 edicatedFoundry/services/cowos.htm.
+     down tlb shootdowns! In ACM European Conference
+     on Computer Systems, EuroSys, 2020.                          [16] Jonathan Corbet. Large pages, large blocks, and large
+                                                                       problems. https://lwn.net/Articles/250335/.
+ [6] Arkaprava Basu, Jayneel Gandhi, Jichuan Chang,
+     Mark D Hill, and Michael M Swift. Efficient virtual          [17] Intel Corporation. New intel core processor combines
+     memory for big memory servers. ACM SIGARCH Com-                   high-performance cpu with custom discrete graphics
+     puter Architecture News, 2013.                                    from amd to enable sleeker, thinner devices. https:
+                                                                       //newsroom.intel.com/editorials/new-intelco
+ [7] Andrew Baumann, Paul Barham, Pierre-Evariste Da-                  re-processor-combine-high-performance-cpu
+     gand, Tim Harris, Rebecca Isaacs, Simon Peter, Timo-             -discrete-graphicssleek-thin-devices/.
+     thy Roscoe, Adrian Schüpbach, and Akhilesh Singhania.
+     The multikernel: a new os architecture for scalable multi-   [18] Marvell Corporation. Mochi architecture. http://www.
+     core systems. In ACM Symposium on Operating Systems               marvell.com/architecture/mochi/.
+     Principles, SOSP, 2009.
+                                                                  [19] Guilherme Cox and Abhishek Bhattacharjee. Efficient
+ [8] Christian Bienia and Kai Li. Parsec 2.0: A new                    address translation for architectures with multiple page
+     benchmark suite for chip-multiprocessors. In Annual               sizes. In nternational Conference on Architectural Sup-
+     Workshop on Modeling, Benchmarking and Simulation,                port for Programming Languages and Operating Sys-
+     AWMB, 2009.                                                       tems, ASPLOS, 2017.
+
+ [9] Silas Boyd-Wickizer, Haibo Chen, Rong Chen, Yandong          [20] Mohammad Dashti, Alexandra Fedorova, Justin Fun-
+     Mao, M Frans Kaashoek, Robert Tappan Morris, Alek-                ston, Fabien Gaud, Renaud Lachaize, Baptiste Lepers,
+     sey Pesterev, Lex Stein, Ming Wu, Yue-hua Dai, et al.             Vivien Quema, and Mark Roth. Traffic management: a
+     Corey: An operating system for many cores. In USENIX              holistic approach to memory placement on numa sys-
+     Symposium on Operating Systems Design and Imple-                  tems. ACM SIGARCH Computer Architecture News,
+     mentation, OSDI, 2008.                                            2013.
+
+[10] Qizhe Cai, Shubham Chaudhary, Midhul Vuppalapati,            [21] Y Demir, Y Pan, S Song, N Hardavellas, J Kim, and
+     Jaehyun Hwang, and Rachit Agarwal. Understanding                  G Memi. Galaxy: A high-performance energy-efficient
+     host network stack overheads. In Proceedings of the               multi-chip architecture using photonic interconnects. In
+     ACM Special Interest Group on Data Communication,                 ACM International Conference on Supercomputing, ICS,
+     SIGCOMM, 2021.                                                    2014.
+
+
+
+458   2024 USENIX Annual Technical Conference                                                            USENIX Association
+[22] Peter J Denning. Virtual memory. ACM Computing                 of memory for parallel programs. In Usenix Annual
+     Surveys, 1970.                                                 Technical Conference, ATC, 2015.
+
+[23] Yu Du, Miao Zhou, Bruce R Childers, Daniel Mossé,         [34] A Kannan, N Jerger, and G Loh. Enabling interposer-
+     and Rami Melhem. Supporting superpages in non-                 based disintegration of multi-core processors. In In-
+     contiguous physical memory. In International Sym-              ternational Symposium on Microarchitecture, MICRO,
+     posium on High Performance Computer Architecture,              2015.
+     HPCA, 2015.
+                                                               [35] Vasileios Karakostas, Jayneel Gandhi, Furkan Ayar,
+[24] J. Gandhi, A. Basu, M. D. Hill, and M. M. Swift. Effi-         Adrián Cristal, Mark D. Hill, Kathryn S. McKinley,
+     cient memory virtualization: Reducing dimensionality           Mario Nemirovsky, Michael M. Swift, and Osman Ün-
+     of nested page walks. In IEEE/ACM International Sym-           sal. Redundant memory mappings for fast access to
+     posium on Microarchitecture, MICRO, 2014.                      large memories. SIGARCH Comput. Archit. News,
+                                                                    43(3S):66–78, jun 2015.
+[25] Jayneel Gandhi, Mark D. Hill, and Michael M. Swift.
+     Agile paging for efficient memory virtualization. IEEE    [36] Vasileios Karakostas, Jayneel Gandhi, Furkan Ayar,
+     Micro, 2017.                                                   Adrián Cristal, Mark D Hill, Kathryn S McKinley, Mario
+                                                                    Nemirovsky, Michael M Swift, and Osman Ünsal. Re-
+[26] Jayneel Gandhi, Vasileios Karakostas, Furkan Ayar,             dundant memory mappings for fast access to large mem-
+     Adrián Cristal, Mark D Hill, Kathryn S McKinley, Mario         ories. ACM SIGARCH Computer Architecture News,
+     Nemirovsky, Michael M Swift, and Osman S Ünsal.                2015.
+     Range translations for fast virtual memory. IEEE Micro,
+     2016.                                                     [37] Alex Kogan, Dave Dice, and Shady Issa. Scalable range
+                                                                    locks for scalable address spaces and beyond. In Euro-
+[27] Fabien Gaud, Baptiste Lepers, Jeremie Decouchant,              pean Conference on Computer Systems, EuroSys, 2020.
+     Justin Funston, Alexandra Fedorova, and Vivien Quema.
+     Large pages may be harmful on NUMA systems. In            [38] Mohan Kumar Kumar, Steffen Maass, Sanidhya
+     Annual Technical Conference, ATC, 2014.                        Kashyap, Ján Veselý, Zi Yan, Taesoo Kim, Abhishek
+                                                                    Bhattacharjee, and Tushar Krishna. Latr: Lazy trans-
+[28] Jinyu Gu, Hao Li, Wentai Li, Yubin Xia, and Haibo              lation coherence. In International Conference on Ar-
+     Chen. {EPK}: Scalable and efficient memory protection          chitectural Support for Programming Languages and
+     keys. In 2022 USENIX Annual Technical Conference               Operating Systems, ASPLOS, 2018.
+     (USENIX ATC 22), pages 609–624, 2022.
+                                                               [39] Redis Labs. Redis. https://redis.io.
+[29] Juncheng Gu, Youngmoon Lee, Yiwen Zhang, Mosharaf
+     Chowdhury, and Kang G. Shin. Efficient memory disag-      [40] Christoph Lameter. Numa (non-uniform memory ac-
+     gregation with infiniswap. In Proceedings of the 14th          cess): An overview: Numa becomes more common be-
+     USENIX Conference on Networked Systems Design and              cause memory controllers get close to execution units
+     Implementation, NSDI’17, page 649–667, USA, 2017.              on microprocessors. Queue, 2013.
+     USENIX Association.                                       [41] Huaicheng Li, Daniel S Berger, Lisa Hsu, Daniel Ernst,
+[30] Swapnil Haria, Mark D. Hill, and Michael M. Swift. De-         Pantea Zardoshti, Stanko Novakovic, Monish Shah,
+     virtualizing memory in heterogeneous systems. In Pro-          Samir Rajadnya, Scott Lee, Ishwar Agarwal, et al. Pond:
+     ceedings of the Twenty-Third International Conference          Cxl-based memory pooling systems for cloud platforms.
+     on Architectural Support for Programming Languages             In ACM International Conference on Architectural Sup-
+     and Operating Systems, ASPLOS ’18, page 637–650,               port for Programming Languages and Operating Sys-
+     New York, NY, USA, 2018. Association for Computing             tems, Volume 2, ASPLOS, 2023.
+     Machinery.                                                [42] Pejman Lotfi-Kamran, Boris Grot, Michael Ferdman,
+[31] Swapnil Haria, Mark D Hill, and Michael M Swift. De-           Stavros Volos, Onur Kocberber, Javier Picorel, Almutaz
+     virtualizing memory in heterogeneous systems. ACM              Adileh, Djordje Jevdjic, Sachin Idgunji, Emre Ozer, and
+     SIGPLAN Notices, 2018.                                         Babak Falsafi. Scale-out processors. In Proceedings of
+                                                                    the 39th Annual International Symposium on Computer
+[32] S Iyer. Heterogeneous integration for performance and          Architecture, 2012.
+     scaling. IEEE Transactions on Components, 2016.
+                                                               [43] Pejman Lotfi-Kamran, Boris Grot, Michael Ferdman,
+[33] Stefan Kaestle, Reto Achermann, Timothy Roscoe, and            Stavros Volos, Onur Kocberber, Javier Picorel, Almu-
+     Tim Harris. Shoal: Smart allocation and replication            taz Adileh, Djordje Jevdjic, Sachin Idgunji, Emre Ozer,
+
+
+
+USENIX Association                                                      2024 USENIX Annual Technical Conference       459
+      and Babak Falsafi. Retrospective: Scale-out processors.   [54] Binh Pham, Abhishek Bhattacharjee, Yasuko Eckert, and
+      In ISCA@50 25-Year Retrospective: 1996-2020. ACM               Gabriel H Loh. Increasing tlb reach by exploiting clus-
+      SIGARCH and IEEE TCCA, 2023.                                   tering in page translations. In International Symposium
+                                                                     on High Performance Computer Architecture, HPCA,
+[44] Artemiy Margaritov, Dmitrii Ustiugov, Edouard                   2014.
+     Bugnion, and Boris Grot. Prefetched address trans-
+     lation. In IEEE/ACM International Symposium on             [55] Binh Pham, Viswanathan Vaidyanathan, Aamer Jaleel,
+     Microarchitecture, MICRO, 2019.                                 and Abhishek Bhattacharjee. Colt: Coalesced large-
+                                                                     reach tlbs. In IEEE/ACM International Symposium on
+[45] Hasan Al Maruf, Hao Wang, Abhishek Dhanotia, Jo-                Microarchitecture, MICRO, 2012.
+     hannes Weiner, Niket Agarwal, Pallab Bhattacharya,
+     Chris Petersen, Mosharaf Chowdhury, Shobhit Kanaujia,      [56] Javier Picorel, Djordje Jevdjic, and Babak Falsafi. Near-
+     and Prakash Chauhan. Tpp: Transparent page placement            memory address translation. In International Confer-
+     for cxl-enabled tiered-memory. In ACM International             ence on Parallel Architectures and Compilation Tech-
+     Conference on Architectural Support for Programming             niques, PACT, 2017.
+     Languages and Operating Systems, Volume 3, ASPLOS,         [57] Javier Picorel, Seyed Alireza Sanaee Kohroudi, Zi Yan,
+     2023.                                                           Abhishek Bhattacharjee, Babak Falsafi, and Djordje
+                                                                     Jevdjic. Sparta: A divide and conquer approach to
+[46] Memcached. A distributed memory object caching store.           address translation for accelerators. arXiv preprint
+     https://memcached.org.                                          arXiv:2001.07045, 2020.
+[47] mongoDB. Disable transparent huge pages. https:            [58] redis. Latency induced by transparent huge pages. ht
+     //docs.mongodb.org/manual/tutorial/transpa                      tps://redis.io/topics/latency.
+     rent-huge-pages/.
+                                                                [59] Jee Ho Ryoo, Nagendra Gulur, Shuang Song, and Lizy K.
+[48] Richard C Murphy, Kyle B Wheeler, Brian W Barrett,              John. Rethinking tlb designs in virtualized environ-
+     and James A Ang. Introducing the graph 500. Cray                ments: A very large part-of-memory tlb. SIGARCH
+     Users Group, 2010.                                              Computer Architecture News, 2017.
+
+[49] Rolf Neugebauer, Gianni Antichi, José Fernando Zazo,       [60] Yizhou Shan, Yutong Huang, Yilun Chen, and Yiying
+     Yury Audzevich, Sergio López-Buedo, and Andrew W                Zhang. LegoOS: A disseminated, distributed OS for
+     Moore. Understanding pcie performance for end host              hardware resource disaggregation. In 13th USENIX
+     networking. In Proceedings of the ACM Special Interest          Symposium on Operating Systems Design and Imple-
+     Group on Data Communication, SIGCOMM, 2018.                     mentation (OSDI 18), pages 69–87, Carlsbad, CA, Oc-
+                                                                     tober 2018. USENIX Association.
+[50] Mark Oskin and Gabriel H. Loh. A software-managed
+     approach to die-stacked dram. In 2015 International        [61] John R Tramm, Andrew R Siegel, Tanzima Islam, and
+     Conference on Parallel Architecture and Compilation,            Martin Schulz. Xsbench-the development and verifica-
+     PACT, 2015.                                                     tion of a performance abstraction for monte carlo reactor
+                                                                     analysis. The Role of Reactor Physics toward a Sustain-
+[51] Ashish Panwar, Reto Achermann, Arkaprava Basu, Ab-              able Future, 2014.
+     hishek Bhattacharjee, K. Gopinath, and Jayneel Gandhi.     [62] Pirmin Vogel, Andrea Marongiu, and Luca Benini.
+     Fast local page-tables for virtualized numa servers with        Lightweight virtual memory support for many-core ac-
+     vmitosis. In International Conference on Architectural          celerators in heterogeneous embedded socs. In 2015
+     Support for Programming Languages and Operating                 International Conference on Hardware/Software Code-
+     Systems, ASPLOS, 2021.                                          sign and System Synthesis (CODES+ISSS), pages 45–54,
+[52] Ashish Panwar, Aravinda Prasad, and K Gopinath. Mak-            2015.
+     ing huge pages actually useful. In International Con-      [63] Zi Yan, Daniel Lustig, David Nellans, and Abhishek
+     ference on Architectural Support for Programming Lan-           Bhattacharjee. Nimble page management for tiered
+     guages and Operating Systems, ASPLOS, 2018.                     memory systems. In International Conference on Ar-
+                                                                     chitectural Support for Programming Languages and
+[53] Soyeon Park, Sangho Lee, Wen Xu, Hyungon Moon,
+                                                                     Operating Systems, ASPLOS, 2019.
+     and Taesoo Kim. libmpk: Software abstraction for in-
+     tel memory protection keys (intel {MPK}). In 2019          [64] Idan Yaniv and Dan Tsafrir. Hash, don’t cache the page
+     USENIX Annual Technical Conference (USENIX ATC                  table. ACM SIGMETRICS Performance Evaluation
+     19), pages 241–254, 2019.                                       Review, 2016.
+
+
+
+460   2024 USENIX Annual Technical Conference                                                           USENIX Association
+[65] J Yin, Z Lin, O Kayiran, M Poremba, M Altaf, N Jerger,
+     and G Loh. Modular routing design for chiplet-based
+     systems. In International Symposium on Computer
+     Architecture, ISCA, 2018.
+[66] Danyang Zhuo, Kaiyuan Zhang, Zhuohan Li, Siyuan
+     Zhuang, Stephanie Wang, Ang Chen, and Ion Stoica.
+     Rearchitecting in-memory object stores for low latency.
+     Proceedings of the VLDB Endowment, 15(3):555–568,
+     2021.
+
+
+
+
+USENIX Association                                             2024 USENIX Annual Technical Conference   461
+

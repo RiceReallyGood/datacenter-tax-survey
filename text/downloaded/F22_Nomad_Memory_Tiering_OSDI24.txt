@@ -1,0 +1,1313 @@
+   Nomad: Non-Exclusive Memory Tiering via
+        Transactional Page Migration
+     Lingfeng Xiang, Zhen Lin, Weishu Deng, Hui Lu, and Jia Rao,
+The University of Texas at Arlington; Yifan Yuan and Ren Wang, Intel Labs
+         https://www.usenix.org/conference/osdi24/presentation/xiang
+
+
+
+
+     This paper is included in the Proceedings of the
+     18th USENIX Symposium on Operating Systems
+              Design and Implementation.
+                July 10–12, 2024 • Santa Clara, CA, USA
+                             978-1-939133-40-3
+
+
+                                      Open access to the Proceedings of the
+                                      18th USENIX Symposium on Operating
+                                       Systems Design and Implementation
+                                                is sponsored by
+     N OMAD: Non-Exclusive Memory Tiering via Transactional Page Migration
+
+            Lingfeng Xiang, Zhen Lin, Weishu Deng, Hui Lu, Jia Rao, Yifan Yuan† , Ren Wang†
+                             The University of Texas at Arlington, † Intel Labs
+
+
+
+
+Abstract                                                         Express Link (CXL)-based memory [1, 37, 44], and storage-
+                                                                 class memory [53, 55] continue to emerge, future computer
+With the advent of byte-addressable memory devices, such as      systems are anticipated to feature multiple tiers of mem-
+CXL memory, persistent memory, and storage-class memory,         ory with distinct characteristics, such as speed, size, power,
+tiered memory systems have become a reality. Page migration      and cost. Tiered memory management aims to leverage the
+is the de facto method within operating systems for managing     strength of each memory tier to optimize the overall data
+tiered memory. It aims to bring hot data whenever possible       access latency and bandwidth. Central to tiered memory man-
+into fast memory to optimize the performance of data accesses    agement is page management within operating systems (OS),
+while using slow memory to accommodate data spilled from         including page allocation, placement, and migration. Efficient
+fast memory. While the existing research has demonstrated        page management in the OS is crucial for optimizing memory
+the effectiveness of various optimizations on page migration,    utilization and performance while maintaining transparency
+it falls short of addressing a fundamental question: Is exclu-   for user applications.
+sive memory tiering, in which a page is either present in fast
+                                                                    Traditionally, the memory hierarchy consists of storage
+memory or slow memory, but not both simultaneously, the
+                                                                 media with at least one order of magnitude difference in per-
+optimal strategy for tiered memory management?
+                                                                 formance. For example, in the two-level memory hierarchy as-
+    We demonstrate that page migration-based exclusive mem-
+                                                                 sumed by commercial operating systems for decades, DRAM
+ory tiering suffers significant performance degradation when
+                                                                 and disks differ in latency, bandwidth, and capacity by 2-3
+fast memory is under pressure. In this paper, we propose non-
+                                                                 orders of magnitude. Therefore, the sole goal of page manage-
+exclusive memory tiering, a page management strategy that
+                                                                 ment is to keep hot pages in, and maximize the hit rate of the
+retains a copy of pages recently promoted from slow mem-
+                                                                 “performance” tier (DRAM), and migrate (evict) cold pages to
+ory to fast memory to mitigate memory thrashing. To enable
+                                                                 the “capacity” tier (disk) when needed. As new memory de-
+non-exclusive memory tiering, we develop N OMAD, a new
+                                                                 vices emerge, the performance gap in the memory hierarchy
+page management mechanism for Linux that features trans-
+                                                                 narrows. Evaluations on Intel’s Optane persistent memory
+actional page migration and page shadowing. N OMAD helps
+                                                                 [56] and CXL memory [50] reveal that these new memory
+remove page migration off the critical path of program execu-
+                                                                 technologies can achieve comparable performance to DRAM
+tion and makes migration completely asynchronous. Evalua-
+                                                                 in both latency and bandwidth, within a range of 2-3x. As
+tions with carefully crafted micro-benchmarks and real-world
+                                                                 a result, the assumption of the performance gap, which has
+applications show that N OMAD is able to achieve up to 6x
+                                                                 guided the design of OS page management for decades, may
+performance improvement over the state-of-the-art transpar-
+                                                                 not hold. It is no longer beneficial to promote a hot page to
+ent page placement (TPP) approach in Linux when under
+                                                                 the performance tier if the migration cost is too high.
+memory pressure. We also compare N OMAD with a recently
+proposed hardware-assisted, access sampling-based page mi-          Furthermore, unlike disks which must be accessed through
+gration approach and demonstrate N OMAD’s strengths and          the file system as a block device, new memory devices are
+potential weaknesses in various scenarios.                       byte-addressable and can be directly accessed by the pro-
+                                                                 cessor via ordinary load and store instructions. Therefore,
+                                                                 for a warm page on the capacity tier, accessing the page di-
+1   Introduction                                                 rectly and avoiding migration to the performance tier could
+                                                                 be a better option. Most importantly, while the performance
+As new memory devices, such as high bandwidth memory             of tiered memory remains hierarchical, the hardware is no
+(HBM) [4, 30], DRAM, persistent memory [7, 39], Compute          longer hierarchical. Both the Optane persistent memory and
+
+
+
+USENIX Association                           18th USENIX Symposium on Operating Systems Design and Implementation           19
+                                                                                              15
+CXL memory appear to the processor as a CPUless memory                                                    TPP in progress       TPP stable      No migration
+
+node and thus can be used by the OS as ordinary DRAM.                                         12
+
+   These unique challenges facing emerging tiered memory
+
+
+
+
+                                                                                  Bandwidth
+                                                                                               9
+
+
+
+
+                                                                                    (GB/s)
+systems have inspired research on improving page manage-
+ment in the OS. Much focus has been on expediting page                                         6
+
+migrations between memory tiers. Nimble [54] improves
+                                                                                               3
+page migration by utilizing transparent huge pages (THP),
+multi-threaded migration of a page, and concurrent migration                                   0
+                                                                                                   Frequency-opt     Random     Frequency-opt    Random
+of multiple pages. Transparent page placement (TPP) [44]                                             placement      placement     placement     placement
+                                                                                                     WSS 10GB       WSS 10GB      WSS 24GB      WSS 24GB
+extends the existing NUMA balancing scheme in Linux to
+support asynchronous page demotion and synchronous page                      Figure 1: The comparison of achieved memory bandwidth in a
+promotion between fast and slow memory. Memtis [37] and                      micro-benchmark due to different phases in TPP and a baseline
+TMTS [24] use hardware performance counters to mitigate                      approach that disables page migration. Higher is better performance.
+the overhead of page access tracking and use background
+threads to periodically and asynchronously promote pages.
+   However, these approaches have two fundamental limita-                       To reduce the cost of page migration, especially for promo-
+tions. First, the existing page management for tiered memory                 tion, this paper proposes transactional page migration (TPM),
+assumes that memory tiers are exclusive to each other – hot                  a novel mechanism to enable page access during migration.
+pages are allocated or migrated to the performance tier while                Unlike current page migrations, TPM starts page content copy
+cold pages are demoted to the capacity tier. Therefore, each                 without unmapping the page from the capacity tier so that
+page is only present in one tier. As memory tiering seeks                    the migrating page is still accessible by user programs. After
+to explore the tradeoff between performance and capacity,                    page content is copied to a new page on the performance
+the working set size of workloads that benefit most from                     tier, TPM checks whether the page has been dirtied during
+tiered memory systems likely exceeds the capacity of the per-                the migration. If so, the page migration (i.e., the transaction)
+formance tier. Exclusive memory tiering inevitably leads to                  is invalidated and the copied page is discarded. Failed page
+excessive hot-cold page swapping or memory thrashing when                    migrations will be retried at a later time. If successful, the
+the performance tier is not large enough to hold hot data.                   copied new page is mapped in the page table and the old page
+   Second, there is a lack of an efficient page migration mech-              is unmapped, becoming a shadow copy of the new page.
+anism to support tiered memory management. As future mem-                       We have developed N OMAD, a new page management
+ory tiers are expected to be addressable by the CPU, page                    framework for tired memory that integrates non-exclusive
+migrations are similar to serving minor page faults and in-                  memory tiering and transactional page migration. N OMAD
+volve three steps: 1) unmap a page from the page table; 2)                   safeguards page allocation to prevent out-of-memory (OOM)
+copy the page content to a different tier; 3) remap the page                 errors due to page shadowing. When the capacity tier is un-
+on the page table, pointing to the new memory address. Re-                   der memory pressure, N OMAD prioritizes the reclamation of
+gardless of whether page migration is done synchronously                     shadow pages before evicting ordinary pages. We have im-
+upon accessing a hot page in the slower capacity tier or asyn-               plemented a prototype of N OMAD in Linux and performed
+chronously in the background, the 3-step migration process is                a thorough evaluation on four different platforms, including
+expensive. During migration, an unmapped page cannot be ac-                  an FPGA-based CXL prototype, a persistent memory system,
+cessed by user programs. If page migration is done frequently,               and a pre-market, commercial CXL system. Experimental
+e.g., due to memory thrashing, user-perceived bandwidth, in-                 results show that, compared to two representative page man-
+cluding accesses to the migrating pages, is significantly lower              agement schemes: TPP and Memtis, N OMAD achieves up
+(up to 95% lower) than the peak memory bandwidth [54].                       to 6x performance improvement over TPP during memory
+   This paper advocates non-exclusive memory tiering that al-                thrashing and consistently outperforms Memtis by as much
+lows a subset of pages on the performance tier to have shadow                as 130% when the working set size fits into fast memory.
+copies on the capacity tier 1 . Note that non-exclusive tiering is
+different from inclusive tiering which strictly uses the perfor-
+mance tier as a cache of the capacity tier. The most important
+benefit is that under memory pressure, page demotion is made                 2    Motivation and Related Work
+less expensive by simply remapping a page if it is not dirty
+and its shadow copy exists on the capacity tier. This allows                 We introduce the background of page management in tiered
+for smooth performance transition when memory demand                         memory systems and use TPP [44], a state-of-the-art page
+exceeds the capacity of the performance tier.                                placement system designed for CXL-enabled tiered memory,
+     1We assume that page migrations only occur between two adjacent tiers   as a motivating example to highlight the main limitations of
+if there are more than two memory tiers.                                     current page management approaches.
+
+
+
+20     18th USENIX Symposium on Operating Systems Design and Implementation                                                              USENIX Association
+2.1    Memory Tiering                                               fast tier and demoting cold data to the slow tier. Given that
+                                                                    all memory tiers are byte-addressable by the CPU and the
+Caching and tiering are two traditional software approaches         performance gap between tiers narrows, it remains to be seen
+to manage a memory, or storage hierarchy, consisting of vari-       whether exclusive tiering is the optimal strategy considering
+ous types of storage media (e.g., CPU caches, DRAM, and             the cost of data movement.
+hard disks) differing in performance, capacity, and cost. With-        We evaluate the performance of transparent page placement
+out loss of generality, we consider a two-level memory hier-        (TPP) [44], a state-of-the-art and the default tiered memory
+archy with 1) a performance tier (i.e., the fast tier), backed      management in Linux. Figure 1 shows the bandwidth of a
+with smaller, faster, but more expensive storage media; and         micro-benchmark that accesses a configurable working set
+2) a capacity tier (i.e., the slow tier) with larger, slower, and   size (WSS) following a Zipfian distribution in a CXL-based
+cheaper storage media. For caching, data is stored in the ca-       tiered memory system. More details of the benchmark and the
+pacity tier, and copies of frequently accessed or “hot” data are    hardware configurations can be found in Section 4. We com-
+strategically replicated to the performance tier. For tiering,      pare the performance of TPP while it actively migrates pages
+new data is first allocated to the performance tier and remains     between tiers for promotion and demotion (denoted as TPP
+there if it is frequently accessed, while less accessed data may    in progress) and when it has finished page relocation (TPP
+be relegated to the capacity tier when needed. At any mo-           stable) with that of a baseline that disables page migration
+ment, data resides exclusively in one of the tiers but not both.    (no migration). The baseline does not optimize page place-
+Essentially, caching operates in an inclusive page placement        ment and directly accesses hot pages from the slow tier. The
+mode and retains pages in their original locations, only tem-       tiered memory testbed is configured with 16GB fast memory
+porarily storing a copy in the performance tier for fast access.    (local DRAM) and 16GB slow memory (remote CXL mem-
+Conversely, tiering operates in an exclusive mode, actively         ory). We vary the WSS to fit in (e.g., 10GB) and exceed (e.g.,
+relocating pages across various memory/storage mediums.             24GB) fast memory capacity. Note that the latter requires
+Diverse memory/storage devices, such as high bandwidth              continuous page migrations between tiers since hot data spills
+memory (HBM) [4], CXL-based memory [1], persistent mem-             into slow memory. Additionally, we explore two initial data
+ory (PM) [7], and fast, byte-addressable NVMe SSDs [31],            placement strategies in the benchmark. First, the benchmark
+have emerged recently. While they still make a tradeoff be-         pre-allocates 10GB of data in fast memory to emulate the ex-
+tween speed, size, and cost, the gap between their performance      isting memory usage from other applications. Frequency-opt
+narrows. For example, Intel Optane DC persistent memory             is an allocation strategy that places pages according to the
+(PM), available in a DIMM package on the memory bus en-             descending order of their access frequencies (hotness). Thus,
+abling programs to directly access data from the CPU using          the hottest pages are initially placed in fast memory until the
+load and store instructions, provides (almost) an order of          WSS spills into slow memory. In contrast, Random employs
+magnitude higher capacity than DRAM (e.g., 8x) and offers           a random allocation policy and may place cold pages initially
+performance within a range of 2-3x of DRAM, e.g., write             in fast memory.
+latency as low as 80 ns and read latency around 170 ns [56].           We have important observations from results in Figure 1.
+More recently, compute express link (CXL), an open-standard         First, page migration in TPP incurs significant degradation
+interconnect technology based on PCI Express (PCIe) [1], pro-       in application performance. When WSS fits in fast memory,
+vides a memory-like, byte-addressable interface (i.e., via the      TPP stable, which has successfully migrated all hot pages
+CXL.mem protocol) for connecting diverse memory devices             to fast memory, achieves more than an order of magnitude
+(e.g., DRAM, PM, GPUs, and smartNICs). Real-world CXL               higher bandwidth than TPP in progress. Most importantly, no
+memory offers comparable memory access latency (<2x) and            migration is consistently and substantially better than TPP
+throughput (∼50%) to ordinary DRAM [50].                            in progress, suggesting that the overhead of page migration
+   From the perspective of OS memory management, CXL                outweighs its benefit until the migration is completed. Second,
+memory or PM appears to be a remote, CPUless memory                 TPP never reaches a stable state and enters memory thrashing
+node, similar to a multi-socket non-uniform memory access           when WSS is larger than the capacity of fast memory. Third,
+(NUMA) node. State-of-the-art tiered memory systems, such           page migration is crucial to achieving optimal performance
+as TPP [44], Memtis [37], Nimble [54], and AutoTiering [32],        if it is possible to move all hot data to fast memory and the
+all adopt tiering to exclusively manage data on different mem-      initial placement is sub-optimal, as evidenced by the wide gap
+ory tiers. Unlike the traditional two-level memory hierarchy        between TPP stable and no migration in the 10GB WSS and
+involving DRAM and disks, in which DRAM acts as a cache             random placement test.
+for the much larger storage tier, current CXL memory tiering
+treats CXL memory as an extension of local DRAM. While              2.2    Page Management
+exclusive memory tiering avoids data redundancy, it necessi-
+tates data movement between memory tiers to optimize the            In this section, we delve into the design of page management
+performance of data access, i.e., promoting hot data to the         in Linux and analyze its overhead during page migration. We
+
+
+
+USENIX Association                             18th USENIX Symposium on Operating Systems Design and Implementation            21
+focus our discussions on 1) how to effectively track memory                        80   Promoted pages:   Demoted pages:
+accesses and identify hot pages, and 2) the mechanism to                                  2,607,369         2,603,215
+                                                                                                                           Page promotion
+migrate a page between memory tiers.
+
+
+
+
+                                                                    Run time (s)
+                                                                                   60                                      Page fault time
+Tracking memory access can be conducted by software                                                                        Userspace time
+                                                                                                                           Page demotion
+(via the kernel) and/or with hardware assistance. Specifi-                         40
+                                                                                                                           CPU idle
+cally, the kernel can keep track of page accesses via page
+faults [2, 32, 44], scanning page tables [2, 14, 19, 43, 54], or                   20
+both. Capturing each memory access for precise tracking
+can be expensive. Page fault-based tracking traps memory                            0
+                                                                                        Application CPU    kswapd CPU
+accesses to selected pages (i.e., whose page table entry per-
+missions are set to no access) via hint (minor) page faults.       Figure 2: Time breakdown in the execution of TPP in progress:
+Thus, it allows the kernel to accurately measure the recency       Synchronous page migration and page fault handling account for a
+and frequency of these pages. However, invoking a page fault       significant portion of the runtime.
+on every memory access incurs high overhead on the critical
+                                                                   active list, it is migrated (promoted) to the fast tier. Page demo-
+path of program execution. On the other hand, page table (PT)
+                                                                   tion occurs when fast memory is under pressure and kswapd
+scanning periodically checks the access bit in all page ta-
+                                                                   migrates pages from the inactive list to slow memory.
+ble entries (PTE) to determine recently accessed pages since
+the last scanning. Compared to page fault-based tracking,             Accurate and lightweight memory access tracking can be
+which tracks every access on selected pages, PT scanning has       achieved with hardware support, e.g., by adding a PTE count
+to make a tradeoff between scanning overhead and tracking          field in hardware that records the number of memory ac-
+accuracy by choosing an appropriate scanning interval [37].        cesses [45]. However, hardware-based tracking can increase
+   Linux adopts a lazy PT scanning mechanism to track hot          the complexity and require extensive hardware changes in
+pages, which lays the foundation for its tiered memory man-        mainstream architectures (e.g., x86). In practice, the hardware-
+agement. Linux maintains two LRU lists for a memory node:          assisted sampling, such as via Processor Event-Based Sam-
+an active list to store hot pages and an inactive list for cold    pling (PEBS) [24, 37] on Intel platforms, has been employed
+pages. By default, all new pages go to the inactive list and       to record page access (virtual address) information from sam-
+will be promoted to the active list according to two flags,        pled hardware events (e.g., LLC misses or store instructions).
+PG_referenced and PG_active, in the per-page struct page.          However, PEBS-based profiling also requires a careful bal-
+PG_reference is set when the access bit in the correspond-         ance between the frequency of sampling and the accuracy of
+ing PTE is set upon a PTE check and PG_active is set after         profiling. We observed that the PEBS-based approach [37],
+PG_reference is set for two consecutive times. A page is           with a sampling rate optimized for minimizing overhead, re-
+promoted to the active list when its PG_active flag is set.        mains coarse-grained and fails to capture many hot pages.
+For file-backed pages, their accesses are handled by the OS        Further, the sampling-based approach may not accurately mea-
+through the file system interface, e.g., read() and write().       sure access recency, thus limiting its ability to make timely
+Therefore, their two flags are updated each time they are          migration decisions.
+accessed. For anonymous pages, e.g., application memory            Page migration between memory tiers involves a complex
+allocated through malloc, since page accesses are directly         procedure: ① The system must trap to the kernel (e.g., via
+handled by the MMU hardware and bypass the OS kernel, the          page faults) to handle migration; ② The PTE of a migrating
+updates to their reference flags and LRU list management are       page must be locked to prevent others from accessing the page
+only performed during memory reclamation. Under memory             during migration and be ummapped from the page table; ③ A
+pressure, the swapping daemon kswapd scans the inactive            translation lookaside buffer (TLB) shootdown must be issued
+list and the corresponding PTEs to update inactive pages’          to each processor (via inter-processor interrupts (IPIs)) that
+flags, and reclaims/swaps out those with PG_reference un-          may have cached copies of the stale PTE; ④ The content of
+set. Additionally, kswapd promotes hot pages (i.e., those with     the page is copied between tiers; ⑤ Finally, the PTE must be
+PG_active set) to the active list. This lazy scanning mecha-       remapped to point to the new location. Page migration can be
+nism delays access tracking until it is necessary to reduce the    done synchronously or asynchronously. Synchronous migra-
+tracking overhead, but undermines tracking accuracy.               tion, e.g., page promotion in TPP, is on-demand triggered by
+   TPP [44] leverages Linux’s PT scanning to track hot pages       user access to a page and on the critical path of program exe-
+and employs page fault-based tracking to decide whether to         cution. During migration, the user program is blocked until
+promote pages from slow memory. Specifically, TPP sets             migration is completed. Asynchronous migration, e.g., page
+all pages residing in slow memory (e.g., CXL memory) as            demotion in TPP, is handled by a kernel thread (i.e., kswapd),
+inaccessible, and any user access to these pages will trig-        oftentimes off programs’ critical path, when certain criteria
+ger a minor page fault, during which TPP decides whether           are met. Synchronous migration is costly not only because
+to promote the faulting page. If the faulting page is on the       pages are inaccessible during migration but also may involve
+
+
+
+22   18th USENIX Symposium on Operating Systems Design and Implementation                                            USENIX Association
+a large number of page faults.                                     advances them by incorporating more recency information
+   Figure 2 shows the run time breakdown of the aforemen-          with no additional CPU overhead. Unlike hardware-assisted
+tioned benchmark while TPP is actively relocating pages be-        approaches [24, 37, 42], N OMAD does not require any addi-
+tween the two memory tiers. Since page promotion is syn-           tional hardware support.
+chronous, page fault handling and page content copying (i.e.,      Page migration optimizations. To hide reclamation overhead
+promotion) are executed on the same CPU as the application         from applications, TPP [44] decouples page allocation and
+thread. Page demotion is done through kswapd and uses a            reclamation; however, page migration remains in the critical
+different core. As shown in Figure 2, synchronous promotion        path, incurring significant slowdowns. Nimble [54] focuses
+together with page fault handling incurs significant overhead      on mitigating page migration overhead with new migration
+on the application core. In contrast, the demotion core re-        mechanisms, including transparent huge page migration and
+mains largely idle and does not present a bottleneck. As will      concurrent multi-page migration. Memtis [37] further moves
+be discussed in Section 3.1, userspace run time can also be        page migration out of the critical path using a kernel thread
+prolonged due to repeated minor page faults (as many as 15)        to promote/demote pages in the background. TMTS [24]
+to successfully promote one page. This overhead analysis           leverage a user/kernel collaborative approach to control page
+explains the poor performance of TPP observed in Figure 1.         migration. In contrast, N OMAD aims to achieve prompt, on-
+                                                                   demand page migration while moving page migration off the
+2.3    Related Work                                                critical path. It is orthogonal to and can benefit from existing
+                                                                   page migration optimizations. The most related work is [20],
+A long line of pioneering work has explored a wide range           which leverages hardware support to pin data in caches, en-
+of tiered storage/memory systems, built upon SSDs and              abling access to pages during migration. Again, N OMAD does
+HDDs [12, 15, 22, 26, 33, 41, 49, 52, 57], DRAM and disks [21,     not need additional hardware support.
+25, 29, 46], HBM and DRAMs [23, 45, 48], NUMA mem-
+ory [2, 3], PM and DRAM [13, 14, 40, 43], local and far mem-
+ory [19, 27, 34, 35, 47], DRAM and CXL memory [37, 38, 44],        3   N OMAD Design and Implementation
+and multiple tiers [32, 36, 40, 51, 54]. We focus on tiered
+memory systems consisting of DRAM and the emerging byte-           N OMAD is a new page management mechanism for tiered
+addressable memory devices, e.g., CXL memory and PM.               memory that features non-exclusive memory tiering and trans-
+N OMAD also applies to other tiered memory systems such as         actional page migration. The goal of N OMAD design is to
+HBM/DRAM and DRAM/PM.                                              enable the processor to freely access pages from both fast
+Lightweight memory access tracking. To mitigate soft-              and slow memory tiers and move the cost of page migration
+ware overhead associated with memory access tracking, Hot-         off the critical path of users’ data access. Note that N OMAD
+box [19] employs two separate scanners for fast and slow tiers     does not make page migration decisions and relies on the
+to scan the slow tier at a fixed rate while the fast tier at an    existing memory access tracking in the OS to determine page
+adaptive rate, configurable based on the local memory pres-        temperature. Furthermore, N OMAD does not impact the initial
+sure. Memtis [37] adjusts its PEBS-based sampling rate to          memory allocation in the OS and assumes a standard page
+ensure its overhead is under control (e.g., < 3%). TMTS [24]       placement policy. Pages are allocated from the fast tier when-
+also adopts a periodic scanning mechanism to detect fre-           ever possible and are placed in the slower tier only when there
+quency along with hardware sampling to more timely de-             is an insufficient number of free pages in the fast tier, or at-
+tect newly hot pages. While these approaches balance scan-         tempts to reclaim memory in the fast tier have failed. After the
+ning/sampling overhead and tracking accuracy, an “always-on”       initial page placement, N OMAD gradually migrates hot pages
+profiling component does not seem practical, especially for        to the fast tier and cold pages to the slow tier. N OMAD seeks
+high-pressure workloads. Instead, thermostat [14] samples a        to address two key issues: 1) how to minimize the cost of page
+small fraction of pages, while DAMON [3] monitors memory           migration? 2) how to minimize the number of migrations?
+access at a coarser-grained granularity (i.e., region). Although   Overview. Inspired by multi-level cache management in mod-
+both can effectively reduce the scanning overhead, coarse          ern processors, which do not employ a purely inclusive or
+granularity leads to lower accuracy regarding page access          exclusive caching policy between tiers [16] to facilitate the
+patterns. On the other hand, to reduce the overhead associated     sharing of or avoid the eviction of certain cache lines, N OMAD
+with frequent hint page faults like AutoNUMA [2], TPP [44]         embraces a non-exclusive memory tiering policy to prevent
+enables the page-fault based detection only for CXL mem-           memory thrashing when under memory pressure. Unlike the
+ory (i.e., the slow tier) and tries to promote a page promptly     existing page management schemes that move pages between
+via synchronous migration; prompt page promotion avoids            tiers and require that a page is only present in one tier, N O -
+subsequent page faults on the same page.                           MAD instead copies pages from the slow tier to the fast tier
+   Inspired by existing lightweight tracking systems, such as      and keeps a shadow copy of the migrated pages at the slow
+Linux’s active and inactive lists and hint page faults, N OMAD     tier. The non-exclusive tiering policy maintains shadow copies
+
+
+
+USENIX Association                            18th USENIX Symposium on Operating Systems Design and Implementation             23
+               TLB shootdown                 Change PTE mapping      aforementioned migration until it is successful or reaching a
+                                                                     maximum of 10 attempts.
+                                         Promotion CPU   2
+                  D   PFN0                                   CPU 1      TPM decouples page migration from the critical path of
+                           1                             5           user programs by making the migrating page accessible dur-
+     8            D   PFN0
+                           4
+                                                                     ing migration. Therefore, users will access the migrating page
+                                                         2           from the slow tier before the migration is complete. While ac-
+                  D     0x0                                  CPU 2
+                      6          7                       5           cessing a hot page from the slow tier may lead to sub-optimal
+           D   PFN0                  D   PFN1                        memory performance, it avoids blocking user access due to
+                      Copy                               2           the migration, thereby leading to superior user-perceived per-
+                                                             CPU 3   formance. Figure 3 shows the workflow of TPM. Before
+     Old page, PFN0    3       New page, PFN1            5
+                                                                     migration commences, TPM clears the protection bit of the
+                                                                     page frame and adds the page to a migration pending queue.
+Figure 3: The workflow of transactional page migration. PFN          Since the page is no longer protected and not yet unmapped
+is the page frame number and D is the dirty bit in PTE. The          from the page table, following accesses to the page will not
+page is only inaccessible by user programs during step 4 when        trigger additional page faults.
+the page is remapped in the page table.                                 TPM starts a migration transaction by clearing the dirty bit
+only for pages that have been promoted to the fast tier, thereby     of the page (step ❶) and checks the dirty bit after the page
+not an inclusive policy. The advantage of the non-exclusive          is copied to the fast tier to determine whether the transaction
+policy is that the demotion of clean, cold pages can be sim-         was successful. After changing the dirty bit in PTE, TPM
+plified to remapping the page table entry (PTE) without the          issues a TLB shootdown to all cores that ever accessed this
+need to copy the cold page to the slower tier.                       page (step ❷). This is to ensure that subsequent writes to the
+    The building block of N OMAD is a new transactional page         page can be recorded on the PTE. After the TLB shootdown is
+migration (TPM) mechanism to reduce the cost of page mi-             completed, TPM starts copying the page from the slow tier to
+grations. Unlike the existing unmap-copy-remap 3-step page           the fast tier (step ❸). To commit the transaction, TPM checks
+migration, TPM opportunistically copies a page without un-           the dirty bit by loading the entire PTE using atomic instruc-
+mapping it from the page table. During the page copy, the            tion get_and_clear (step ❹). Clearing the PTE is equivalent
+page is not locked and can be accessed by a user program.            to unmapping the page and thus another TLB shootdown is
+After the copy is completed, TPM checks if the page has been         needed (step ❺). Note that after unmapping the page from
+dirtied during the copy. If not, TPM locks the page and remaps       PTE, it becomes inaccessible by users. TPM checks whether
+it in the PTE to the faster tier. Otherwise, the migration is        the page was dirtied during the page copy (step ❻) and either
+aborted and will be tried at a later time. TPM not only min-         commits the transaction by remapping the page to the fast tier
+imizes the duration during which a page is inaccessible but          if the page is clean (step ❼) or otherwise aborts the transac-
+also makes page migration asynchronous, thereby removing             tion (step ❽). If the migration is aborted, the original PTE is
+it from the critical path of users’ data access.                     restored and waits for the next time when TPM is rescheduled
+    Without loss of generality, we describe N OMAD design            to retry the migration. The duration in which the page is in-
+in the context of Linux. We start with transactional page            accessible is between ❹ and ❼/ ❽, significantly shorter than
+migration and then delve into page shadowing – an essential          that in TPP (possibly multiple attempts between ❶ and ❼).
+mechanism that enables non-exclusive memory tiering.                    Page migration is a complex procedure that involves mem-
+                                                                     ory tracing and updates to the page table for page remapping.
+                                                                     The state-of-the-art page fault-based migration approaches,
+3.1       Transactional Page Migration                               e.g., TPP in Linux [44], employ synchronous page migration,
+The motivation to develop TPM is to make page migration              a mechanism in the Linux kernel for moving pages between
+entirely asynchronous and decoupled from users’ access to the        NUMA nodes. In addition to the extended migration time
+page. As discussed in Section 2.2, the current page migration        affecting the critical path of user programs, this mechanism
+in Linux is synchronous and on the critical path of users’ data      causes excessive page faults when integrated with the existing
+access. For example, the default tiered memory management            LRU-based memory tracing. TPP makes per-page migration
+in Linux, TPP, attempts to migrate a page from the slow tier         decisions based on whether the page is on the active LRU
+whenever a user program accesses the page. Since the page            list. Nevertheless, in Linux, memory tracing adds pages from
+is in inaccessible mode, the access triggers a minor page            the inactive to the active LRU list in batches of 15 requests 2 ,
+fault, leading TPP to attempt the migration. The user program        aiming to minimize the queue management overhead. Due
+is blocked and makes no progress until the minor page fault is       to synchronous page migration, TPP may submit multiple
+handled and the page is remapped to the fast tier, which can         requests (up to 15 if the request queue is empty) for a page to
+be a time-consuming process. Worse, if the migration fails,             2 The 15 requests could be repeated requests for promoting the same page
+
+the OS remains in function migrate_pages and retries the             to the active LRU list
+
+
+
+
+24       18th USENIX Symposium on Operating Systems Design and Implementation                                         USENIX Association
+        CPU1         Access page                                                                  Fast tier        Slow tier
+                                                  User space
+                                                                                       Master                                   Shadow
+                                Page fault       Kernel space                        page, PFN0                                page, PFN1
+                   COLD     COLD
+                                                                                                      Demote: remap PTE
+        Tail                                           Head
+                                                                                               PFN0                        PFN1
+                                         Promotion candidate queue
+                          HOT            HOT                                                              Restore r/w bit after demotion
+       CPU2
+                                                                                            Shadow r/w bit                 r/w bit
+        Tail                                           Head
+
+        kpromote                             Migration pending queue          Figure 5: Shadow page management using shadow r/w bit.
+
+Figure 4: TPM uses a two-queue design to enable asyn-                         swapping hot and cold pages between memory tiers, page
+chronous page migration.                                                      shadowing enables efficient page demotion through page table
+                                                                              remapping. This would eliminate half of the page migration
+be promoted to the active LRU list to initiate the migration                  overhead, i.e., page demotion, during memory thrashing.
+process. In the worst case, migrating one page may generate                   Indexing shadow pages. Inspired by the indexing of file-
+as many as 15 minor page faults.                                              based data in the Linux page cache, N OMAD builds an XArray
+   TPM provides a mechanism to enable asynchronous page                       for indexing shadow pages. An XArray is a radix-tree like,
+migration but requires additional effort to interface with                    cache-efficient data structure that acts as a key-value store,
+memory tracing in Linux to minimize the number of page                        mapping from the physical address of a fast tier page to the
+faults needed for page migration. As shown in Figure 4, in                    physical address of its shadow copy on the slow tier. Upon
+addition to the inactive and active LRU lists in memory trac-                 successfully completing a page migration, N OMAD inserts
+ing, TPM maintains a separate promotion candidate queue                       the addresses of both the new and old pages into the XArray.
+(PCQ) for pages that 1) have been tried for migration but 2)                  Additionally, it adds a new shadow flag to the struct page
+not yet promoted to the active LRU list. Upon each time a                     of the new page, indicating that shadowing is on for this page.
+minor (hint) page fault occurs and the faulting page is added
+                                                                              Shadow page management. The purpose of maintaining
+to PCQ, TPM checks if there are any hot pages in PCQ that
+                                                                              shadow pages is to assist with page demotion. Fast or efficient
+have both the active and accessed bits set. These hot pages
+                                                                              page demotion is possible via page remapping if the master
+are then inserted to a migration pending queue, from where
+                                                                              page, i.e., the one on the fast tier, is clean and consistent
+they will be tried for asynchronous, transactional migration
+                                                                              with the shadow copy. Otherwise, the shadow copy should
+by a background kernel thread kpromote. Note that TPM
+                                                                              be discarded. To track inconsistency between the master and
+does not change how Linux determines the temperature of a
+                                                                              shadow copies, N OMAD sets the master page as read-only
+page. For example, in Linux, all pages in the active LRU list,
+                                                                              and a write to the page causes a page fault. To simplify system
+which are eligible for migration, have the two memory tracing
+                                                                              design and avoid additional cross-tier traffic, N OMAD discards
+bits set. However, not all pages with these bits set are in the
+                                                                              the shadow page if the master page is dirtied.
+active list due to LRU list management. TPM bypasses the
+                                                                                 However, tracking updates to the master page poses a sig-
+LRU list management and provides a more efficient method
+                                                                              nificant challenge. Page management in Linux relies heav-
+to initiate page migration. If all transactional migrations were
+                                                                              ily on the read-write permission to perform various opera-
+successful, TPM guarantees that only one page fault is needed
+                                                                              tions on a page, such as copy-on-write (CoW). While setting
+per migration in the presence of LRU list management.
+                                                                              master pages as read-only effectively captures all writes, it
+                                                                              may affect how these master pages are managed in the ker-
+3.2    Page Shadowing                                                         nel. To address this issue, N OMAD introduces a procedure
+                                                                              called shadow page fault. It still designates all master pages as
+To enable non-exclusive memory tiering, N OMAD introduces                     read-only but preserves the original read-write permission
+a one-way page shadowing mechanism to allow a subset of                       in an unused software bit on the page’s PTE (as shown in
+pages resident in the performance tier to have a shadow copy                  Figure 5). We refer to this software bit as shadow r/w. Upon
+in the capacity tier. Only pages promoted from the slow tier                  a write to a master page, a page fault occurs. Unlike an ordi-
+have shadow copies in the slow tier. Shadow copies are the                    nary page fault that handles write violation, the shadow page
+original pages residing on the slow tier before they are un-                  fault, which is invoked if the page’s shadow flag is set in its
+mapped in the page table and migrated to the fast tier. Shadow                struct page, restores the read-write permission of the fault-
+pages play a crucial role in minimizing the overhead of page                  ing page according to the shadow r/w bit and discards/frees
+migration during periods of memory pressure. Instead of                       the shadow page. The write may proceed once the shadow
+
+
+
+USENIX Association                                         18th USENIX Symposium on Operating Systems Design and Implementation             25
+page fault returns and reinstates the page to be writable. For                                                               RSS
+read-only pages, tracking shadow pages does not impose                                                                       WSS
+additional overhead; for writable pages, it requires one addi-
+tional shadow page fault to restore their write permission.
+Reclaiming shadow pages. Non-exclusive memory tiering
+introduces space overhead due to the storage of shadow pages.                    Fast tier            Slow tier
+If shadow pages are not timely reclaimed when the system is
+under memory pressure, applications may encounter out-of-         Figure 6: The three memory provisioning schemes used in the
+memory (OOM) errors, which would not occur under exclu-           evaluation. From bottom to top concerning fast memory: over-
+sive memory tiering. There are two scenarios in which shadow      provisioning, approaching capacity, and under-provisioning.
+pages should be reclaimed. First, the Linux kernel periodically
+checks the availability of free pages and if free memory falls    primary goal is to understand tiered memory management by
+below low_water_mark, kernel daemon kswapd is invoked             comparing N OMAD with existing representative approaches
+to reclaim memory. N OMAD instructs kswapd to prioritize          to reveal the benefits and potential limitations of current page
+the reclamation of shadow pages. Second, upon a memory            management approaches for emerging tiered memory.
+allocation failure, N OMAD also tries to free shadow pages. To       We analyze two types of memory footprints: 1) resident set
+avoid OOM errors, the number of freed shadow pages should         size (RSS) – the total size of memory occupied by a program,
+exceed the number of requested pages. However, frequent           and 2) working set size (WSS) – the amount of memory a
+memory allocation failures could negatively affect system         program actively uses during execution. RSS determines the
+performance. N OMAD employs a straightforward heuristic           initial page placement, while WSS dictates the number of
+to reclaim shadow pages, targeting 10 times the number of         pages that should be migrated to the fast tier. Since we focus
+requested pages or until all shadow pages are freed. While ex-    on in-memory computing, WSS is typically smaller than RSS.
+cessive reclamation may have a negative impact on N OMAD’s        Figure 6 illustrates the three scenarios we study with the WSS
+performance, it is crucial to prevent Out-of-Memory (OOM)         size smaller than, close to, and larger than fast memory size.
+errors. Experiments in Section 4 demonstrate the robustness       Testbeds. We conducted experiments on four platforms with
+of N OMAD even under extreme circumstances.                       different configurations in CPU, local DRAM, CXL memory,
+                                                                  and persistent memory, as detailed in Table 1.
+3.3    Limitations                                                • Platform A was built with commercial off-the-shelf (COTS)
+N OMAD relies on two rounds of TLB shootdown to effec-              Intel Sapphire Rapids processors and a 16 GB Agilex-7
+tively track updates to a migrating page during transactional       FPGA-based CXL memory device [6].
+page migration. When a page is used by multiple processes         • Platform B featured an engineering sample of the Intel Sap-
+or mapped by multiple page tables, its migration involves           phire Rapids processors with the same FPGA-based CXL
+multiple TLB shootdowns, per each mapping, that need to             memory device. The prototype processors have engineering
+happen simultaneously. The overhead of handling multiple            tweaks that have the potential to enhance the performance
+IPIs could outweigh the benefit of asynchronous page copy.          of CXL memory, which were not available on platform A.
+Hence, N OMAD deactivates transactional page migration for
+                                                                  • Platform C included an Intel Cascade Lake processor and
+multi-mapped pages and resorts to the default synchronous
+                                                                    six 256 GB 100 series Intel Optane Persistent Memory. This
+page migration mechanism in Linux. As high-latency TLB
+                                                                    platform enabled the full capability of PEBS-based mem-
+shootdowns based on IPIs continue to be a performance con-
+                                                                    ory tracking and allowed for a comprehensive comparison
+cern, modern processors, such as ARM, future AMD, and Intel
+                                                                    between page fault- and sampling-based page migration.
+x86 processors, are equipped with ISA extensions for faster
+broadcast-based [17, 18] or micro-coded RPC-like [28] TLB         • Platform D had an AMD Genoa 9634 processor and four
+shootdowns. These emerging lightweight TLB shootdown                256 GB Micron’s (pre-market) CXL memory modules. This
+methods will greatly reduce the overhead of TLB coherence           platform allowed us to evaluate N OMAD with more realistic
+in tiered memory systems with expanded memory capacity.             CXL memory configurations.
+N OMAD will also benefit from the emerging hardware and             Since the FPGA-based CXL memory device had only 16
+can be extended to scenarios where more intensive TLB shoot-      GB of memory, we configured local DRAM to 16 GB for all
+downs are necessary.                                              platforms 3 . Note that platform C was equipped with DDR4
+                                                                  DRAM as fast memory while the other platforms used DDR5
+4     Evaluation                                                      3 Although platform C and D have larger PM or CXL memory sizes, we
+
+                                                                  configured them with 16 GB slow memory consistent with platform A and B
+This section presents a thorough evaluation of N OMAD, fo-        for a fair comparison in micro-benchmarks.This limit was lifted when testing
+cusing on its performance, overhead, and robustness. Our          real applications.
+
+
+
+
+26    18th USENIX Symposium on Operating Systems Design and Implementation                                          USENIX Association
+                                                 Platform A                Platform B                 Platform C             Platform D
+                                                                      (engineering sample)
+                                             4th Gen Xeon Gold       4th Gen Xeon Platinum        2nd Gen Xeon Gold         AMD Genoa
+                        CPU
+                                                   2.1GHz                    3.5GHz                     3.9GHz                3.7GHz
+            Performance tier (DRAM)             16 GB DDR5                16 GB DDR5                 16 GB DDR4            16GB DDR5
+                   Capacity tier                  Agilex 7                  Agilex 7                  Optane 100        Micron CXL memory
+              (CXL or PM Memory)                16 GB DDR4                16 GB DDR4              256 GB DDR-T ×6            256GB ×4
+           Performance tier read latency         316 cycles                226 cycles                 249 cycles             391 cycles
+             Capacity tier read latency          854 cycles                737 cycles                 1077 cycles            712 cycles
+                  Performance tier
+                                               Read: 12/31.45            Read: 12/31.2             Read: 12.57/116         Read: 37.8/270
+                 bandwidth (GB/s)
+                                               Write: 20.8/28.5         Write: 22.3/23.67           Write: 8.67/85         Write: 89.8/272
+         Single Thread / Peak performance
+                   Capacity tier
+                                               Read: 4.5/21.7           Read: 4.45/22.3              Read: 4/40.1         Read: 20.25/83.2
+                 bandwidth (GB/s)
+                                               Write: 20.7/21.3         Write: 22.3/22.4            Write: 8.1/13.6       Write: 57.7/84.3
+         Single Thread/Peak performance
+
+           Table 1: The configurations of four testbeds and performance characteristics of various memory devices.
+
+          Workload Type        In progress Promotion          In progress Demotion            Steady Promotion           Steady demotion
+                              (1.2M|1M)/(15.9K|134K)/    (2.4M|2.2M)/(15.9K|140K)/           (0|3.3K)/(7.7K|104K)/     (424K|56K)/(0|104K)/
+            Small WSS
+                                    (1.16M|781K)                 (2.7M|1.5M)                         (82|74)                  (48K|0)
+                                   (4M|6M)/(0|0)/            (4.7M|6M)/(2|512)/             (1.8M|3.2M)/(17.4K|0)/    (1.9M|3.2M)/(16.9K|0)/
+           Medium WSS
+                                      (1.6M|5M)                  (2.5M|4.8M)                      (417K|1.6M)              (293K|1.4M)
+                                  (7M|5.9M)/(0|0)/           (7.2M|6.5M)/(0|15)/            (7.1M|5.2M)/(0|143K)/     (7.1M|5.3M)/(0|143K)/
+            Large WSS
+                                      (4.5M|7M)                  (4.1M|7.2M)                      (6.8M|8.8M)              (6.8M|8.9M)
+
+Table 2: The number of page promotions/demotions for read|write during the migration in progress and the stable phases for
+TPP/Memtis-Default/NOMAD. The data corresponds to Figure 7 for platform A.
+
+DRAM. We evaluated both CXL memory and persistent mem-                        systems, though it can be ported to AMD processors with
+ory (PM) as slow memory. Table 1 lists the performance char-                  Instruction-based Sampling (IBS). Thus, Memtis was not
+acteristics of the four platforms for single-threaded and peak                evaluated on platform D. Memtis works slightly differently
+(multi-threaded) performance. While CXL memory and PM                         on CXL-memory systems (platforms A and B) and the PM
+have distinct characteristics, including persistence, concurrent              system (platform C). LLC misses to CXL memory are re-
+performance, and read/write asymmetry, they achieve com-                      garded as uncore events on Intel platforms and thus cannot be
+parable performance within 2-3x of DRAM and provide a                         captured by PEBS. Therefore, Memtis relies solely on TLB
+similar programming interface as a CPUless memory node.                       misses and retired store instructions to infer page temperature
+To ensure a fair comparison, we only enabled one socket on                    on platforms A and B.
+each of the four platforms. Intel platforms were configured
+with 32 cores while the AMD platform had 84 cores.
+                                                                              4.1     Micro-benchmarks
+Baselines for comparison. We compared N OMAD with
+two state-of-the-art tired memory systems: TPP [44] and                       To evaluate the performance of N OMAD’s transactional page
+Memtis [37]. We evaluated both TPP and Nomad on Linux                         migration and shadowing mechanisms, we developed a micro-
+kernel v5.13-rc6 and ran Memtis on kernel v5.15.19, the ker-                  benchmark to precisely assess N OMAD in a controlled manner.
+nel version upon which Memtis was built and released. We                      This micro-benchmark involves 1) allocating data to specific
+tested two versions of Memtis – Memtis-Default and Memtis-                    segments of the tiered memory; 2) running tests with various
+QuickCool – with different data cooling speeds (i.e., the num-                working set sizes (WSS) and resident set sizes (RSS); and 3)
+ber of samples collected before halving a page’s access count).               generating memory accesses to the WSS data that mimic real-
+Specifically, Memtis-Default used the default cooling period                  world memory access patterns with a Zipfian distribution. We
+of 2,000k samples, while Memtis-QuickCool used a period                       created three scenarios representing small, medium, and large
+of 2k samples. A shorter cooling period encourages more                       WSS, as illustrated in Figure 6, to evaluate tiered memory
+frequent page migration between the memory tiers.                             management under different memory pressures. As platform
+                                                                              B behaved similarly to platform A in micro-benchmarks, it is
+   Memtis relies on Intel’s Processor Event-Based Sampling
+                                                                              excluded from the discussion.
+(PEBS) to track memory access patterns. It samples various
+hardware events, including LLC misses, TLB misses, and re-                    Small WSS. We began with a scenario with a small WSS
+tired store instructions, to infer accessed page addresses and                of 10 GB and a total RSS of 20 GB. Initially, we filled the
+build frequency-based histograms to aid in making migra-                      first 10 GB of local DRAM with the first half of the RSS
+tion decisions. Memtis currently only supports Intel-based                    data. Subsequently, we allocated 10 GB of WSS data as the
+
+
+
+USENIX Association                                 18th USENIX Symposium on Operating Systems Design and Implementation                        27
+                            TPP            Memtis-QuickCool              Memtis-Default            Nomad                                   TPP            Memtis-QuickCool               Memtis-Default            Nomad                                   TPP            Memtis-QuickCool               Memtis-Default            Nomad
+                   12500
+                                                                                                                                                                                                                                                  6000
+
+
+
+
+                                                                                                               Bandwidth (MB/s)
+
+
+
+
+                                                                                                                                                                                                                               Bandwidth (MB/s)
+Bandwidth (MB/s)
+
+
+
+
+                   10000                                                                                                          6000
+
+                    7500                                                                                                                                                                                                                          4000
+                                                                                                                                  4000
+                    5000
+                                                                                                                                  2000                                                                                                            2000
+                    2500
+
+                       0                                                                                                             0                                                                                                               0
+                                   Read                 Read                Write                Write                                           Read                 Read                  Write                Write                                           Read                 Read                  Write                Write
+                           Migration in progress   Migration stable Migration in progress   Migration stable                             Migration in progress   Migration stable   Migration in progress   Migration stable                             Migration in progress   Migration stable   Migration in progress   Migration stable
+
+
+                                  (a) Small working set size                                                                                 (b) Medium working set size                                                                                         (c) Large working set size
+
+                            Figure 7: Performance comparison between TPP, Memtis-Default, Memtis-QuickCool, and N OMAD on platform A.
+
+  second half of the RSS – 6 GB on the local DRAM and 4 GB                                                                                                                           tics in Table 2 show that Memtis performed significantly
+  on CXL memory (platforms A and D) and the PM (platform                                                                                                                             fewer page migrations. This explains its sub-optimal perfor-
+  C). The micro-benchmark continuously performed memory                                                                                                                              mance in the stable phase as most memory accesses were
+  reads or writes (following a Zipfian distribution) to this 10                                                                                                                      still served from slow memory. Second, a shorter cooling pe-
+  GB WSS data, spread across both the local DRAM and CXL                                                                                                                             riod in Memtis, which incentivizes more frequent migrations,
+  memory or PM. The frequently accessed, or “hot” data, was                                                                                                                          led to better performance. This also suggests that sampling-
+  uniformly distributed along the 10 GB WSS. In TPP and                                                                                                                              based memory access tracking may not accurately identify
+  N OMAD, accessing data on CXL memory or PM triggered                                                                                                                               and timely migrate hot pages to fast memory.
+  page migration to the local DRAM, with TPP performing                                                                                                                              Medium WSS. We increased the size of WSS and RSS to
+  this migration synchronously and N OMAD asynchronously.                                                                                                                            13.5 GB and 27 GB, respectively. Similarly, we placed the
+  In contrast, Memtis used a background thread to migrate hot                                                                                                                        first half of the RSS (13.5 GB) at the start of the local DRAM,
+  data from CXL memory or PM to the local DRAM. Due                                                                                                                                  followed by 2.5 GB of the WSS on the local DRAM, with the
+  to page migration, the 4 GB WSS data, initially allocated                                                                                                                          remaining 11 GB residing on CXL memory or PM. However,
+  to CXL memory or PM, was gradually moved to the local                                                                                                                              as the system (e.g., the OS kernel) required approximately
+  DRAM. Since the WSS was small (i.e., 10 GB), it could be                                                                                                                           3-4 GB of memory, the WSS could barely fit in the fast tier,
+  completely stored in the fast tier (i.e., local DRAM) after the                                                                                                                    resulting in occasional and substantial migrations even during
+  micro-benchmark reached a stable state.                                                                                                                                            the stable phase. Accurately identifying hot pages and avoid-
+    Figures 7 (a), 8 (a), and 9 (a) show that in the transient                                                                                                                       ing thrashing is crucial to achieving high performance for this
+ phase, during which page migration was conducted inten-                                                                                                                             medium-sized benchmark.
+ sively (i.e., migration in progress), both N OMAD and Memtis                                                                                                                           Unlike the small WSS case, Figures 7 (b), 8 (b), and 9 (b)
+ demonstrated similar performance regarding memory band-                                                                                                                             show that during the transient phase, N OMAD and TPP gen-
+ width for reads. Although page-fault-based page migration                                                                                                                           erally achieved lower performance for both read and write
+ in N OMAD could incur more overhead than the PEBS-based                                                                                                                             compared to Memtis. This is because, under the medium
+ approach in Memtis, when the WSS can fit in fast memory                                                                                                                             WSS, the system experienced higher memory pressure than
+ and no memory thrashing occurs, the benefit of migration                                                                                                                            in the small WSS case, causing N OMAD and TPP to conduct
+ outweighs its overhead. For writes, e.g., on platform A, N O -                                                                                                                      more page migrations (2x - 6x) and incur higher overhead
+ MAD incurred noticeable performance degradation compared                                                                                                                            than Memtis, as shown in Table 2. Many of such migrations
+ to Memtis due to possibly aborted migrations and the mainte-                                                                                                                        were futile during thrashing. Conversely, Memtis performed
+ nance of shadow pages. Note that N OMAD’s overhead varies                                                                                                                           significantly fewer page migrations and avoided the waste.
+ across platforms depending on the performance difference                                                                                                                            However, there was no evidence that Memtis effectively de-
+ between fast and slow memory. In contrast, Nomad consis-                                                                                                                            tected thrashing and throttled migration. The coarse-grained
+ tently outperformed TPP for both read and write, except for                                                                                                                         sampling was unable to accurately determine page tempera-
+ the slightly worse performance on platform C, highlighting                                                                                                                          ture in a volatile situation and inadvertently sustained high
+ the advantage of asynchronous page migration in N OMAD.                                                                                                                             performance under high memory pressure.
+    In the stable phase (i.e., migration stable), when most of                                                                                                                          In the stable phase, N OMAD significantly outperformed
+ the WSS data had been migrated from CXL memory or PM                                                                                                                                TPP in all cases, especially on platform D. These results show
+ to the local DRAM, both N OMAD and TPP achieved similar                                                                                                                             the benefit of N OMAD’s transactional page migration and non-
+ read/write bandwidth. This was because memory accesses                                                                                                                              exclusive memory tiering compared to TPP’s synchronous
+ were primarily served by the local DRAM with few page mi-                                                                                                                           page migration and exclusive tiering. On platform D, which
+ grations, as shown in Table 2. Memtis performed the worst,                                                                                                                          was equipped with an application-specific integrated circuit
+ achieving as low as 40% of the performance of the other two                                                                                                                         (ASIC)-based CXL memory implementation, the performance
+ approaches. We make two observations regarding Memtis’s                                                                                                                             gap between fast and slow memory narrows. Thus, the soft-
+ weaknesses. First, its stable phase performance is not drasti-                                                                                                                      ware overhead associated with synchronous page migration
+ cally different from the transient phase. The migration statis-                                                                                                                     was exacerbated and N OMAD offered more pronounced per-
+
+
+
+  28                       18th USENIX Symposium on Operating Systems Design and Implementation                                                                                                                                                                                               USENIX Association
+                            TPP            Memtis-QuickCool              Memtis-Default            Nomad                                                  TPP            Memtis-QuickCool               Memtis-Default                                 Nomad                                                TPP         Memtis-QuickCool              Memtis-Default            Nomad
+                                                                                                                                  10000
+                   10000                                                                                                                                                                                                                                                              6000
+
+
+
+
+                                                                                                                                                                                                                                                                   Bandwidth (MB/s)
+                                                                                                               Bandwidth (MB/s)
+Bandwidth (MB/s)
+
+
+
+
+                                                                                                                                     8000
+                    7500
+                                                                                                                                     6000                                                                                                                                             4000
+
+                    5000                                                                                                             4000
+                                                                                                                                                                                                                                                                                      2000
+                    2500                                                                                                             2000
+
+                       0                                                                                                                             0                                                                                                                                   0
+                                   Read                 Read                Write                Write                                                           Read                 Read                Write                                      Write                                              Read                       Read                  Write                Write
+                           Migration in progress   Migration stable Migration in progress   Migration stable                                             Migration in progress   Migration stable Migration in progress                         Migration stable                                Migration in progress         Migration stable   Migration in progress   Migration stable
+
+
+                                  (a) Small working set size                                                                                                (b) Medium working set size.                                                                                                                          (c) Large working set size
+
+                            Figure 8: Performance comparison between TPP, Memtis-Default, Memtis-QuickCool, and N OMAD on platform C.
+
+                                                      TPP                Nomad                                                                                                          TPP                                          Nomad                                                                                                 TPP                 Nomad
+                                                                                                                                                     15000
+                                                                                                                                                                                                                                                                                                            10000
+                   15000
+Bandwidth (MB/s)
+
+
+
+
+                                                                                                                                  Bandwidth (MB/s)
+
+
+
+
+                                                                                                                                                                                                                                                                                         Bandwidth (MB/s)
+                                                                                                                                                                                                                                                                                                             8000
+                                                                                                                                                     10000
+                   10000                                                                                                                                                                                                                                                                                     6000
+
+                                                                                                                                                                                                                                                                                                             4000
+                                                                                                                                                      5000
+                    5000
+                                                                                                                                                                                                                                                                                                             2000
+
+                           0                                                                                                                                  0                                                                                                                                                    0
+                                   Read              Read             Write              Write                                                                        Read              Read             Write                                   Write                                                                    Read            Read              Write             Write
+                                 Migration         Migration        Migration          Migration                                                                    Migration         Migration        Migration                               Migration                                                                Migration       Migration         Migration         Migration
+                                in progress         stable         in progress          stable                                                                     in progress         stable         in progress                               stable                                                                 in progress       stable          in progress         stable
+
+                             (a) Small working set size                                                                                                     (b) Medium working set size                                                                                                                            (c) Large working set size
+
+  Figure 9: Performance comparison between TPP and N OMAD on platform D with AMD Genoa processor. Memtis does not
+  support AMD’s instruction-based sampling (IBS) and thus was not tested.
+                                                                                                                                                                                                                                              TPP                  Memtis-QuickCool                                                  Memtis-Default                       Nomad
+ formance gains. Similarly, N OMAD achieved substantially
+                                                                                                                                                                                                      Average latency (CPU cycles)
+
+
+
+
+ higher performance in reads than Memtis and comparable per-
+                                                                                                                                                                                                                                     1000
+ formance in writes. Unlike in the small WSS case, in which
+                                                                                                                                                                                                                                      750
+ asynchronous and transactional page migration in N OMAD
+ contributed most to its performance benefit, the advantage of                                                                                                                                                                        500
+ page shadowing played a critical role in alleviating thrashing                                                                                                                                                                       250
+ in the medium WSS case. Under memory thrashing, most
+                                                                                                                                                                                                                                        0
+ demoted pages, which were recently promoted from the slow                                                                                                                                                                                    Migration
+                                                                                                                                                                                                                                             in progress
+                                                                                                                                                                                                                                                                   Migration
+                                                                                                                                                                                                                                                                    stable
+                                                                                                                                                                                                                                                                                                               Migration
+                                                                                                                                                                                                                                                                                                              in progress
+                                                                                                                                                                                                                                                                                                                                Migration
+                                                                                                                                                                                                                                                                                                                                 stable
+                                                                                                                                                                                                                                                                                                                                                    Migration
+                                                                                                                                                                                                                                                                                                                                                   in progress
+                                                                                                                                                                                                                                                                                                                                                                         Migration
+                                                                                                                                                                                                                                                                                                                                                                          stable
+ tier, can be simply discarded without migration. However,                                                                                                                                                                                           Small WSS                                                         Medium WSS                           Large WSS
+
+ for write-intensive workloads, page shadowing requires one
+ additional page fault for each write to restore a page’s original                                                                                                                                 Figure 10: The average cache line access latency on platform
+ read-write permission. This explains N OMAD’s inferior write                                                                                                                                      C. The benchmark is a point-chasing workload optimized for
+ performance in the stable phase compared to Memtis.                                                                                                                                               PEBS-based memory access tracking.
+ Large WSS. We scaled up the WSS and RSS both to 27                                                                                                                                                Limitations of PEBS-based approaches. Our evaluation re-
+ GB and fully populated local DRAM with the first 16 GB                                                                                                                                            vealed several issues with PEBS-based memory access track-
+ of the WSS. The remaining WSS spilled onto CXL memory                                                                                                                                             ing. While Memtis prevented excessive migrations during
+ or PM. Unlike the medium WSS that incurred intermittent                                                                                                                                           thrashing, it achieved sub-optimal performance and failed to
+ memory thrashing, this workload caused continuous and se-                                                                                                                                         migrate all hot data to fast memory even when the WSS could
+ vere thrashing as the size of hot data greatly exceeded the                                                                                                                                       fit in the fast tier. Due to the lack of hardware support for hot
+ capacity of fast memory. Figures 7 (c), 8 (c), and 9 (c) present                                                                                                                                  page tracking, PEBS-based approaches employ indirect met-
+ the performance results in both the transient phase and the                                                                                                                                       rics, such as LLC and TLB misses to sample recently accessed
+ stable phase. Compared to the tests with the medium-sized                                                                                                                                         addresses to infer page temperature. Sampling-based memory
+ workload in which N OMAD could outperform Memtis for                                                                                                                                              tracking has two fundamental limitations. First, there is a dif-
+ read-only benchmarks, especially in the stable phase, both                                                                                                                                        ficult tradeoff between sampling rate and tracking accuracy.
+ N OMAD and TPP performed worse than Memtis in almost                                                                                                                                              Second and most importantly, cache misses may not effec-
+ all scenarios. It suggests that page fault-based tiered mem-                                                                                                                                      tively capture hot pages. For most frequently accessed pages
+ ory management, which makes per-page migration decisions                                                                                                                                          that always hit the caches, Memtis fails to collect enough
+ upon access to a page, inevitably incurs high overhead during                                                                                                                                     (cache miss) samples to build the histogram. If such pages
+ severe memory thrashing. Nevertheless, N OMAD consistently                                                                                                                                        are evicted from the caches, e.g., due to conflict or coherence
+ and significantly outperformed TPP thanks to asynchronous,                                                                                                                                        misses, they will be falsely regarded as “cold” pages.
+ transactional page migration and page shadowing.                                                                                                                                                      To demonstrate these limitations, we created a favorable
+
+
+
+  USENIX Association                                                                                                                  18th USENIX Symposium on Operating Systems Design and Implementation                                                                                                                                                                           29
+              RSS              23GB     25GB    27GB     29GB                   TPP            Memtis-QuickCool           Memtis-Default          No Migration         Nomad
+                                                                              150
+     Total shadow page size   3.93GB   2.68GB   2.2GB   0.58GB
+
+
+
+
+                                                                 Throughput
+                                                                              100
+
+
+
+
+                                                                  (kOps/s)
+Table 3: Shadow memory size as RSS changes on platform B.
+                                                                               50
+The size of tiered memory (DRAM+CXL) is 30.7 GB.
+                                                                                0
+                                                                                    Case      Case    Case   Case      Case    Case   Case      Case    Case   Case Case Case
+scenario where Memtis can capture every page access. We                              1          2
+                                                                                           Platform A
+                                                                                                       3      1          2
+                                                                                                                    Platform B
+                                                                                                                                3      1          2
+                                                                                                                                             Platform C
+                                                                                                                                                         3      1     2
+                                                                                                                                                                 Platform D
+                                                                                                                                                                           3
+
+used a pointer-chasing benchmark that repeatedly accesses
+multiple fixed-sized (1 GB) memory blocks. Within each 1          Figure 11: Performance comparisons using Redis and YCSB
+GB block, the benchmark randomly accesses all cache lines         between TPP, Memtis-Default, Memtis-QuickCool, N OMAD,
+belonging to a block while accesses across blocks follow a        and “no migration”.
+Zipfian distribution. The number of blocks determines the
+WSS. Since the block size exceeds the LLC size in our             Note that the parameters of YCSB were set as default unless
+testbeds, every access generates an LLC miss that can be cap-     otherwise specified. Case 1: We set recordcount to 6 million
+tured by Memtis. Effective memory access tracking should          and operationcount to 8 million. After pre-loading the dataset,
+identify hot blocks and place them in fast memory.                we used a customized tool to demote all memory pages to
+   Figure 10 shows the average latency to access a cache line     the slow tier before starting the experiment. The RSS of this
+in this benchmark on platform C. Note that platform C with        case was 13GB. Case 2: We increased the RSS by setting
+PM was the only testbed on which Memtis has full tracking         recordcount to 10 million and operationcount to 12 million.
+capability and can capture all the PEBS events. According         We demoted all the memory pages to the slow tier in the same
+to Table 1, a latency closer to DRAM performance (∼250            way. The RSS of this case was 24GB. Case 3: We kept the
+cycles) indicates more effective page placement. As shown in      same total operations and RSS as Case 2. However, after pre-
+Figure 10, when the WSS exceeds fast tier capacity, Memtis        loading the dataset, we did not demote any memory pages.
+achieved latency close to slow memory performance, sug-              Consistent with the micro-benchmarking results, Figure 11
+gesting that most hot pages still resided in the slow tier. In    shows that N OMAD delivered superior performance (in terms
+comparison, page fault-based approaches, e.g., N OMAD and         of operations per second) compared to TPP across all plat-
+TPP, can timely migrate hot pages and achieve low latency.        forms in all cases. In addition, N OMAD outperformed Memtis
+Robustness. Page shadowing can potentially increase mem-          when the WSS was small (i.e., in case 1), but suffered more
+ory usage and in the worst case can cause OOM errors if           performance degradation as the WSS increased (i.e., in case 2
+shadow pages are not timely reclaimed. In this test, we evalu-    and 3) due to an increased number of page migrations and ad-
+ated N OMAD’s shadow page reclamation. We measured the            ditional overhead. Finally, all the page migration approaches
+total memory usage and the size of shadow memory using a          underperformed compared to the “no migration” baseline.
+micro-benchmark that sequentially scans a predefined RSS          It is because the memory accesses generated by the YCSB
+area. Table 3 shows the change of shadow pages as we var-         workload were mostly “random”, rendering migrating pages
+ied the RSS. The results suggest that N OMAD effectively          to the fast tier less effective, as those pages were unlikely to
+reclaimed shadow pages to reduce shadow memory usage as           be accessed again. It indicates once again that page migration
+RSS increased and approached memory capacity.                     could incur nontrivial overhead, and a strategy to dynamically
+                                                                  switch it on/off is needed.
+                                                                     We further increased the RSS of the database and opera-
+4.2      Real-world Applications                                  tions of YCSB by setting the recordcount to 20 million and
+We continued the evaluation of N OMAD using three repre-          operationcount to 30 million. The RSS for this case was
+sentative real-world applications with unique memory access       36.5GB, exceeding the total size of the tiered memory on
+patterns: Redis [10], PageRank [9], and Liblinear [5]. We ran     platforms A and B. Thus, the large RSS test was only per-
+these three applications on four platforms (as shown in Ta-       formed on platforms C and D. We tested two initial memory
+ble 1) with two configurations: 1) a small RSS (under 32 GB)      placement strategies for the database – 1) thrashing that allo-
+working with all platforms and 2) a large RSS (over 32 GB)        cated all pages first to the slow tier and immediately invoked
+only on platform C and D with large PM or CXL memory.             intensive page migrations, and 2) normal that prioritized page
+In addition, we include results from a “no migration” base-       allocation to fast memory and triggered page migration only
+line which disables page migrations to show whether tiered        under memory pressure. As shown in Figure 14, N OMAD out-
+memory management is necessary.                                   performed TPP due to its graceful performance degradation
+Key-value store. We first conducted experiments on a latency-     during thrashing but fell short of matching Memtis’s perfor-
+sensitive key-value database, Redis [10]. The workload was        mance. The initial placement strategy did not substantially
+generated from YCSB [11], using its update-heavy workload         affect the results and performance under different placements
+A, with a 50/50 distribution of read and write operations. We     eventually converged.
+crafted three cases with different RSS and total operations.      Graph-based computation. We used PageRank [9], an ap-
+
+
+
+30     18th USENIX Symposium on Operating Systems Design and Implementation                                                                  USENIX Association
+                                                  TPP                             Memtis-Default                 Nomad                  Workload type               Success : Aborted
+                                                  Memtis-QuickCool                No Migration
+                    1.20                                   1.3                                        1.10                    Liblinear (large RSS) on platform C        1:1.9
+ Normalized speed
+
+
+
+
+                                                                                2.00
+                    1.15                                                                                                      Liblinear (large RSS) on platform D        2.6:1
+                                                           1.2                                        1.05
+                                                                                1.75
+                    1.10                                                                                                       Redis (large RSS) on platform C           153:1
+                    1.05                                   1.1                  1.50                  1.00
+                                                                                                                               Redis (large RSS) on platform D          278.2:1
+                    1.00
+                                                                                1.25
+                                                           1.0                                        0.95
+                    0.95
+                                                                                1.00                                          Table 4: The Success rate of transactional migration.
+                    0.90                                   0.9                                        0.90
+                                             Platform A           Platform B            Platform C       Platform D
+
+                                                                                                                          Machine learning. Our final evaluation of N OMAD involved
+Figure 12: Performance comparisons of PageRank between                                                                    using the machine learning library Liblinear [5], known for
+non-migration, TPP, Memtis, and N OMAD. Performance is                                                                    its large-scale linear classification capabilities. We executed
+normalized to the approach with the lowest speed.                                                                         Liblinear with an L1 regularized logistic regression workload
+                                             TPP                           Memtis-Default                Nomad
+                                             Memtis-QuickCool              No Migration
+                                                                                                                          with an RSS of 10 GB. Prior to each execution, we used our
+                                       1.6                  1.6
+                                                                                  2.5
+                                                                                                        2.5               tool to demote all memory pages associated with the Liblinear
+                    Normalized speed
+
+
+
+
+                                       1.4                  1.4
+                                                                                                        2.0
+                                                                                                                          workload to the slower memory tier.
+                                                                                  2.0
+
+                                       1.2                  1.2
+                                                                                                                             Figure 13 demonstrates that both N OMAD and TPP signif-
+                                                                                                        1.5
+                                                                                  1.5                                     icantly outperformed “no migration” and Memtis across all
+                                       1.0                  1.0
+                                                                                  1.0                   1.0               platforms, with performance improvement ranging from 20%
+                                       0.8                  0.8
+                                              Platform A           Platform B            Platform C          Platform D   to 150%. This result further illustrates that when the WSS is
+                                                                                                                          smaller than the local DRAM, N OMAD and TPP can substan-
+Figure 13: Performance comparisons of Liblinear between                                                                   tially enhance application performance by timely migrating
+non-migration, TPP, Memtis, and N OMAD. Performance is                                                                    hot pages to the faster memory tier. Figure 16 shows that
+normalized to the approach with the lowest speed.                                                                         with a much larger model and RSS when running Liblinear,
+                                                                                                                          NOMAD consistently achieved high performance across all
+                                                                                                                          cases. In contrast, TPP’s performance significantly declined,
+plication used to rank web pages. It involves iterative com-
+                                                                                                                          likely due to inefficiency issues, as frequent, high bursts in
+putations to determine the rank of each page, based on the
+                                                                                                                          kernel CPU time were observed during TPP execution.
+link structures of the entire web. As the size of the dataset in-
+creases, the computational complexity also increases, making                                                              Migration success rate. As stated in Section 3.1, N OMAD’s
+it both memory-intensive and compute-intensive. We used a                                                                 transactional page migration may be aborted due to updates
+benchmark suite [8] to generate a synthetic uniform-random                                                                to the migrating page, resulting in wasted memory bandwidth
+graph comprising 226 vertices, each with an average of 20                                                                 and CPU cycles. Subsequent retries could also fail. A low
+edges. The RSS in this experiment was 22 GB, indicating that                                                              success rate could negatively affect application performance.
+the memory pages were distributed at both the local DRAM                                                                  Table 4 shows N OMAD’s migration success rate for Liblin-
+and remote CXL memory or PM.                                                                                              ear and Redis on platforms C and D. We chose a large RSS
+   Figure 12 illustrates that there was negligible variance in                                                            for both applications and ensured there were sufficient cross-
+performance between scenarios with page migrations (using                                                                 tier migrations. We observed a low success rate for Liblinear
+N OMAD and TPP) and without page migrations (no migra-                                                                    while Redis had a high success rate. Interestingly, this con-
+tion). The results suggest that: 1) For non-latency-sensitive                                                             trasted with N OMAD’s performance – it was excellent with
+applications, such as PageRank, using CXL memory can sig-                                                                 Liblinear but poor with Redis with large RSS. This suggests
+nificantly expand the local DRAM capacity without adversely                                                               that a high success rate in page migrations does not necessar-
+impacting application-level performance. 2) In such scenar-                                                               ily lead to high performance. A low success rate indicates that
+ios, page migration appears to be unnecessary. These findings                                                             the pages being migrated by N OMAD are also being modified
+also reveal that the overhead associated with N OMAD’s page                                                               by other processes, implying their “hotness”. Timely migra-
+migration minimally influences PageRank’s performance. Ad-                                                                tion of such pages can benefit ongoing and future accesses.
+ditionally, it was observed that among all evaluated scenarios,                                                           Summary. The results from micro-benchmarks and appli-
+Memtis exhibited the least efficient performance.                                                                         cations indicate that when the WSS was smaller than the
+   Figure 15 shows the case when we scaled the RSS to a                                                                   performance tier, N OMAD enabled workloads to maintain
+very large scale on platforms C & D. When the PageRank                                                                    higher performance than Memtis through asynchronous, trans-
+program started, it first used up to 100GB memory, then its                                                               actional page migrations. However, when the WSS was com-
+RSS size dropped to 45GB to 50GB. N OMAD achieved 2x                                                                      parable to or exceeded the performance tier capacity, leading
+the performance of TPP (both platforms) and slightly better                                                               to memory thrashing, the page-fault-based migration in N O -
+than Memtis (platform C), due to more frequent page migra-                                                                MAD became detrimental to workload performance, under-
+tions – the local DRAM (16 GB) was not large enough to                                                                    performing Memtis in write operations. Notably, N OMAD’s
+accommodate the WSS in this case.                                                                                         page shadowing feature preserved the efficiency of read opera-
+
+
+
+USENIX Association                                                                                    18th USENIX Symposium on Operating Systems Design and Implementation              31
+                                                                                        TPP                          Memtis-Default                         TPP                        Memtis-Default
+                            TPP                       Memtis-Default
+                                                                                        Memtis-QuickCool             Nomad                                  Memtis-QuickCool           Nomad
+                            Memtis-QuickCool          Nomad
+
+
+
+
+                                                                                                                                       Normalized speed
+Throughput (kOps/s)
+
+
+
+
+                                                                                                                                                                                       4
+
+
+
+
+                                                                            Normalized speed
+                                                                                               2                                                          1.4
+                      60
+                                                                                                                                                                                       3
+                      40                                                                                                                                  1.2
+                                                                                               1                                                                                       2
+                      20
+                                                                                                                                                          1.0
+                                                                                                                                                                                       1
+                       0                                                                                                                                        Thrashing     Normal   Thrashing Normal
+                             Thrashing       Normal   Thrashing Normal                         0
+                                    Platform C           Platform D                                Platform C       Platform D                                        Platform C           Platform D
+
+                           Figure 14: Redis (large RSS).                 Figure 15: Page ranking (large RSS).                                         Figure 16: Liblinear (large RSS).
+
+  tions even under severe memory thrashing, often maintaining                                                      Impact of Platform Characteristics: There exist difficult
+  comparable or superior performance to Memtis. In all test                                                     tradeoffs between page fault-based access tracking, such as
+  scenarios, N OMAD significantly outperformed the state-of-                                                    TPP and N OMAD, and hardware performance counter-based
+  the-art page-fault-based migration approach, TPP.                                                             memory access sampling like Memtis. While page fault-based
+     The evaluation results across four different platforms re-                                                 tracking effectively captures access recency, it can be poten-
+  veal the following observations: First, N OMAD generally per-                                                 tially expensive and on the critical path of program execution.
+  formed better on platform D, which was equipped with faster                                                   In comparison, hardware-based access sampling is off the
+  and larger CXL memory, compared to other platforms. Ad-                                                       critical path and captures access frequency. However, it is not
+  ditionally, the reduced performance gap between fast and                                                      responsive to workload changes and its accuracy relies on the
+  slow memory on platform D allowed N OMAD to achieve                                                           sampling rate. One advantage of N OMAD is that it is a page
+  greater performance gains than TPP, as the performance over-                                                  fault-based migration approach that is asynchronous and off
+  head from TPP’s synchronous page migration was more pro-                                                      the critical path. A potential future work is integrating N O -
+  nounced. Second, while platforms A and B showed similar                                                       MAD with hardware-based, access frequency tracking, such
+  behavior in micro-benchmarks, their application-level perfor-                                                 as Memtis, to enhance the current migration policy.
+  mance varied (slightly) across different applications, suggest-
+  ing that specific CPU features (differing between the off-the-                                                6      Conclusion
+  shelf Intel Sapphire Rapids CPU for platform A and the engi-
+  neering sample for platform B) may affect the performance                                                     This paper introduces non-exclusive memory tiering as an
+  of page migration under more realistic workloads.                                                             alternative to the common exclusive memory tiering strategy,
+                                                                                                                where each page is confined to either fast or slow memory.
+                                                                                                                The proposed approach, implemented in N OMAD, leverages
+  5                        Discussions and Future Work                                                          transactional page migration and page shadowing to enhance
+                                                                                                                page management in Linux. Unlike traditional page migra-
+ The key insight from N OMAD’s evaluation is that page mi-
+                                                                                                                tion, N OMAD ensures asynchronous migration and retains
+ gration, especially under memory pressure, has a detrimental
+                                                                                                                shadow copies of recently promoted pages. Through com-
+ impact on overall application performance. While N OMAD
+                                                                                                                prehensive evaluations, N OMAD demonstrates up to 6x per-
+ achieved graceful performance degradation and much higher
+                                                                                                                formance improvement over existing methods, addressing
+ performance than TPP, an approach based on synchronous
+                                                                                                                critical performance degradation issues in exclusive memory
+ page migration, its performance is sub-optimal compared to
+                                                                                                                tiering, especially under memory pressure. The paper calls for
+ that without page migration. When the program’s working set
+                                                                                                                further research in tiered memory-aware memory allocation.
+ exceeds the capacity of the fast tier, the most effective strategy
+ is to access pages directly from their initial placement, com-
+ pletely disabling page migration. It is straightforward to detect                                              7      Acknowledgments
+ memory thrashing, e.g., frequent and equal number of page
+ demotions and promotions, and disable page migrations. How-                                                    We thank our shepherd, Sudarsun Kannan, and the anonymous
+ ever, estimating the working set size to resume page migration                                                 reviewers for their constructive feedback. This work was sup-
+ becomes challenging, as the working set now spans multiple                                                     ported in part by NSF grants CCF-1845706, CNS-2415774,
+ tiers. It requires global memory tracking, which could be                                                      CCF-2415473, and the gift and equipment from Intel Labs
+ prohibitively expensive, to identify the hot data set that can                                                 and Micron Technology.
+ potentially be migrated to the fast tier. We plan to extend
+ N OMAD to unilaterally throttle page promotions and monitor
+ page demotions to effectively manage memory pressure on
+ the fast tier. Note that this would require the development
+ of a new page migration policy, which is orthogonal to the
+ N OMAD page migration mechanisms proposed in this work.
+
+
+
+  32                       18th USENIX Symposium on Operating Systems Design and Implementation                                                                               USENIX Association
+References                                                                    [21] B URNETT, N. C., B ENT, J., A RPACI -D USSEAU , A. C., AND A RPACI -
+                                                                                   D USSEAU , R. H. Exploiting Gray-Box knowledge of Buffer-Cache
+ [1] https://www.computeexpresslink.org/.                                          management. In 2002 USENIX Annual Technical Conference (USENIX
+                                                                                   ATC 02) (Monterey, CA, June 2002), USENIX Association.
+ [2] Autonuma: the other approach to numa scheduling. https://lwn.
+     net/Articles/488709/.                                                    [22] C HEN , F., KOUFATY, D. A., AND Z HANG , X. Hystor: Making the
+                                                                                   best use of solid state drives in high performance storage systems. In
+ [3] Damon-based reclamation.       https://docs.kernel.org/
+                                                                                   Proceedings of the international conference on Supercomputing (2011),
+     admin-guide/mm/damon/reclaim.html#:~:text=DAMON%
+                                                                                   pp. 22–32.
+     2Dbased%20Reclamation%20(DAMON_RECLAIM),of%20memory%
+     20pressure%20and%20requirements.                                         [23] C HOU , C., JALEEL , A., AND Q URESHI , M. Batman: Techniques
+                                                                                   for maximizing system bandwidth of memory systems with stacked-
+ [4] https://blocksandfiles.com/2023/11/20/accelerating-high-bandwidth-            dram. In Proceedings of the International Symposium on Memory
+     memory-to-light-speed/. https://blocksandfiles.com/2023/11/                   Systems (New York, NY, USA, 2017), MEMSYS ’17, Association for
+     20/accelerating-high-bandwidth-memory-to-light-speed/.                        Computing Machinery, p. 268–280.
+ [5] https://www.csie.ntu.edu.tw/ cjlin/libsvmtools/multicore-liblinear/.     [24] D URAISAMY, P., X U , W., H ARE , S., R AJWAR , R., C ULLER , D.,
+ [6] Intel agilex® 7 fpga and soc fpga. https://www.intel.com/                     X U , Z., FAN , J., K ENNELLY, C., M C C LOSKEY, B., M IJAILOVIC , D.,
+     content/www/us/en/products/details/fpga/agilex/7.html.                        M ORRIS , B., M UKHERJEE , C., R EN , J., T HELEN , G., T URNER , P.,
+                                                                                   V ILLAVIEJA , C., R ANGANATHAN , P., AND VAHDAT, A. Towards an
+ [7] Intel  optane   dimm.            https://www.intel.com/                       adaptable systems architecture for memory tiering at warehouse-scale.
+     content/www/us/en/architecture-and-technology/                                In Proceedings of the 28th ACM International Conference on Archi-
+     optane-dc-persistent-memory.html.                                             tectural Support for Programming Languages and Operating Systems,
+ [8] Pagerank. https://github.com/sbeamer/gapbs.                                   Volume 3 (New York, NY, USA, 2023), ASPLOS 2023, Association for
+                                                                                   Computing Machinery, p. 727–741.
+ [9] Pagerank wiki. https://en.wikipedia.org/wiki/PageRank.
+                                                                              [25] F ORNEY, B. C., AND A RPACI -D USSEAU , A. C. Storage-Aware
+[10] Redis. https://redis.io/.                                                     caching: Revisiting caching for heterogeneous storage systems. In
+[11] Ycsb. https://github.com/brianfrankcooper/YCSB.                               Conference on File and Storage Technologies (FAST 02) (Monterey,
+                                                                                   CA, Jan. 2002), USENIX Association.
+[12] Caching less for better performance: Balancing cache size and update
+     cost of flash memory cache in hybrid storage systems. In 10th USENIX     [26] G UERRA , J., P UCHA , H., G LIDER , J., B ELLUOMINI , W., AND R AN -
+                                                                                   GASWAMI , R. Cost effective storage using extent based dynamic
+     Conference on File and Storage Technologies (FAST 12) (San Jose, CA,
+     Feb. 2012), USENIX Association.                                               tiering. In 9th USENIX Conference on File and Storage Technologies
+                                                                                   (FAST 11) (San Jose, CA, Feb. 2011), USENIX Association.
+[13] A BULILA , A., M AILTHODY, V. S., Q URESHI , Z., H UANG , J., K IM ,
+                                                                              [27] H OLLAND , D. A., A NGELINO , E., WALD , G., AND S ELTZER , M. I.
+     N. S., X IONG , J., AND H WU , W.- M . Flatflash: Exploiting the byte-
+                                                                                   Flash caching on the storage client. In 2013 USENIX Annual Technical
+     accessibility of ssds within a unified memory-storage hierarchy. In
+                                                                                   Conference (USENIX ATC 13) (San Jose, CA, June 2013), USENIX
+     Proceedings of the Twenty-Fourth International Conference on Archi-
+                                                                                   Association, pp. 127–138.
+     tectural Support for Programming Languages and Operating Systems
+     (2019), pp. 971–985.                                                     [28] I NTEL®. Remote action request –white paper. revision 1.0 (2021).
+                                                                                   https://www.intel.com/content/dam/develop/external/us/
+[14] AGARWAL , N., AND W ENISCH , T. F. Thermostat: Application-
+                                                                                   en/documents/341431-remote-action-request-white-paper.
+     transparent page management for two-tiered main memory. SIGPLAN
+                                                                                   pdf.
+     Not. 52, 4 (apr 2017), 631–644.
+                                                                              [29] J IANG , S., D ING , X., C HEN , F., TAN , E., AND Z HANG , X. DULO:
+[15] A HMADIAN , S., S ALKHORDEH , R., AND A SADI , H. Lbica: A load               An effective buffer cache management scheme to exploit both temporal
+     balancer for i/o cache architectures. In 2019 Design, Automation Test         and spatial localities. In 4th USENIX Conference on File and Storage
+     in Europe Conference Exhibition (DATE) (2019), pp. 1196–1201.                 Technologies (FAST 05) (San Francisco, CA, Dec. 2005), USENIX
+[16] A LIAN , M., S HIN , J., K ANG , K.-D., WANG , R., DAGLIS , A., K IM ,        Association.
+     D., AND K IM , N. S. Idio: Orchestrating inbound network data on         [30] J UN , H., C HO , J., L EE , K., S ON , H.-Y., K IM , K., J IN , H., AND K IM ,
+     server processors. IEEE Computer Architecture Letters 20, 1 (2021),           K. Hbm (high bandwidth memory) dram technology and architecture.
+     30–33.                                                                        In 2017 IEEE International Memory Workshop (IMW) (2017), IEEE,
+[17] AMD.      Zynq ultrascale+ device technical reference man-                    pp. 1–4.
+     ual (ug1085), 2023.        https://docs.amd.com/r/en-US/                 [31] J UNG , M. Hello bytes, bye blocks: Pcie storage meets compute express
+     ug1085-zynq-ultrascale-trm/TLB-Maintenance-Operations.                        link for memory expansion (cxl-ssd). HotStorage ’22, Association for
+[18] ARM. Learn the architecture - aarch64 memory management                       Computing Machinery, p. 45–51.
+     guide, 2024.   https://developer.arm.com/documentation/                  [32] K IM , J., C HOE , W., AND A HN , J. Exploring the design space of
+     101811/0103/Translation-Lookaside-Buffer-maintenance/                         page management for Multi-Tiered memory systems. In 2021 USENIX
+     Format-of-a-TLB-operation.                                                    Annual Technical Conference (USENIX ATC 21) (July 2021), USENIX
+[19] B ERGMAN , S., FALDU , P., G ROT, B., V ILANOVA , L., AND S ILBER -           Association, pp. 715–728.
+     STEIN , M. Reconsidering os memory optimizations in the presence of      [33] K IM , Y., G UPTA , A., U RGAONKAR , B., B ERMAN , P., AND S IVA -
+     disaggregated memory. In Proceedings of the 2022 ACM SIGPLAN In-              SUBRAMANIAM , A. Hybridstore: A cost-efficient, high-performance
+     ternational Symposium on Memory Management (New York, NY, USA,                storage system combining ssds and hdds. In 2011 IEEE 19th Annual
+     2022), ISMM 2022, Association for Computing Machinery, p. 1–14.               International Symposium on Modelling, Analysis, and Simulation of
+[20] B OCK , S., C HILDERS , B. R., M ELHEM , R., AND M OSSÉ , D. Con-             Computer and Telecommunication Systems (2011), pp. 227–236.
+     current page migration for mobile systems with os-managed hybrid         [34] KOLLER , R., M ARMOL , L., R ANGASWAMI , R., S UNDARARAMAN ,
+     memory. In Proceedings of the 11th ACM Conference on Comput-                  S., TALAGALA , N., AND Z HAO , M. Write policies for host-side flash
+     ing Frontiers (New York, NY, USA, 2014), CF ’14, Association for              caches. In 11th USENIX Conference on File and Storage Technologies
+     Computing Machinery.                                                          (FAST 13) (San Jose, CA, Feb. 2013), USENIX Association, pp. 45–58.
+
+
+
+
+USENIX Association                                     18th USENIX Symposium on Operating Systems Design and Implementation                                   33
+[35] KOLLER , R., M ASHTIZADEH , A. J., AND R ANGASWAMI , R. Centaur:           [49] S OUNDARARAJAN , G., P RABHAKARAN , V., BALAKRISHNAN , M.,
+     Host-side ssd caching for storage performance control. In 2015 IEEE             AND W OBBER , T. Extending ssd lifetimes with disk-based write
+     International Conference on Autonomic Computing (2015), pp. 51–60.              caches. In Proceedings of the 8th USENIX Conference on File and
+                                                                                     Storage Technologies (USA, 2010), FAST’10, USENIX Association,
+[36] K WON , Y., F INGLER , H., H UNT, T., P ETER , S., W ITCHEL , E., AND
+                                                                                     p. 8.
+     A NDERSON , T. Strata: A cross media file system. In Proceedings of the
+     26th Symposium on Operating Systems Principles (2017), pp. 460–477.        [50] S UN , Y., Y UAN , Y., Y U , Z., K UPER , R., J EONG , I., WANG , R., AND
+                                                                                     K IM , N. S. Demystifying cxl memory with genuine cxl-ready systems
+[37] L EE , T., M ONGA , S. K., M IN , C., AND E OM , Y. I. Memtis: Efficient        and devices. ArXiv abs/2303.15375 (2023).
+     memory tiering with dynamic page classification and page size deter-
+     mination. In Proceedings of the 29th Symposium on Operating Systems        [51] W U , K., G UO , Z., H U , G., T U , K., A LAGAPPAN , R., S EN , R., PARK ,
+     Principles (New York, NY, USA, 2023), SOSP ’23, Association for                 K., A RPACI -D USSEAU , A. C., AND A RPACI -D USSEAU , R. H. The
+     Computing Machinery, p. 17–34.                                                  storage hierarchy is not a hierarchy: Optimizing caching on modern
+                                                                                     storage devices with orthus. In 19th USENIX Conference on File and
+[38] L I , H., B ERGER , D. S., H SU , L., E RNST, D., Z ARDOSHTI , P., N O -        Storage Technologies (FAST 21) (2021), pp. 307–323.
+     VAKOVIC , S., S HAH , M., R AJADNYA , S., L EE , S., AGARWAL , I.,
+                                                                                [52] W U , X., AND R EDDY, A. N. Exploiting concurrency to improve
+     ET AL . Pond: Cxl-based memory pooling systems for cloud platforms.
+                                                                                     latency and throughput in a hybrid storage system. In 2010 IEEE
+     In Proceedings of the 28th ACM International Conference on Archi-
+                                                                                     International Symposium on Modeling, Analysis and Simulation of
+     tectural Support for Programming Languages and Operating Systems,
+                                                                                     Computer and Telecommunication Systems (2010), pp. 14–23.
+     Volume 2 (2023), pp. 574–587.
+                                                                                [53] X IANG , L., Z HAO , X., R AO , J., J IANG , S., AND J IANG , H. Character-
+[39] L IN , Z., X IANG , L., R AO , J., AND L U , H. P2CACHE: Exploring              izing the performance of intel optane persistent memory: a close look
+     tiered memory for In-Kernel file systems caching. In 2023 USENIX                at its on-dimm buffering. In Proceedings of the Seventeenth European
+     Annual Technical Conference (USENIX ATC 23) (Boston, MA, July                   Conference on Computer Systems (2022), pp. 488–505.
+     2023), USENIX Association, pp. 801–815.
+                                                                                [54] YAN , Z., L USTIG , D., N ELLANS , D., AND B HATTACHARJEE , A. Nim-
+[40] L IN , Z., X IANG , L., R AO , J., AND L U , H. P2CACHE: Exploring              ble page management for tiered memory systems. In Proceedings of
+     tiered memory for In-Kernel file systems caching. In 2023 USENIX                the Twenty-Fourth International Conference on Architectural Support
+     Annual Technical Conference (USENIX ATC 23) (Boston, MA, July                   for Programming Languages and Operating Systems (New York, NY,
+     2023), USENIX Association, pp. 801–815.                                         USA, 2019), ASPLOS ’19, Association for Computing Machinery,
+[41] L IU , K., Z HANG , X., DAVIS , K., AND J IANG , S. Synergistic coupling        p. 331–345.
+     of ssd and hard disk for qos-aware virtual memory. In 2013 IEEE            [55] YANG , J., K IM , J., H OSEINZADEH , M., I ZRAELEVITZ , J., AND
+     International Symposium on Performance Analysis of Systems and                  S WANSON , S. An empirical guide to the behavior and use of scalable
+     Software (ISPASS) (2013), pp. 24–33.                                            persistent memory. In Proceedings of the 18th USENIX Conference
+                                                                                     on File and Storage Technologies (USA, 2020), FAST’20, USENIX
+[42] L OH , G. H., JAYASENA , N., C HUNG , J., R EINHARDT, S. K.,
+                                                                                     Association, p. 169–182.
+     O’C ONNOR , J. M., AND M C G RATH , K. J. Challenges in hetero-
+     geneous die-stacked and off-chip memory systems.                           [56] YANG , J., K IM , J., H OSEINZADEH , M., I ZRAELEVITZ , J., AND
+                                                                                     S WANSON , S. An empirical guide to the behavior and use of scalable
+[43] M ARUF, A., G HOSH , A., B HIMANI , J., C AMPELLO , D., RUDOFF ,                persistent memory. In 18th USENIX Conference on File and Stor-
+     A., AND R ANGASWAMI , R. Multi-clock: Dynamic tiering for hybrid                age Technologies (FAST 20) (Santa Clara, CA, Feb. 2020), USENIX
+     memory systems. In 2022 IEEE International Symposium on High-                   Association, pp. 169–182.
+     Performance Computer Architecture (HPCA) (Los Alamitos, CA, USA,
+     apr 2022), IEEE Computer Society, pp. 925–937.                             [57] YANG , Q., AND R EN , J. I-cash: Intelligently coupled array of ssd and
+                                                                                     hdd. In 2011 IEEE 17th International Symposium on High Performance
+[44] M ARUF, H. A., WANG , H., D HANOTIA , A., W EINER , J., AGARWAL ,               Computer Architecture (2011), pp. 278–289.
+     N., B HATTACHARYA , P., P ETERSEN , C., C HOWDHURY, M., K ANAU -
+     JIA , S., AND C HAUHAN , P. Tpp: Transparent page placement for cxl-
+     enabled tiered-memory. In Proceedings of the 28th ACM International
+     Conference on Architectural Support for Programming Languages and
+     Operating Systems, Volume 3 (New York, NY, USA, 2023), ASPLOS
+     2023, Association for Computing Machinery, p. 742–755.
+[45] M ESWANI , M. R., B LAGODUROV, S., ROBERTS , D., S LICE , J., I GNA -
+     TOWSKI , M., AND L OH , G. H. Heterogeneous memory architectures:
+     A hw/sw approach for mixing die-stacked and off-package memories.
+     In 2015 IEEE 21st International Symposium on High Performance
+     Computer Architecture (HPCA) (2015), pp. 126–136.
+[46] PAPAGIANNIS , A., X ANTHAKIS , G., S ALOUSTROS , G., M ARAZAKIS ,
+     M., AND B ILAS , A. Optimizing memory-mapped {I/O} for fast storage
+     devices. In 2020 USENIX Annual Technical Conference (USENIX ATC
+     20) (2020), pp. 813–827.
+[47] RUAN , Z., S CHWARZKOPF, M., AGUILERA , M. K., AND B ELAY,
+     A. {AIFM}:{High-Performance},{Application-Integrated} far mem-
+     ory. In 14th USENIX Symposium on Operating Systems Design and
+     Implementation (OSDI 20) (2020), pp. 315–332.
+[48] S IM , J., L OH , G. H., K IM , H., OC ONNOR , M., AND T HOTTETHODI ,
+     M. A mostly-clean dram cache for effective hit speculation and self-
+     balancing dispatch. In 2012 45th Annual IEEE/ACM International
+     Symposium on Microarchitecture (2012), pp. 247–257.
+
+
+
+
+34    18th USENIX Symposium on Operating Systems Design and Implementation                                                          USENIX Association
+A    Artifact Appendix
+
+Abstract
+The artifact contains the source code of N OMAD, TPP, and
+Memtis for reproducing the results and graphs presented in
+the paper. The code works on platforms with Persistent Mem-
+ory, Intel Agilex CXL memory, and/or Micron CXL memory.
+To facilitate the reproduction, we have provided a collection
+of scripts for compiling and installing these approaches, exe-
+cuting the experiments, collecting logs, and creating graphs.
+More details are available in the "README.md" file.
+
+Scope
+This artifact demonstrates N OMAD’s strengths and weak-
+nesses over TPP and Memtis across various scenarios and
+platforms, as elaborated in the Evaluation section.
+   It is open-source and can be used for further research, de-
+velopment, or other purposes by the community.
+
+Contents
+N OMAD, TPP and Memtis implementation. We provide
+two separate patches to enable N OMAD and TPP to work with
+the upstream kernel version v5.13-rc6. In particular, the TPP
+patch comes from the Linux community email discussions.
+Memtis, on the other hand, is directly incorporated from its
+original artifact, with a few minor bugs fixed.
+Documentation The "Reproducing Paper Results" section of
+"README.md" provides a step-by-step guide for reproduc-
+ing the results in the paper. This guide includes instructions
+for compiling the three implementations (i.e., N OMAD, TPP,
+and Memtis), running the experiments, and generating the
+graphs as presented in the paper.
+
+Hosting
+Artifact link: https://github.com/lingfenghsiang/Nomad
+Artifact license: GNU GPL V3.0
+Artifact version tag: v0.0
+
+Requirements
+To reproduce the results in the paper, the system under test
+requires one NUMA node with a CPU and another CPU-
+less NUMA node. If the system has more NUMA nodes, the
+operating system might encounter unexpected errors. Addi-
+tionally, Memtis is only fully functional on platforms with
+Optane Persistent Memory. More details are included in the
+"Prerequisites" section of "README.md".
+
+
+
+
+USENIX Association                           18th USENIX Symposium on Operating Systems Design and Implementation   35
+

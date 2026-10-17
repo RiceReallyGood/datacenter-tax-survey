@@ -1,0 +1,974 @@
+Skyloft: A General High-Efficient Scheduling Framework
+                     in User Space
+                              Yuekai Jia†∗ , Kaifu Tian†∗ , Yuyang You† , Yu Chen‡† , Kang Chen†
+                                                          † Tsinghua University, Beijing, China
+                                                         ‡ Quan Cheng Laboratory, Jinan, China
+
+
+Abstract                                                                              1   Introduction
+Skyloft is a general and highly efficient user-space schedul-                         Cloud computing increasingly demands highly optimized
+ing framework. It leverages user-mode interrupt to deliver                            and customized scheduling policies to enhance performance
+and process hardware timers directly in user space. This                              across key metrics such as tail latency, throughput, and re-
+capability enables Skyloft to achieve µs-scale preemption.                            source utilization [21, 30, 45]. For distributed services within
+Skyloft offers a set of scheduling interfaces that supports dif-                      an application, improved scheduling is crucial for reducing
+ferent scheduling policies, including both preemptive and non-                        tail latency, as demonstrated in large-scale RPC systems at
+preemptive ones. Operating as a user-space scheduling frame-                          Google [51]. Additionally, for varying workloads, application-
+work, Skyloft is compatible with Linux and integrates seam-                           specific scheduling is essential to meet service level objectives
+lessly with high-performance I/O frameworks like DPDK.                                (SLOs) [16, 28, 30, 47].
+   Evaluation results show that optimizations in per-CPU                                 Efforts have been made to customize Linux schedulers
+scheduling with user-space timer interrupts allow Skyloft’s                           using user agents [26], live updates [37], and the Berkeley
+Completely Fair Scheduler (CFS) and Round Robin (RR) to                               Packet Filter (BPF) [25], among others. However, scheduling
+significantly reduce wake-up latency compared to their Linux                          threads through the kernel introduces performance overhead
+counterparts (100µs vs. 10000µs). In comparison to the gen-                           due to frequent mode switches and reduced locality [53].
+eral scheduling framework ghOSt, Skyloft achieves a 1.2×                              Developing scheduling policies within the kernel is either
+increase in maximum throughput for Latency Critical (LC)                              constrained by limited interfaces [25] or requires significant
+applications. Additionally, unlike the specialized scheduling                         modifications to the kernel’s scheduling subsystem [26]. Ad-
+framework Shinjuku, Skyloft not only supports LC appli-                               ditionally, kernel-level scheduling cannot take full advantage
+cations but also efficiently allocates CPU resources to Best                          of widely deployed kernel-bypass drivers and frameworks,
+Effort (BE) applications under low load conditions. By incor-                         such as DPDK and SPDK [12, 18].
+porating a 5µs preemption mechanism into the Work-Stealing                               Recent works manage threads in user space and make
+strategy, a RocksDB Server running on Skyloft exhibits a per-                         scheduling decisions without kernel intervention for perfor-
+formance improvement of 1.9× compared to Shenango.                                    mance [32, 35, 52]. However, none of these approaches are
+                                                                                      sufficiently flexible to support both µs-scale preemption and
+CCS Concepts: • Software and its engineering → Schedul-
+                                                                                      multiple applications to offer the same level of versatility in
+ing.
+                                                                                      scheduling policies as their kernel-based counterparts.
+Keywords: Operating systems, Scheduling, User interrupts                                 µs-scale preemption is crucial for meeting today’s strin-
+ACM Reference Format:                                                                 gent µs-scale tail latency SLOs. In datacenter applications,
+Yuekai Jia, Kaifu Tian, Yuyang You, Yu Chen, and Kang Chen.                           the First Come, First Served (FCFS) policy is widely used and
+2024. Skyloft: A General High-Efficient Scheduling Framework                          performs well for workloads with light-tailed distributions
+in User Space. In ACM SIGOPS 30th Symposium on Operating                              (e.g., Meta’s USR workload [3] in Memcached). However, it
+Systems Principles (SOSP ’24), November 4–6, 2024, Austin, TX,                        suffers from head-of-line blocking for workloads with heavy-
+USA. ACM, New York, NY, USA, 15 pages. https://doi.org/10.1145/                       tailed distributions [16, 28, 30]. For instance, RocksDB can
+3694715.3695973                                                                       process GET requests within 10 microseconds, but range
+* Both authors contributed equally to this research.                                  queries may take hundreds of microseconds or even millisec-
+                                                                                      onds to complete. Consequently, schedulers must support
+Permission to make digital or hard copies of all or part of this work for             preemptive scheduling to implement a Processor Sharing (PS)
+personal or classroom use is granted without fee provided that copies are not
+made or distributed for profit or commercial advantage and that copies bear
+                                                                                      policy for heavy-tailed workloads [59]. User-space schedulers
+this notice and the full citation on the first page. Copyrights for third-party       like ZygOS [48] and Shenango [45] lack support for preemp-
+components of this work must be honored. For all other uses, contact the              tion within a single application. Other user-space schedulers
+owner/author(s).                                                                      [8, 52] rely on Linux signals for preemption, which introduces
+SOSP ’24, November 4–6, 2024, Austin, TX, USA                                         extra overheads.
+© 2024 Copyright held by the owner/author(s).                                            Supporting multiple applications is essential for improving
+ACM ISBN 979-8-4007-1251-7/24/11
+https://doi.org/10.1145/3694715.3695973
+                                                                                      CPU efficiency. Schedulers must dynamically allocate unused
+                                                                                  1
+cores from latency-critical (LC) applications to best-effort            Skyloft provides a set of scheduling operations to facilitate the
+(BE) applications and swiftly reallocate cores back to LC               implementation of various scheduling policies. A scheduler
+applications to handle burst loads. Shinjuku [30] and Con-              can leverage these operations, such as task_enqueue and
+cord [28] implement µs-scale preemptive scheduling through              task_dequeue, to define custom policies.
+posted interrupts using virtual machines and compiler instru-              To evaluate Skyloft, we implement several per-CPU
+mentation, optimizing both tail latency and throughput for              scheduling policies and achieve wakeup latencies that are
+workloads with light- and heavy-tailed distributions. How-              orders of magnitude lower on schbench [39] compared
+ever, these systems do not support core sharing with other              to native Linux schedulers (§5.1). We also implement a
+applications to enhance CPU efficiency at low loads, as they            centralized policy and evaluate Skyloft using synthetic work-
+dedicate cores exclusively to a single application.                     loads, demonstrating that Skyloft can achieve 1.2× higher
+   To enable universal user-space scheduling that supports              maximum throughput than ghOSt [26], while maintaining
+both µs-scale preemption and multiple applications, we pro-             a comparable core share for batch applications (§5.2). For
+pose Skyloft, a general user-space scheduling framework de-             real-world applications, we implement a work-stealing policy,
+signed to achieve the following goals.                                  where Skyloft delivers performance similar to Shenango on
+   High Flexibility. Skyloft provides flexible support for var-         Memcached. After enabling preemption for the work-stealing
+ious scheduling policies across multiple applications. It ac-           policy, Skyloft achieves 1.2× higher performance than
+commodates both preemptive and non-preemptive schedul-                  Shenango on a RocksDB server, while maintaining identical
+ing policies, allowing efficient management of threads both             tail-latency SLOs (§5.3). Finally, we show that Skyloft’s
+among applications and within individual applications.                  preemption overhead is 0.6µs from sending an interrupt on
+   High Efficiency. Skyloft supports µs-scale preemption,               one core to handling the interrupt on another core, and 0.3µs
+enabling it to efficiently implement preemption-based sched-            to handle a timer interrupt, nearly 10x faster than a soft timer
+uling policies. To achieve this, Skyloft needs to support light-        (§5.4).
+weight context switching, efficient interrupt management, fast             The main contributions of this paper are:
+resource allocation and synchronization primitives for effec-                • Skyloft supports kernel-bypass preemption by leverag-
+tive management of user-level threads.                                         ing a new hardware feature (UINTR). To the best of
+   High Compatibility. Skyloft is fully compatible with                        our knowledge, Skyloft is the first general user-space
+kernel-bypass I/O frameworks, such as DPDK, allowing                           framework to support µs-scale preemptive scheduling
+high-performance I/O operations. Furthermore, Skyloft                          for multiple applications.
+seamlessly coexists with Linux, offering flexibility in                      • Skyloft proposes a paradigm to develop various sched-
+deployment. Applications have the freedom to choose                            ulers with a set of general operations. Based on Skyloft,
+between utilizing Linux’s native schedulers or leveraging                      scheduling policies – previously requiring significant
+Skyloft’s custom scheduling mechanisms, based on their                         modifications to specialized schedulers – can be imple-
+specific performance or operational requirements.                              mented in just hundreds of lines of code.
+   Achieving µs-scale preemption and efficient multi-                        • Skyloft achieves comparable or even better perfor-
+application switching is challenging. Both are closely tied to                 mance than existing works on both synthetic and
+privileged operations typically restricted by the kernel, such                 real-world workloads for popular applications.
+as interrupt handling and page table management.
+   For µs-scale preemption, Skyloft leverages a new hard-               2     Motivation
+ware feature, User Interrupts (UINTR), introduced in Intel              2.1   User-Space Scheduling Frameworks
+Sapphire Rapids processors [13]. This feature enables user-
+space programs to register, deliver, and handle interrupts with         The user-space scheduling frameworks [5, 21, 26, 30, 45,
+minimal configuration overhead from initialization by the               48, 49] are proposed to achieve both flexibility and perfor-
+kernel. Both user-level threads and hardware components can             mance, as with other modern kernel-bypass frameworks [12,
+act as interrupt senders. Skyloft supports both centralized             18, 29, 33, 47, 60]. Based on the generality, user-space sched-
+preemptive scheduling and per-CPU preemptive scheduling,                uling frameworks can be classified based on two dimensions:
+closely resembling the native Linux schedulers. By utilizing            whether or not a scheduling framework can support (1) µs-
+the per-CPU hardware timer design (x86 LAPIC), Skyloft                  scale preemption; or (2) multiple applications.
+handles timer interrupts in user space, offering improved               Microsecond-scale preemptive scheduling. Non-preemptive
+scalability compared to dispatchers or timers simulated via             scheduling policies are usually used in user space. For exam-
+Inter-Processor Interrupts (IPI).                                       ple, with the run-to-completion policy, a task never switches
+   To support multiple applications, Skyloft avoids reliance            to another task throughout its lifetime. The cooperative policy
+on a global controller for making decisions. Instead, it utilizes       allows switching to another task during execution, but the
+a main loop on each core, benefiting from a clean interface             switch is invoked by the task itself at a deterministic switch
+between the user and kernel for efficient application switching.        point (e.g., yield or await). For short-lived RPC requests (such
+                                                                    2
+                      0.08 μs
+ User IPI                       SENDUIPI                                                          Scheduling µs-scale    Multiple
+              User
+ Sender                                                                                              unit    preemption applications
+                                0.3 μs                                       IX[5], ZygOS[48]       uthread          ✘             ✘
+ User IPI                                                                    Shinjuku [30]          uthread          ✔             ✘
+              User
+ Receiver                0.6 μs    UINTR handler &                           Shenango [45]          uthread          ✘             ✔
+                                     reschedule
+                         0.6 μs                                              ghOSt [26]             kthread          ✔             ✔
+Kernel IPI User
+                                  sys_kill                                   Skyloft                uthread          ✔             ✔
+ Sender Kernel
+                                  0.8 μs
+                                                  3.2 μs                    Table 1. Comparison of different schedulers. Scheduling unit
+Kernel IPI User                                                             denotes the minimum scheduling unit (uthread for user-level
+Receiver Kernel                                                             thread, while kthread for Linux task_struct).
+                         0.7 μs                      Signal handler &
+                                         2.6 μs
+                                                      reschedule ➋
+                            IPI handler &
+                           reschedule ➊                                     kernel IPI (Inter-Processor Interrupt) has been widely used
+                                                                            in existing work. In ghOSt, the agent sends messages to the
+Figure 1. Comparsion between different preemptive sched-
+                                                                            kernel, and the kernel sends an IPI to preempt other cores,
+uling frameworks. ➊ ghOSt [26] modifies kernel scheduler
+                                                                            which introduces additional context-switching overhead. For
+to reschedule threads on receiving kernel IPIs. ➋ Shenango
+                                                                            user-space scheduling frameworks, such as Shenango, Linux
+[45] further delivers a signal to the thread to yield the core.
+                                                                            signals are used to send preemption signals. This mechanism,
+                                                                            in addition to kernel IPI handling, requires the signal to be
+as GET/SET requests in key-value stores like in Memcached),                 handled in user space through a signal handler, introducing
+a run-to-completion policy is often used to avoid the over-                 even more context-switching overhead. Additionally, signal
+head of switching, while also contributing to improved data                 handling faces scalability challenges when multiple threads
+locality [5]. However, non-preemptive scheduling leads to                   on different cores receive signals simultaneously, leading to
+higher tail latency under heavy-tailed workloads [30]. We                   increased processing times due to data races [52].
+need µs-scale preemption to approximate processor sharing
+                                                                            Multi-application support. To enable scheduling threads
+(PS) policy, which performs best in terms of tail latency for
+                                                                            from different applications, the first challenge is to address
+such workloads [59].
+                                                                            the context-switching issue for different applications. From
+Multiple applications. Today’s large-scale datacenters need                 the kernel’s perspective, different applications are separate
+to support multiple applications with different characteristics,            processes with their own address spaces. Switching to a
+such as latency-sensitive applications and batch-processing                 thread in another application requires switching the address
+applications requiring high throughput. To improve CPU effi-                space. Kernel-space schedulers can easily handle address
+ciency, schedulers need to allocate unused cores from latency-              space switching, but these privileged operations are difficult
+sensitive applications to batch processing applications. More-              to perform in user space. Additionally, the scheduler needs to
+over, a scheduler is also required to reallocate cores back to              have a global view of all threads (belonging to different appli-
+latency-sensitive applications to handle peak load quickly.                 cations), such as priorities, time slices, etc., in order to make
+Linux can only achieve microsecond latency with low CPU                     the appropriate scheduling. Therefore, user-space schedulers
+utilization [34]. Alternatively, Shenango [45] and Caladan                  need data sharing to get the global view of all threads.
+[21] support fast core allocations between multiple appli-
+cations. Thus a flexible scheduling framework should also                   2.3   Limitations of Existing Work
+support multiple applications for efficient resource utilization.           Currently, a series of works have been dedicated to enabling
+                                                                            applications to customize their scheduling strategies, includ-
+2.2   Challenges in User-Space Scheduling                                   ing both user-space and kernel-space schedulers. Table 1 sum-
+Scheduling is a core function of an operating system, re-                   marizes their comparisons with Skyloft.
+lying on privileged operations such as handling interrupts                  User-level threading. The M:N threading model, supported
+and switching CPU states. It is challenging for user-space                  by some runtime libraries [6, 32, 44, 58] and programming
+scheduling frameworks to support both µs-scale preemption                   languages with asynchronous capabilities, like Go [22] and
+and multiple applications with no serious negative impact on                Rust [50], maps M user-level threads to N kernel-level threads.
+performance.                                                                User-level threads are lighter and can handle many thread op-
+Microsecond-scale preemption support. Preemption re-                        erations without needing the kernel, which reduces the over-
+quires the ability to interrupt and subsequently resume task                head associated with thread creation, context switching, and
+execution at any point. As shown in Figure 1, preemption via                synchronization. Despite these advantages, user-level threads
+                                                                        3
+struggle with low-overhead preemption and inter-application
+scheduling. Consequently, they are limited to functioning
+                                                                             CPU      CPU        CPU   CPU   CPU     CPU          CPU   CPU
+within a single application and cannot efficiently manage
+                                                                                          Timer                            IPIs
+tasks across multiple applications. Moreover, because the ker-                          Interrupts
+
+nel scheduler does not recognize user-space scheduling, it
+might inadvertently suspend a user-level thread that is holding                (a) Per-CPU scheduling        (b) Centralized scheduling
+a lock, potentially causing indefinite spinning [10, 55].                            Figure 2. Two typical scheduling models.
+Dataplane OSes. Several works have integrated scheduling
+                                                                         High Flexibility. Skyloft should offer a range of general
+frameworks with kernel-bypass technologies like DPDK [18]
+                                                                         scheduling operation interfaces to help the implementation of
+to develop dataplane operating systems such as IX [5] and
+                                                                         various scheduling policies, such as per-CPU/centralized, or
+ZygOS [48]. These systems, however, primarily focus on exe-
+                                                                         cooperative/preemptive. Additionally, Skyloft should not be
+cuting tasks to completion and lack support for preemption.
+                                                                         limited to scheduling threads within a single application but
+Shinjuku [30] and Concord [28] utilize posted interrupts and
+                                                                         also support thread scheduling across multiple applications.
+compiler instrumentation techniques, respectively, to facilitate
+                                                                         For instance, when all threads in one application are blocked,
+µs-scale preemption. LibPreemptible [35] makes use of user
+                                                                         the corresponding cores should be allocated to other applica-
+interrupts. These strategies tightly integrate schedulers with
+                                                                         tions to enhance CPU utilization. This necessitates that the
+application logic, which complicates adaptation to various
+                                                                         Skyloft scheduler maintains a global view of all applications
+scheduling policies and multiple applications. Moreover, all
+                                                                         to make informed scheduling decisions.
+these methods restrict dedicated cores to a single application,
+leading to inefficient use of resources.                                 High Efficiency. Skyloft must support µs-scale preemption
+                                                                         with minimal overhead for latency-critical applications. Pre-
+Core reallocation across applications. Several studies fo-
+                                                                         emption can be facilitated by CPU-local timer interrupts (Fig-
+cus on achieving performance isolation between applica-
+                                                                         ure 2a) or through a dedicated dispatcher core that sends IPIs
+tions [21, 27, 40, 45, 49], aiming to meet the tail latency re-
+                                                                         to other cores (Figure 2b). Skyloft should limit interactions
+quirements of LC applications while optimizing the through-
+                                                                         with the kernel and implement most of its functionality in
+put of BE applications. These approaches typically moni-
+                                                                         user space to decrease the overhead associated with context
+tor application congestion using various metrics periodically,
+                                                                         switching. For instance, employing user-level threads can
+making decisions to add or remove cores for each application
+                                                                         minimize thread operation overhead, and handling interrupts
+and conducting intra-application load balance. For instance,
+                                                                         in user space can reduce preemption overhead.
+Arachne [49] redistributes resources every 50ms, whereas
+Shenango [45] and Caladan [21] do so at frequencies as low               High Compatibility. Skyloft should require minimal modi-
+as 5µs. However, the flexibility of these systems is limited by          fications to the kernel to ensure compatibility with existing
+their tightly integrated schedulers. Additionally, these frame-          Linux systems. It should offer POSIX-compatible threading
+works rely on either Linux signals or kernel IPIs for preemp-            APIs, giving applications the flexibility to choose between us-
+tion, which are not optimal.                                             ing Skyloft or native Linux schedulers. Additionally, Skyloft
+                                                                         should be compatible with user-space I/O frameworks, such
+User-space delegation of kernel scheduling. Some studies
+                                                                         as DPDK [18], for performance.
+utilize the Linux scheduling subsystem and delegate sched-
+uling decisions to user space. ghOSt [26] facilitates this by
+                                                                         3     Design
+informing user agents about changes in the state of kernel
+threads. However, this approach requires frequent interac-               3.1       Design Overview
+tions with the kernel, leading to considerable overhead. The             Skyloft operates on top of Linux to ensure compatibility. To
+recent sched_ext patch [25] in Linux enables control over                avoid interference from the kernel in Skyloft’s scheduling,
+kernel schedulers through BPF [20]. BPF programs are lim-                specific cores are isolated at boot time, exclusively dedicated
+ited in their expressive capabilities due to security constraints,       to running applications within Skyloft. The remaining cores
+such as prohibitions on loops and floating-point arithmetic,             continue to function under the Linux scheduler for handling
+which complicates the implementation of complex schedul-                 regular system applications.
+ing strategies. These methods depend on kernel-level threads,               Skyloft consists of two primary components (Figure 3): the
+requiring user-to-kernel mode switches for thread creation               Skyloft Library OS, which operates in user space, enabling
+and synchronization, which degrades performance.                         kernel-bypass scheduling while offering POSIX-compatible
+                                                                         APIs; and the Skyloft Kernel Module, which runs in kernel
+2.4   Design Goals                                                       space, managing thread switching between applications and
+Skyloft aims to propose a general scheduling framework to                performing other privileged operations.
+achieve both flexibility and performance. We consider the                   The core function of the Skyloft LibOS is to manage user
+following requirements as goals for Skyloft:                             threads, which are the fundamental units of scheduling. ➊
+                                                                     4
+                     Skyloft LibOS                                        Sending a user interrupt. User interrupts are typically gen-
+                                                                          erated using the SENDUIPI instruction. Each sender maintains
+          I/O stack                                Scheduling
+                                                                          a User-Interrupt Target Table (UITT) in memory, with each
+      ➎                   Shared runqueues         Policy
+                            uthread switch ➋
+                                                                          entry containing the UPID address of the receiver and the
+                                                   task_enqueue()
+                                                   task_dequeue()         notification vector. The SENDUIPI instruction takes the index
+           UINTR              Uthread              task_block()
+                                                                          of the UITT entry as its operand, sets the corresponding bit in
+                                                   task_wakeup()
+      ➍    handler           scheduling        ➊   ......
+                                                                          the PIR, and then sends a standard Inter-Processor Interrupt
+                            kthread switch ➌            User space
+                                                                          (IPI) to the target CPU via the local Advanced Programmable
+                                                                          Interrupt Controller (APIC).
+                                                       Kernel space
+                          Skyloft Kernel                                  User-interrupt handling. The process of handling a user
+                             Module                                       interrupt involves the following steps: (1) Identification:
+      Timer source                                                        When the core receives an interrupt V, it proceeds to the next
+                                               App 1                      step if V matches the UINV value. Otherwise, V is treated as
+                                               App 2                      a legacy interrupt. (2) Processing: The core sets each bit in
+                                                                          the UIRR based on the bits set in the PIR field of the UPID,
+       I/O device         CPU        CPU
+                                                                          detecting a pending user interrupt. (3) Delivery: Once the
+                Figure 3. Skyloft architecture.                           CPU enters user mode and the UIRR is set, the user inter-
+                                                                          rupt is delivered. The current state, such as the stack pointer,
+                                                                          instruction pointer, etc., is saved onto the stack, and control
+                                                                          flow jumps to the user-interrupt handler. (4) Handling: The
+The user-space scheduler maintains a shared runqueue across               interrupt handler completes context saving and handles the
+all applications, follows various user-defined policies, and              interrupt. Once finished, it restores the context and executes
+makes scheduling decisions accordingly. When a context                    the UIRET instruction to return to normal execution.
+switch is required, it either ➋ switches the user thread directly            In Skyloft, preemption can be triggered through two mecha-
+in user space or ➌ invokes the kernel module to switch the                nisms: by sending IPIs to other cores, or by utilizing hardware-
+corresponding kernel thread , depending on the applications               generated timer interrupts.
+involved (§3.3). ➍ Additionally, the user-space scheduler
+                                                                          Preemption with IPIs. This method is particularly well-
+handles user interrupts to enable µs-scale preemption (§3.2).
+                                                                          suited for the centralized scheduling models illustrated in
+➎ Moreover, the Skyloft LibOS integrates kernel-bypass I/O
+                                                                          Figure 2b. A dispatcher periodically assesses the need to pre-
+stacks (§3.5).
+                                                                          empt tasks on other worker cores, acting as a clock source.
+                                                                          When preemption is necessary, the dispatcher sends a user
+3.2   User-Space Preemption                                               IPI via the SENDUIPI instruction to the targeted core, trigger-
+To enable µs-scale preemptive scheduling in user space,                   ing the user-interrupt handler. The main advantage of this
+Skyloft utilizes a new hardware feature called User Interrupts            approach is its flexibility, as the frequency of preemption
+(UINTR), available on Intel Sapphire Rapids servers. Intel                signals can be dynamically adjusted based on workload fluc-
+has also submitted a patch for UINTR to the Linux kernel                  tuations [35]. However, this method requires a dedicated core
+[41]. UINTR allows interrupts to be delivered directly to                 for the dispatcher, which reduces overall throughput since
+a user-space handler without switching address spaces or                  it cannot be used for regular task execution. Moreover, the
+privilege levels, offering a low-overhead mechanism for                   constant monitoring of all worker cores by the dispatcher
+event dispatch and inter-processor communication.                         can introduce bottlenecks, particularly in systems with many
+Resources related to UINTR. A dedicated interrupt vec-                    cores, thus limiting scalability [28, 30].
+tor is used to identify user interrupts [13], configured in the           Preemption with timer interrupts. Timer interrupts are cru-
+UINV (User-Interrupt Vector) register. Each receiving thread              cial for supporting per-CPU scheduling models, as illustrated
+registers a user-interrupt handler through the UIHANDLER                  in Figure 2a, and they eliminate the need for a dedicated dis-
+(User-Interrupt Handler) register and maintains a User Posted-            patcher core. However, implementing user-space handling of
+Interrupt Descriptor (UPID) in memory, which contains es-                 hardware interrupts, including timer interrupts, presents sig-
+sential information. For instance, the PIR (Posted-Interrupt              nificant challenges. To the best of our knowledge, no existing
+Requests) field in the UPID holds interrupts posted by a                  research or documentation has addressed the facilitation of
+sender; a non-empty PIR value indicates that a user interrupt             user-space hardware interrupt handling, nor is it covered in
+has been raised. Before invoking the handler, the core sets the           the Intel manual [13]. Skyloft implements two critical steps to
+appropriate bit in the User Interrupt Request Register (UIRR),            manage hardware interrupts, such as timer interrupts, in user
+which is a bitmap representing up to 64 different interrupts,             space. The first step involves configuring the UINV register
+based on the PIR value.
+                                                                      5
+with the timer interrupt vector, enabling the core to recog-             newly created kernel threads to isolated cores and immedi-
+nize the timer interrupt as a user interrupt. However, this              ately suspends them, making them inactive until they are later
+step alone is insufficient because the PIR is not automatically          activated.
+updated when a timer event occurs. Since the PIR remains                    In principle, kernel threads not managed by Skyloft can still
+empty, the core does not trigger the user-interrupt handling             be bound to isolated cores if their CPU affinity is manually set
+process. Therefore, the second step—updating the PIR—is                  and they are in a runnable state. As these threads do not share
+more challenging. While the SENDUIPI instruction could be                state with Skyloft, potential interference may occur, possibly
+used to update the PIR, this would unnecessarily generate an             leading to performance degradation. To avoid this issue, it
+IPI. Fortunately, we discovered that a bit in the UPID, known            is recommended that regular applications not managed by
+as SN (Suppress Notification), can prevent the generation of             Skyloft refrain from manually setting CPU affinity.
+an actual IPI. As a result, Skyloft requires each core to send
+itself an IPI with the SN bit set, effectively updating the PIR             App 2             uthread switch             kthread switch         C
+
+without triggering an IPI.
+                                                                            App 1         A                          B
+   To configure Skyloft for handling hardware interrupts, the
+following steps are performed: (1) Initialize each thread’s              Runqueue   B C                        C A                        A B
+UPID and set the SN bit. (2) Execute SENDUIPI to populate
+the PIR with a non-empty value (using any interrupt num-                 Figure 4. Skyloft switches user-level threads within the same
+ber), allowing the first hardware interrupt to be handled in             application(A → B) and between different applications(B →
+user space. (3) After entering the interrupt handler, execute            C).
+SENDUIPI again to ensure subsequent hardware interrupts are
+handled in user space. By following these steps, Skyloft suc-            Scheduling user threads. Skyloft organizes all user threads
+cessfully delegates local APIC timer interrupts to user space,           from all applications into either a single global runqueue
+enabling support for per-CPU preemptive scheduling policies.             or per-CPU runqueues, depending on the chosen scheduling
+                                                                         policy. These runqueues are shared across all applications.
+                                                                            A running user thread may yield or be preempted by an-
+3.3   Scheduling Threads Across Applications                             other user thread. The next thread to execute is selected from
+Managing kernel threads. To simplify the overall design,                 the shared runqueue based on the scheduling policy. As il-
+Skyloft seeks to reuse the existing process and thread abstrac-          lustrated in Figure 4, if the next thread belongs to the same
+tions as much as possible. Process represents an application’s           application, the switch can occur directly in user space with-
+global resources, such as address space and file table, while            out kernel intervention. However, if the next thread is from a
+kernel threads represent the application’s CPU resources.                different application, an application switch is required. This
+   Skyloft allocates a specific number of isolated cores for the         involves setting the current application’s active kernel thread
+applications it schedules. When an application is launched,              to inactive (suspending it) and activating (waking up) the in-
+Skyloft creates a number of kernel threads equal to the number           active kernel thread of the target application. Both steps must
+of isolated cores and binds each thread to one of these cores.           occur simultaneously in the kernel to uphold the binding rule.
+As a result, each core is associated with a set of kernel threads,       Since the overhead of switching between applications is con-
+corresponding to the number of initiated applications. Among             siderably higher than switching within the same application
+these kernel threads, only those in the runnable state are               (§5.4), minimizing inter-application thread switching is an
+selected by the kernel scheduler for execution. Threads that             important metric for scheduling policies to consider.
+are exited, suspended, or blocked do not appear in the kernel            Application termination. When all user threads of an applica-
+scheduler’s runqueue. These are referred to as active and                tion have completed execution (or if the application manually
+inactive kernel threads, respectively. The primary challenge is          invokes exit()), the application and all its kernel threads will
+to prevent scheduling interference from the kernel in Skyloft.           be terminated. Before terminated, an active kernel thread of
+To address this, Skyloft enforces the Single Binding Rule:               the application must wake up another thread on the same core
+   Single Binding Rule: No two or more active ker-                       first. Otherwise, once the sole active thread exits, there will
+nel threads may be bound to the same isolated core                       be no active threads left on that core, leading to the potential
+simultaneously.                                                          issue of inactive kernel threads never being woke up.
+   By following this rule, the kernel scheduler is entirely by-              Additionally, since a kernel thread must reclaim its re-
+passed. Each core’s single active kernel thread is associated            sources before terminating, which must be performed by the
+with the application currently running on that core. Skyloft             thread itself, each kernel thread remains in a runnable state un-
+then manages the user threads within each application. As                til it fully exits. To adhere to the binding rule, Skyloft rebinds
+shown in Figure 3, every application has one active kernel               active kernel threads to non-isolated cores before allowing
+thread occupying distinct isolated cores. To enforce the bind-           them to exit independently, or it sends a termination signal to
+ing rule when launching a new application, Skyloft binds                 inactive threads.
+                                                                     6
+   As described, the kernel must perform several operations            4.1   Skyloft LibOS
+simultaneously, such as transitioning kernel thread states or
+adjusting CPU affinity. Skyloft implements these operations            Scheduler Initialization. Skyloft uses the kernel command
+within a Linux kernel module, providing access to these func-          line parameter isolcpus to reserve isolated cores. Although
+tionalities for the Skyloft scheduler through the ioctl() in-          Linux may still run some background threads on these cores
+terface (§4.2).                                                        [26], it does not interfere with Skyloft’s scheduler and has
+                                                                       minimal impact on performance.
+                                                                          A daemon starts before any applications and is responsible
+3.4   General Scheduling Operations
+                                                                       for initializing shared states. The daemon then creates a num-
+Inspired by both recent latency-optimized centralized sched-           ber of kernel threads equal to the number of isolated cores us-
+ulers [30] and traditional per-CPU schedulers in Linux [9, 56],        ing the pthread library and binds these threads to the isolated
+Skyloft defines a set of operations to facilitate implementing         cores with sched_setaffinity(). For subsequent applica-
+schedulers in user space. As shown in Table 2, these op-               tions, the initialization process is similar, but instead of di-
+erations include runqueue and task state manipulations for             rectly binding the kernel threads, skyloft_park_on_cpu(),
+managing user threads, as well as event callbacks. For exam-           provided by the Skyloft kernel module (§4.2), is used to bind
+ple, sched_timer_tick() is invoked in the timer interrupt              and suspend the kernel thread.
+handler to determine whether preemption is required. Based                For each application, an idle user thread is created first on
+on these operations, high-level thread primitives (e.g., pthread       each kernel thread to run the main scheduling loop until it
+functions) can be implemented.                                         finds another runnable user thread to schedule. We implement
+   Certain operations are tied to specific scheduling models. In       a fast path for directly switching between two threads. If no
+per-CPU schedulers with multiple runqueues, task imbalance             runnable user thread is available, the scheduler saves the cur-
+can significantly degrade performance [40, 45, 48]. To ad-             rent thread’s context and re-enters the main loop to perform
+dress this, Skyloft provides the sched_balance() operation,            further operations, such as load balancing.
+enabling policy-defined load balancing (e.g., work stealing
+[7]). On the other hand, centralized schedulers with a single          Shared memory. Different applications use shared memory
+queue are naturally balanced [30], so the sched_balance()              to exchange data, including application metadata, runqueues,
+operation is not necessary. Instead, the dispatcher must call          memory pools for shared data structures. Each application
+sched_poll() to distribute tasks from the global runqueue              must link an identical copy of the Skyloft library to ensure that
+to each worker core.                                                   the same version of the scheduler code and shared memory
+                                                                       structures is used, regardless of which application is running.
+3.5   Integration with User-Space I/O Frameworks                       The application metadata stores the IDs of its kernel threads
+                                                                       (obtained via gettid()), which are used by other applications
+Skyloft adopts a design similar to existing dataplane operating        to wake them up. The shared runqueue holds all runnable
+systems [5, 30, 45, 48], integrating high-performance user-            user threads, and the scheduler selects a user thread to run
+space I/O frameworks for applications. For instance, Skyloft           based on the defined scheduling policy. Each user thread
+leverages DPDK [18] to poll network on a dedicated core.               includes fields that are visible to other applications, such as
+When a packet is received, it is distributed to the appropriate        the thread state, the application it belongs to, and an extra
+isolated core of Skyloft via a shared ring buffer based on the         field reserved for policy-defined data. This ensures that no
+Receive Side Scaling (RSS) [15] hash value. A lightweight              matter which application is running, consistent scheduling
+user-space TCP and UDP stack is integrated to parse net-               information is visible. Skyloft maintains a memory pool in
+work packets and provide POSIX-compliant socket interfaces             the shared memory dedicated to these structures. Additionally,
+to applications. When a thread is blocked by a request, the            each user thread has private fields, such as its context and
+scheduler suspends it and switches to other threads. Idle cores        stack, that are not visible to other applications.
+also poll the ingress pool, creating new threads to process
+incoming packets.                                                      User-interrupt configuration. The Linux UINTR patch [41]
+                                                                       has introduced kernel APIs for user-space IPIs, enabling pre-
+                                                                       emptive scheduling via user-space IPIs without requiring ad-
+4     Implementation
+                                                                       ditional kernel modifications. A dedicated dispatcher thread
+Skyloft operates on top of Linux, comprising 9K lines of C             is needed to send IPIs to other cores. Since the sender and
+code for the LibOS and an additional 4K lines of C code                receiver may belong to different applications, file descriptors
+to integrate DPDK and implement the TCP/UDP network                    opened by one are not visible to the other. To address this, we
+stacks. Skyloft is linked with the application and runs as a           use pidfd_get() to share the opened user interrupt file de-
+process in user space. The Skyloft kernel module consists of           scriptor (uvec_fd) between the sender and receiver, allowing
+325 lines of C code. Additionally, we modified 163 lines of            the sender to establish a connection with the receiver for send-
+code in the UINTR kernel patch [41] to support user-space              ing IPIs. Each application’s kernel thread on each isolated
+timer interrupts.
+                                                                   7
+     Scheduling Operations                                      Description
+     void task_init(struct task_t* task)               Initializes the policy-defined field of a task.
+     void task_terminate(struct task_t* task)          Finishes running a task and releases its policy-defined field.
+     void task_enqueue(struct task_t* task, int flags) Puts a task to the runqueue.
+     struct task_t* task_dequeue()                     Selects a task to run on and removes it from the runqueue.
+     void task_block()                                 Suspends the current task.
+     void task_wakeup(struct task_t* task)             Wakes up the task and puts it back to the runqueue.
+     void sched_init(void* data)                                Initializes policy-defined states of the scheduler.
+     bool sched_timer_tick()                                    Updates scheduler states on each timer tick, returns true if rescheduling is
+                                                                required (current task is preempted).
+     void sched_balance()                                       Performs load balancing among runqueues (per-CPU policy only).
+     void sched_poll()                                          Polls the global runqueue and dispatches tasks to worker cores (centralized
+                                                                policy only).
+
+                       Table 2. Scheduling interfaces defined by Skyloft to implement different scheduling policies.
+
+                                 APIs                                 Description
+                                 skyloft_park_on_cpu(cpu_id)          Binds the current kernel thread to the specified core and suspends.
+                                 skyloft_switch_to(target_tid)        Suspends the current kernel thread and wakes up the target kernel
+       App Lifecycle
+                                                                      thread.
+                                 skyloft_wakeup(tid)                  Wakes up the specified kernel thread.
+                                 skyloft_timer_enable()               Enables user-space timer interrupts on the current core.
+       UINTR Configuration
+                                 skyloft_timer_set_hz(hz)             Configures the timer frequency on the current core.
+
+                                          Table 3. APIs provided by the Skyloft kernel module.
+1  void __attribute__((interrupt))                                        and per-CPU schedulers using the operations described
+2  uintr_handler(struct __uintr_frame *ui_frame,                          in §3.4. For timer interrupts, the handler first resets the
+ 3               unsigned long long vector) {
+                                                                          UPID.PIR to prepare for the next timer interrupt (§3.2). The
+ 4   if (is_timer_uintr(vector)) {
+ 5     _senduipi(uintr_idx); // reset UPID.PIR for next timer
+                                                                          handler then updates the policy-defined states and makes a
+ 6   }                                                                    rescheduling decision if preemption is required.
+ 7   // update policy-defined states, check preemption
+ 8   bool is_preempted = sched_timer_tick();                              4.2   Skyloft Kernel Module
+ 9   // check if rescheduling is needed                                   The Skyloft kernel module is mounted as a miscellaneous de-
+10   if (preempt_enabled() && is_preempted) {                             vice file at /dev/skyloft. It provides two key operations for
+11     // put current task to end of runqueue                             the user-space scheduler: atomic invocation of kernel APIs for
+12     task_enqueue(current);                                             thread state transitions and execution of privileged operations
+13     schedule(); // enter main scheduling loop
+                                                                          for user-interrupt configuration. These operations are made
+14   }
+                                                                          available to user space through the ioctl() interface.
+15 }
+                                                                             The upper half of Table 3 lists the operations for kernel
+    Listing 1. Global user-interrupt handler for centralized and          thread state transitions. As detailed in §3.3, these operations
+    per-CPU schedulers.                                                   are invoked when an application starts, switches, or termi-
+                                                                          nates. They are implemented using Linux kernel APIs, such
+                                                                          as setting CPU affinity, suspending, and waking up kernel
+    core acts as a receiver, and the sender establishes connections       threads, without additional kernel code modifications.
+    with all of them at the start.                                           The lower half of Table 3 outlines the operations necessary
+       Skyloft also supports preemption via user-space timer in-          for configuring user-space timer interrupts. As discussed in
+    terrupts without needing a dedicated dispatcher thread (§3.2),        §3.2, user-space timer interrupts are enabled by setting UINV
+    though this functionality is not provided by the UINTR patch.         and UPID.SN, and the timer frequency can be configured
+    We address this with additional modifications to the UINTR            through the local APIC registers.
+    patch, configuring specific UINTR-related registers and al-
+    lowing the application to set the timer frequency.                    5     Evaluation
+    User-interrupt handler. We implement a global user-                   We evaluate Skyloft schedulers to address the following ques-
+    interrupt handler, as shown in Listing 1, for both centralized        tions:
+                                                                      8
+  Linux CFS (kernel/sched/fair.c)                 6,592 LOC            5.1   User-Space Timer Interrupts
+  Linux RT (kernel/sched/rt.c)                    1,939 LOC            To evaluate Skyloft’s timer-interrupt delegation, we imple-
+  Linxu EEVDF (Linux v6.8 kernel/sched/fair.c)    7,102 LOC            mented per-CPU scheduling policies and compared them with
+  ghOSt Shinjuku                                  710 LOC              Linux’s schedulers, including SCHED_RR and SCHED_BATCH,
+  ghOSt Shinjuku-Shenango                         727 LOC              which use Round-Robin (RR) with time slicing, and the Com-
+                                                                       pletely Fair Scheduler (CFS), respectively.
+  Skyloft Round-Robin (§5.1)                      141 LOC
+  Skyloft CFS (§5.1)                              430 LOC
+                                                                          We use schbench [39] (v1.0), a widely used scheduler
+  Skyloft EEVDF (§5.1)                            579 LOC              benchmarking tool [19], to evaluate various schedulers.
+                                                                       Schbench simulates a typical network application by creating
+  Skyloft Shinjuku (§5.2)                         192 LOC              M message threads and T worker threads. The message
+  Skyloft Shinjuku-Shenango (§5.2)                444 LOC
+                                                                       threads continuously wake up the worker threads to perform
+  Skyloft Work-Stealing (Preemptive) (§5.3)       150 LOC              simulated tasks (e.g., matrix multiplication). Once the tasks
+                                                                       are completed, the worker threads enter a sleep state, waiting
+      Table 4. Lines of code for different schedulers.                 for the message threads to wake them up for the next request.
+                                                                          We configure Skyloft with 24 isolated cores. For Linux,
+                                                                       schbench is also bound to 24 cores using the taskset com-
+    • What is the impact of Skyloft’s timer-interrupt delega-          mand. The RR policy is applied using the chrt command.
+      tion on per-CPU schedulers? (§5.1)                               For both RR and CFS policies on Linux, schbench is set to
+    • How do Skyloft schedulers perform across multiple ap-            the highest priority. Schbench is configured with default pa-
+      plications compared to ghOSt, a general-purpose sched-           rameters (approximately 2,300 µs per request), using a single
+      uling framework? (§5.2)                                          message thread, and the number of worker threads is grad-
+    • How does Skyloft handle real-world applications with             ually increased to saturate the cores. When the number of
+      light- and heavy-tailed workloads? (§5.3)                        worker threads exceeds the number of cores, wakeup latency
+    • What are the overheads associated with Skyloft opera-            is affected by queuing time. Figure 5 compares the wakeup
+      tions? (§5.4)                                                    latencies of worker threads across the four schedulers. For
+                                                                       both Skyloft and Linux, CFS slightly outperforms RR due
+Evaluated schedulers. To compare with existing systems,                to its compensation for blocked threads [56]. Since Skyloft
+we have implemented several schedulers using Skyloft. Ta-              can handle timer interrupts at µs scale with low overhead, it
+                                                                       achieves significantly lower wakeup latencies compared to
+ble 4 shows the lines of code (LOC) required for Skyloft and
+                                                                       Linux schedulers , even when Linux CFS is tuned to reduce
+other systems, such as the Linux scheduling subsystem and
+                                                                       wakeup latency.
+ghOSt. Each Skyloft scheduler is implemented with only a
+few hundred lines of code, significantly fewer than the com-              Similar to CFS, the Earliest Eligible Virtual Deadline First
+pared systems. This efficiency demonstrates the advantages             (EEVDF) scheduler aims to provide a fair share of CPU time
+of Skyloft’s approach to developing preemptive schedulers              to all runnable tasks, introduced in Linux v6.6 [9, 11, 54].
+                                                                       However, unlike CFS, which relies on various empirical
+entirely in user space, without requiring kernel intervention.
+                                                                       heuristics, EEVDF uses a well-defined mechanism based on a
+In contrast, scheduling in previous user-space frameworks is
+                                                                       lag value to decide which task to schedule. We implemented
+often tightly integrated with other functionalities and lacks
+flexibility for different policies (e.g., Shinjuku [30] consists       the EEVDF scheduling policy in Skyloft and compared it
+of 3,900 LOC and relies heavily on Dune [4]).                          with CFS. As shown in Figure 5, Skyloft’s EEVDF outper-
+                                                                       forms Skyloft’s CFS. We also evaluated Linux EEVDF on
+Experimental setup. We evaluated Skyloft on a Sapphire                 Linux v6.8 (the latest Hardware Enablement (HWE) kernel
+Rapids server that supports user interrupts. The server is             on Ubuntu 22.04 LTS). Linux EEVDF performs similarly to
+equipped with two 24-core (48-hyperthread) Intel Xeon Gold             CFS (with both default and tuned parameters), as the wakeup
+5418Y CPUs running at 2.0 GHz, along with 128 GB of                    latency is constrained by the timer frequency.
+RAM. To optimize for low latency, we configured the server                Additionally, we evaluated the impact of different preemp-
+according to best practices, disabling TurboBoost, CPU idle            tion frequencies on wakeup latency. As shown in Figure 6,
+states, CPU frequency scaling, and transparent hugepages.              the wakeup latency in schbench is roughly proportional to the
+For networking tests, we used a dual-socket client with 16-            time slice: smaller time slices result in lower wakeup latency.
+core Intel Xeon E5-2683 v4 CPUs at 2.1 GHz and 128 GB
+of RAM. Both the server and the client were equipped with
+a 10 Gb/s Intel 82599ES NIC. Unless otherwise noted, most              5.2   Synthetic Workload Comparison
+evaluations on the server were conducted using DPDK 22.11              We evaluate a centralized scheduling policy from recent re-
+and a Linux kernel version 6.0.0, which was modified to                search, Shinjuku [30], designed to support µs-scale latency
+support Intel user interrupts.                                         for network applications. In Shinjuku, a spinning dispatcher
+                                                                   9
+                                                                      CONFIG_HZ (Linux) /         min_granularity (CFS) /     time_slice (RR) /
+                                                                      TIMER_HZ (Skyloft)           base_slice (EEVDF)       sched_latency (CFS)
+                                          Linux RR (default)                     250                         -                    100ms
+                                          Linux CFS (default)                    250                       3ms                     24ms
+                                          Linux CFS (tuned)                     1,000                     12.5µs                   50µs
+                                          Linux EEVDF (default)                 1,000                      3ms                       -
+                                          Linux EEVDF (tuned)                   1,000                     12.5µs                     -
+                                          Skyloft RR                         100,000                         -                     50µs
+                                          Skyloft CFS                        100,000                      12.5µs                   50µs
+                                          Skyloft EEVDF                      100,000                      12.5µs                     -
+
+                     Table 5. Parameters for scheduling policies. For Linux, the maximum configurable timer interrupt frequency is 1000 Hz.
+
+                     10ms        Linux-RR                                                            (3) The Skyloft-Shinjuku dispatcher, which sends a user
+                                 Linux-CFS
+                                                                                                         interrupt to preempt a worker.
+99% wakeup latency
+
+
+
+
+                                 Linux-CFS-opt
+                      1ms        Linux-EEVDF
+                                 Linux-EEVDF-opt                                                     (4) A non-preemptive version running on Linux CFS.
+                                 Skyloft-EEVDF
+                     100 s       Skyloft-RR
+                                 Skyloft-CFS                                                      Single workload. As described in the ghOSt paper [26], we
+                     10 s
+                                                                                                  implement a load generator and request handlers for synthetic
+                       1s                                                                         workloads. We generate a workload consisting of 99.5% short
+                             0       16            32   48       64        80           96
+                                           Number of worker threads                               requests and 0.5% long requests, with execution times of
+                                                                                                  4µs and 10ms, respectively. One core is used for the load
+   Figure 5. Schbench performance with different scheduling                                       generator and dispatcher (except in the case of Linux CFS),
+   policies. The corresponding parameters of each test are shown                                  and 20 cores are used as workers.
+   in Table 5.                                                                                       Figure 7a presents the performance of different implemen-
+                                                                                                  tations. The choice of preemption quantum has a significant
+                     10ms                                                                         impact on tail latency and maximum throughput. We find that
+                                                                                                  a preemption quantum of 30µs yields the best results. While
+99% wakeup latency
+
+
+
+
+                      1ms
+                                                                                                  higher preemption frequencies can further reduce tail latency,
+                     100 s                                                                        they also increase the overhead from interrupt handling, which
+                                                                       Skyloft-FIFO               reduces maximum throughput. Linux CFS achieves 58.7%
+                     10 s                                              Skyloft-RR (1ms)
+                                                                       Skyloft-RR (200 s)         of the maximum throughput compared to Skyloft. This is be-
+                                                                       Skyloft-RR (50 s)          cause Linux CFS is designed for fairness rather than latency-
+                       1s
+                             0       16            32   48       64         80         96         sensitive applications. Skyloft and Shinjuku show similar
+                                           Number of worker threads
+                                                                                                  performance, as both use low-overhead preemption mecha-
+   Figure 6. Schbench wakeup latency with different RR time                                       nisms. In contrast, ghOSt performs worse, with maximum
+   slices. Skyloft-FIFO represents an infinite time slice and no                                  throughput reaching only 80.1% of Skyloft (at 30µs), and
+   preemption will occur.                                                                         the 99% tail latency at low load is three times higher than
+                                                                                                  that of Skyloft. This is due to ghOSt relying on Linux ker-
+                                                                                                  nel threads, which incur significant overhead from context
+   runs on a dedicated core and maintains a global queue. The                                     switches during preemption. Additionally, ghOSt’s perfor-
+   dispatcher manages incoming requests and dispatches them                                       mance is affected by frequent communication between the
+   to idle workers running on other cores. Each request is pre-                                   user agent and the kernel.
+   empted by the dispatcher and returned to the global queue if
+                                                                                                  Multiple workloads. A general-purpose scheduling frame-
+   it exceeds a limited quantum. We compare four implementa-
+                                                                                                  work should support scheduling multiple applications to im-
+   tions of this policy:
+                                                                                                  prove CPU utilization. To demonstrate Skyloft’s ability to han-
+                (1) The original Shinjuku system, which leverages posted                          dle multi-application scheduling, we evaluate a high-priority,
+                    interrupts to preempt workers. We run Shinjuku on                             latency-sensitive application co-located with a low-priority
+                    Linux 4.4 due to compatibility issues with Dune on                            batch application on the same machine [26].
+                    newer versions.                                                                  We implement Shenango’s core allocation strategy [45]
+                (2) The ghOSt-Shinjuku global agent, which makes sched-                           with the centralized policy mentioned earlier. Based on task
+                    uling decisions by committing transactions [26]. We                           queuing times, the dispatcher periodically checks if the global
+                    run ghOSt on Linux 5.11 as porting ghOSt to newer                             queue of requests is congested. If congestion is detected, the
+                    versions requires significant effort.                                         cores running the batch application are preempted and yield
+                                                                                             10
+            1000                                                          1000                                                                                          1
+                              CFS
+                   800        ghOSt (30 s)                                       800                                                                                   0.8
+99% Latency ( s)
+
+
+
+
+                                                              99% Latency ( s)
+
+
+
+
+                                                                                                                                                     Batch CPU Share
+                              Shinjuku (30 s)
+                   600        Skyloft (30 s)                                     600                                                                                   0.6
+                   400                                                           400                                                                                   0.4
+                   200                                                           200                                                                                   0.2
+                    0                                                             0                                                                                     0
+                         0      100             200   300                              0   100        200                            300                                     0            100         200          300
+                                  Throughput (kRPS)                                         Throughput (kRPS)                                                                             Throughput (kRPS)
+                    (a) Tail latency for a dispersive load.   (b) Tail latency for a dispersive load co-located                                                    (c) CPU share of the batch application.
+                                                              with a batch application.
+Figure 7. Skyloft implements a centralized scheduling policy and ensures CPU sharing without compromising tail latency.
+Shinjuku ➊ is unable to allocate resources to run another application effectively, it cannot support the batch application (with
+zero CPU share).
+                                                                                                                           500
+to tasks from the latency-sensitive application. The strategy                                                                              Shenango
+aims to allocate idle cores to the batch application when the                                                              400             Skyloft
+
+
+
+
+                                                                                                      99.9% Latency ( s)
+latency-sensitive application is not busy, maximizing CPU                                                                  300
+utilization while ensuring low tail latency under peak loads.
+                                                                                                                           200
+   Figure 7b shows that we can achieve the same tail latency as
+the original centralized policy. Compared with ghOSt, Skyloft                                                              100
+increases maximum throughput by 19% and reduces 99% tail                                                                    0
+latency by 33%. More importantly, Figure 7c demonstrates                                                                         0             0.5                               1         1.5          2          2.5
+                                                                                                                                                                       Throughput (MRPS)
+that we achieve a similar CPU share for the batch application
+at different load levels compared to both Linux and ghOSt.                                                         (a) USR workload (99.8% GETs, 0.2% SETs) of Memcached.
+                                                                                                                    200
+                                                                                                                            Shenango
+                                                                                                                    150     Skyloft (no preemption)
+5.3                  Real-World Applications                                                                                Skyloft (20 s)
+                                                                                                      99.9% Slowdown
+
+
+
+
+                                                                                                                            Skyloft (5 s)
+Skyloft can flexibly support scheduling policies for real-world                                                     100     Skyloft (5 s utimer)
+applications. Skyloft leverages the approach described in Sec-
+tion 3.5 to provide kernel-bypass network functionality. We                                                                50
+evaluate two popular applications: Memcached [17] (v1.5.6),
+                                                                                                                            0
+and a UDP-based RocksDB [42] (v6.15.5) server, each han-                                                                         0               10                                  20          30           40
+dling different types of network requests. Memcached is an                                                                                                              Throughput (kRPS)
+in-memory key-value store with light-tailed workloads, while                                          (b) Bimodal workload (50% GETs, 50% SCANs) of RocksDB Server.
+RocksDB is a persistent key-value store with heavy-tailed                                             Figure 8. Skyloft flexibly supports both light- and heavy-
+workloads. A separate machine is used as a client, running an                                         tailed workloads for real-world applications.
+open-loop load generator to send requests to the Memcached
+or RocksDB server, following a Poisson arrival process.
+                                                                                                      and 591µs, respectively. We allocate 14 worker cores for
+Memcached. For Memcached, the client generates the                                                    both Skyloft and Shenango to ensure the server is fully satu-
+USR workload [3], consisting of 99.8% GET requests and                                                rated. Without any modifications to the scheduler, we enable
+0.2% SET requests. To saturate the server, we configure 4                                             Skyloft’s timer-interrupt handler for the work-stealing policy.
+worker cores for both Skyloft and Shenango. We implement                                              Skyloft improves the tail latency of short requests by pre-
+a work-stealing policy similar to Shenango [45] to achieve                                            empting each core using timer interrupts. We compare the
+load balance and low tail latency for light-tailed workloads.                                         throughput at a target 99.9% Slowdown, which represents the
+As shown in Figure 8a, Skyloft performs comparably to                                                 ratio of total response time to the original service time. By us-
+Shenango, within 2% of its maximum throughput. At low                                                 ing tail Slowdown instead of latency, we effectively evaluate
+loads, Skyloft exhibits slightly lower tail latencies than                                            the dispersive workload (where absolute latencies of requests
+Shenango, as Shenango incurs additional overhead due to                                               vary significantly) against a common Service Level Objective
+frequent core adjustments, yielding, and wake-ups for a                                               (SLO). As shown in Figure 8b, Skyloft supports preemption
+single application.                                                                                   quanta as low as 5µs. Due to its lack of µs-scale preemption,
+RocksDB server. We configure the client to generate a work-                                           Shenango exceeds the slowdown SLO much earlier for the
+load with a bimodal distribution, consisting of 50% GET                                               heavy-tailed workload. Skyloft sustains 1.9× more load than
+and 50% SCAN requests, with processing times of 0.95µs                                                Shenango at a quantum of 5µs for a target slowdown of 50×.
+                                                                                                 11
+                                     Send    Receive    Delivery                                  pthread    Go    Skyloft
+ Signal                      1,224             6,359       5,274                      Yield           898 108           37
+ Kernel IPI                    437             1,582       1,345                      Spawn        15,418 503          191
+ User IPI                      167               661       1,211                      Mutex            28 25            27
+ User IPI (cross NUMA nodes)   178               883       1,782                      Condvar       2,532 262           86
+ setitimer                              —      5,057           —                Table 7. Threading operation comparison (ns).
+ User timer interrupt                   —        642           —
+                                                                         User-level threading overhead. Skyloft implements low-
+   Table 6. Preemption mechanism comparison (cycles).                    overhead thread operations through its user-level thread li-
+                                                                         brary. We evaluate the time required for several common
+                                                                         thread operations in Skyloft and compare them with native
+   We also use a dedicated core to emulate a timer (called               Linux kernel threads (pthread) and user-level threads in the
+utimer) and send IPIs to 13 worker cores with a 5µs quantum.             Go programming language [22]. The results are shown in
+The results show that, compared to local APIC timer inter-               Table 7. Skyloft achieves the lowest overhead for almost all
+rupts, software-emulated timer interrupts reduce performance             thread operations compared to other mechanisms.
+by 13% due to the absence of one worker core.                               We also measured the time for Skyloft’s inter-application
+                                                                         thread switching, which is 1,905ns. When switching between
+5.4   Microbenchmarks                                                    threads of different applications, Skyloft requires additional
+                                                                         operations in the kernel, such as suspending and waking up
+User-space preemption overhead. We measure the overhead                  kernel threads and manipulating the kernel’s runqueue to
+of user interrupts and compare it with other notification mech-          comply with the binding rule described in §3.3.
+anisms. The sender and receiver threads are bound to different              For Linux, the thread-switching time is 1,124ns if both
+cores on the same socket. The receiver’s event handler is a              threads are runnable, and 2,471ns if one thread needs to wake
+no-op. In this setup, both Linux signals and kernel IPIs need            up another (e.g., in inter-process communication). Further
+to access the local APIC to send interrupts. We configure the            optimizations could provide a direct kernel thread context-
+local APIC in x2APIC mode, which is accessed through the                 switching operation in Skyloft without the need to manipulate
+MSR (Model-Specific Register) instead of MMIO (Memory-                   the kernel’s runqueue.
+Mapped I/O). Table 6 shows the results, including the time
+spent by the sender on the send operation, the time spent by             6   Discussion
+the receiver on event handling (including context saving and
+restoring), and the delivery latency. Linux signal has the high-         Kernel-bypass timer reset. Currently, the timer is set through
+est overhead, which involves several switches between user               the kernel before running applications. We can enable appli-
+and kernel. Neither sending nor receiving user IPIs involves a           cations to dynamically reset the timer by mapping the lo-
+privilege level change, resulting in lower overhead than other           cal APIC address range to the application’s address space.
+mechanisms.                                                              However, a potential risk of this emulation is that the core
+   We also measure the overhead of user timer interrupts                 may send an IPI to other cores, which should not be allowed
+and compare it with the traditional signal-based user timer              in non-privileged mode. To address this, a new instruction
+(setitimer in Linux). A timer interrupt can be generated                 could be introduced, allowing applications to modify the timer
+either by the local APIC timer or from another core (utimer,             deadline directly. Recently, a similar hardware feature, called
+as described in §5.3). The lower part of Table 6 shows the               User-Timer Events, has been introduced in the programming
+results. The signal-based timer requires several switches be-            reference for Intel’s future processors [14].
+tween user and kernel space, resulting in significantly higher           Shared memory protection. Scheduling multiple applica-
+overhead compared to the user timer interrupt. The overhead              tions in user space requires sharing data between different
+of simulating a timer on another core is similar to that of user         address spaces, which can raise safety concerns. For instance,
+IPIs but increases when signaling cores on different NUMA                malicious applications could tamper with the shared runqueue
+nodes. Therefore, using extra cores as timers limits scalability.        to manipulate scheduling decisions. However, since the user
+   It is also worth noting that, as described in Section 3.2,            thread’s context and stack are not shared between applica-
+receiving user-mode device interrupts requires an additional             tions, this does not lead to memory-related attacks on other
+senduipi instruction (with UPID.SN = 1) in the interrupt                 applications. Hardware mechanisms like Intel MPK (Memory
+handler, which takes approximately 123 cycles. Even with                 Protection Keys) [46] can be employed for isolation. R/W
+this additional operation, the overhead of receiving user timer          permissions can be configured through a guardian code be-
+interrupts remains lower than that of user IPIs, as timer inter-         fore entering the application. The risk arises from the fact that
+rupts do not incur the overhead of cross-core communication.             Skyloft’s library and the application are linked together in
+                                                                    12
+the same address space, meaning the application could poten-           within a single process, whereas Skyloft is capable of sched-
+tially modify permissions using the WRPKRU instruction. Prior          uling across multiple processes, thereby improving CPU effi-
+works have addressed this issue to some extent [23, 24, 36].           ciency. While Perséphone [16] implements a non-preemptive
+Other mechanisms, such as VMFUNC, are also possible.                   policy, it reserves a small number of cores specifically for
+Peripheral interrupts. Skyloft provides a unified method               short requests, sometimes outperforming preemptive systems
+for delegating peripheral interrupts to user space (§3.2). Both        under high-dispersion workloads. However, Perséphone re-
+external interrupts via the I/O APIC and Message Signaled              lies on applications to group incoming requests and is not
+Interrupts (MSI) via the local APIC can be handled in user             work-conserving[1].
+space. Additionally, kernel-bypass I/O drivers can be imple-           Kernel-bypass and dataplane OSes. Emerging faster net-
+mented with this mechanism, avoiding the need for polling or           work and storage devices demand shorter software I/O paths,
+kernel signaling.                                                      beyond what general-purpose kernels can provide. Libraries
+Blocking events. Skyloft enforces the Single Binding Rule,             like DPDK [18], SPDK [12], mTCP [29], and Strata [33]
+preventing multiple active kernel threads on the same core             move the driver and protocol stack to user space, tightly inte-
+(§3.3). An active kernel thread can be blocked by events such          grating them with the application. Dataplane operating sys-
+as page faults or I/O operations. Skyloft can integrate various        tems separate the dataplane from the control plane to optimize
+techniques to minimize performance impact. For active block-           throughput and latency. IX [5], Arrakis [47], and Demikernel
+ing (e.g., I/O syscalls), asynchronous syscalls like aio and           [60] focus on optimizing shorter datapaths, while ZygOS [48]
+io_uring can be used, or user-space file I/O can be imple-             adopts work stealing for load balancing. Skyloft leverages
+mented with SPDK. For passive blocking (e.g., page faults),            DPDK and incorporates datapath optimizations from previ-
+userfaultfd can monitor the blockage on a non-isolated                 ous works to build a high-performance user-space networking
+core and reschedule other kernel threads from different ap-            system, in alignment with its µs-scale scheduling capabilities.
+plications on the blocked core without violating the Single            User-defined kernel scheduling. In addition to building
+Binding Rule.                                                          scheduler systems from scratch, several approaches aim to
+                                                                       improve existing kernel schedulers. Scheduler Activations
+                                                                       [2] provides APIs that allow applications to coordinate with
+7   Related Works                                                      kernel thread scheduling. ghOSt [26] delegates kernel sched-
+                                                                       uling decisions to user-space agents, while Enoki [43] uploads
+User-level threading. To enable fast switching between ap-             user-provided schedulers to run inside the kernel. Syrup [31]
+plication tasks, user-level threading libraries such as Capric-        coordinates thread and network scheduling with ghOSt and
+cio [57], QThreads [58], Fred [32], and others [6, 8, 38, 44,          eBPF support. Plugsched [37] is an SDK that enables live
+52] multiplex user threads atop one or more kernel (native)            updating of the Linux kernel scheduler. Like other user-space
+threads. With Skyloft providing POSIX-compatible threading             schedulers, Skyloft can achieve more efficient scheduling by
+APIs and lightweight user-space scheduling facilities, these           bypassing kernel overhead.
+libraries could be simplified by adopting a 1:1 thread mapping
+model, instead of the more complex M:N model.                          8   Conclusion
+Core allocation. Latency can generally be reduced by provi-            Skyloft demonstrates significant advancements in user-space
+sioning more cores for LC applications, but static partitioning        scheduling, offering a robust framework that leverages user-
+may result in wasted resources under fluctuating workloads.            mode interrupt mechanisms to handle hardware timer inter-
+Systems like Arachne [49], Shenango [45], Caladan [21], and            rupts directly in user space. This architecture enables µs-scale
+others [40] dynamically reallocate cores between LC and                preemption, improving the performance of latency-sensitive
+BE applications, balancing latency and throughput. Skyloft             applications. With these preemption capabilities, Skyloft pro-
+adopts core allocation policies similar to Shenango [45] for           vides a flexible scheduling framework that supports various
+multiple applications, while offering additional support for           scheduling policies.
+more scheduling policies to achieve better latency for both
+light- and heavy-tailed workloads.                                     Acknowledgments
+Microsecond-scale preemption. Non-preemptive scheduling                We thank the anonymous reviewers and our shepherd Prof.
+policies can suffer from head-of-line blocking in the pres-            KyoungSoo Park for their constructive suggestions. The au-
+ence of high-dispersion workloads, requiring frequent pre-             thors from Tsinghua University are all in the Department
+emption to maintain lower tail latencies. Systems like Shin-           of Computer Science and Technology. This work was sup-
+juku [30], Concord [28], and LibPreemptible [35] achieve               ported by Quan Cheng Laboratory (QCLZD202305), Nat-
+µs-scale preemption, with LibPreemptible being the most                ural Science Foundation of China (62141216). Correspon-
+similar to Skyloft in terms of preemption mechanisms. How-             dence to: Yu Chen (yuchen@tsinghua.edu.cn), Kang Chen
+ever, LibPreemptible only supports preemptive scheduling               (chenkang@tsinghua.edu.cn).
+                                                                  13
+References                                                                            [17] Dormando. memcached - a distributed memory object caching system.
+ [1] Work-conserving scheduler. https://en.wikipedia.org/wiki/Work-                        https://memcached.org, 2018.
+     conserving_scheduler, 2024.                                                      [18] DPDK Project. DPDK. https://www.dpdk.org, 2023.
+ [2] Thomas E. Anderson, Brian N. Bershad, Edward D. Lazowska, and                    [19] Matt Fleming. A survey of scheduler benchmarks. https://lwn.net/
+     Henry M. Levy. Scheduler activations: effective kernel support for                    Articles/725238/, 2017.
+     the user-level management of parallelism. In Proceedings of the Thir-            [20] Matt Fleming. A thorough introduction to eBPF. https://lwn.net/
+     teenth ACM Symposium on Operating Systems Principles, SOSP ’91,                       Articles/740157/, 2017.
+     page 95–109, New York, NY, USA, 1991. Association for Computing                  [21] Joshua Fried, Zhenyuan Ruan, Amy Ousterhout, and Adam Belay.
+     Machinery.                                                                            Caladan: Mitigating interference at microsecond timescales. In 14th
+ [3] Berk Atikoglu, Yuehai Xu, Eitan Frachtenberg, Song Jiang, and Mike                    USENIX Symposium on Operating Systems Design and Implementation
+     Paleczny. Workload analysis of a large-scale key-value store. In                      (OSDI 20), pages 281–297. USENIX Association, November 2020.
+     Proceedings of the 12th ACM SIGMETRICS/PERFORMANCE Joint                         [22] Google. The Go Programming Language. https://go.dev, 2024.
+     International Conference on Measurement and Modeling of Computer                 [23] Jinyu Gu, Xinyue Wu, Wentai Li, Nian Liu, Zeyu Mi, Yubin Xia, and
+     Systems, SIGMETRICS ’12, page 53–64, New York, NY, USA, 2012.                         Haibo Chen. Harmonizing performance and isolation in microker-
+     Association for Computing Machinery.                                                  nels with efficient intra-kernel isolation and communication. In 2020
+ [4] Adam Belay, Andrea Bittau, Ali Mashtizadeh, David Terei, David Maz-                   USENIX Annual Technical Conference (USENIX ATC 20), pages 401–
+     ières, and Christos Kozyrakis. Dune: Safe user-level access to privileged             417. USENIX Association, July 2020.
+     CPU features. In 10th USENIX Symposium on Operating Systems De-                  [24] Mohammad Hedayati, Spyridoula Gravani, Ethan Johnson, John
+     sign and Implementation (OSDI 12), pages 335–348, Hollywood, CA,                      Criswell, Michael L. Scott, Kai Shen, and Mike Marty. Hodor: Intra-
+     October 2012. USENIX Association.                                                     Process isolation for High-Throughput data plane libraries. In 2019
+ [5] Adam Belay, George Prekas, Ana Klimovic, Samuel Grossman, Chris-                      USENIX Annual Technical Conference (USENIX ATC 19), pages 489–
+     tos Kozyrakis, and Edouard Bugnion. IX: A protected dataplane op-                     504, Renton, WA, July 2019. USENIX Association.
+     erating system for high throughput and low latency. In 11th USENIX               [25] Tejun Heo. sched: Implement BPF extensible scheduler class. https:
+     Symposium on Operating Systems Design and Implementation (OSDI                        //lwn.net/Articles/951156/, 2023.
+     14), pages 49–65, Broomfield, CO, October 2014. USENIX Associa-                  [26] Jack Tigar Humphries, Neel Natu, Ashwin Chaugule, Ofir Weisse,
+     tion.                                                                                 Barret Rhoden, Josh Don, Luigi Rizzo, Oleg Rombakh, Paul Turner,
+ [6] Robert D. Blumofe, Christopher F. Joerg, Bradley C. Kuszmaul,                         and Christos Kozyrakis. ghOSt: Fast & flexible user-space delegation of
+     Charles E. Leiserson, Keith H. Randall, and Yuli Zhou. Cilk: an efficient             linux scheduling. In Proceedings of the ACM SIGOPS 28th Symposium
+     multithreaded runtime system. In Proceedings of the Fifth ACM SIG-                    on Operating Systems Principles, SOSP ’21, page 588–604, New York,
+     PLAN Symposium on Principles and Practice of Parallel Programming,                    NY, USA, 2021. Association for Computing Machinery.
+     PPOPP ’95, page 207–216, New York, NY, USA, 1995. Association                    [27] Calin Iorgulescu, Reza Azimi, Youngjin Kwon, Sameh Elnikety, Manoj
+     for Computing Machinery.                                                              Syamala, Vivek Narasayya, Herodotos Herodotou, Paulo Tomita, Alex
+ [7] Robert D. Blumofe and Charles E. Leiserson. Scheduling multithreaded                  Chen, Jack Zhang, and Junhua Wang. PerfIso: Performance isolation
+     computations by work stealing. J. ACM, 46(5):720–748, sep 1999.                       for commercial Latency-Sensitive services. In 2018 USENIX Annual
+ [8] Sol Boucher, Anuj Kalia, David G. Andersen, and Michael Kaminsky.                     Technical Conference (USENIX ATC 18), pages 519–532, Boston, MA,
+     Lightweight preemptible functions. In 2020 USENIX Annual Technical                    July 2018. USENIX Association.
+     Conference (USENIX ATC 20), pages 465–477. USENIX Association,                   [28] Rishabh Iyer, Musa Unal, Marios Kogias, and George Candea. Achiev-
+     July 2020.                                                                            ing microsecond-scale tail latency efficiently with approximate optimal
+ [9] Jonathan Corbet. An EEVDF CPU scheduler for Linux. https://lwn.                       scheduling. In Proceedings of the 29th Symposium on Operating Sys-
+     net/Articles/925371/, 2023.                                                           tems Principles, SOSP ’23, page 466–481, New York, NY, USA, 2023.
+[10] Jonathan Corbet. Deferred scheduling for user-space critical sections.                Association for Computing Machinery.
+     https://lwn.net/Articles/948870/, 2023.                                          [29] EunYoung Jeong, Shinae Wood, Muhammad Jamshed, Haewon Jeong,
+[11] Jonathan Corbet. Completing the EEVDF scheduler. https://lwn.net/                     Sunghwan Ihm, Dongsu Han, and KyoungSoo Park. mTCP: a highly
+     Articles/969062/, 2024.                                                               scalable user-level TCP stack for multicore systems. In 11th USENIX
+[12] Intel Corporation. Introduction to the Storage Performance Devel-                     Symposium on Networked Systems Design and Implementation (NSDI
+     opment Kit (SPDK). https://www.intel.com/content/www/us/en/                           14), pages 489–502, Seattle, WA, April 2014. USENIX Association.
+     developer/articles/tool/introduction-to-the-storage-performance-                 [30] Kostis Kaffes, Timothy Chong, Jack Tigar Humphries, Adam Belay,
+     development-kit-spdk.html, 2016.                                                      David Mazières, and Christos Kozyrakis. Shinjuku: Preemptive sched-
+[13] Intel Corporation. Intel® 64 and IA-32 Architectures Software Devel-                  uling for µsecond-scale tail latency. In 16th USENIX Symposium on
+     oper’s Manual Volume 3A: System Programming Guide, Part 1, chapter                    Networked Systems Design and Implementation (NSDI 19), pages 345–
+     User Interrupts, pages 7.1–7.8. 2023.                                                 360, Boston, MA, February 2019. USENIX Association.
+[14] Intel Corporation. Intel® Architecture Instruction Set Extensions and            [31] Kostis Kaffes, Jack Tigar Humphries, David Mazières, and Christos
+     Future Features Programming Reference, chapter User-Timer Events                      Kozyrakis. Syrup: User-defined scheduling across the stack. In Pro-
+     and Interrupts, pages 13.1–13.3. Number 319433-052. March 2024.                       ceedings of the ACM SIGOPS 28th Symposium on Operating Systems
+[15] Microsoft Corporation.          Introduction to receive side scal-                    Principles, SOSP ’21, page 605–620, New York, NY, USA, 2021. As-
+     ing. https://learn.microsoft.com/en-us/windows-hardware/drivers/                      sociation for Computing Machinery.
+     network/introduction-to-receive-side-scaling, 2023.                              [32] Martin Karsten and Saman Barghi. User-level threading: Have your
+[16] Henri Maxime Demoulin, Joshua Fried, Isaac Pedisich, Marios Kogias,                   cake and eat it too. Proc. ACM Meas. Anal. Comput. Syst., 4(1), may
+     Boon Thau Loo, Linh Thi Xuan Phan, and Irene Zhang. When idling                       2020.
+     is ideal: Optimizing tail-latency for heavy-tailed datacenter workloads          [33] Youngjin Kwon, Henrique Fingler, Tyler Hunt, Simon Peter, Emmett
+     with Perséphone. In Proceedings of the ACM SIGOPS 28th Symposium                      Witchel, and Thomas Anderson. Strata: A cross media file system. In
+     on Operating Systems Principles, SOSP ’21, page 621–637, New York,                    Proceedings of the 26th Symposium on Operating Systems Principles,
+     NY, USA, 2021. Association for Computing Machinery.                                   SOSP ’17, page 460–477, New York, NY, USA, 2017. Association for
+                                                                                           Computing Machinery.
+
+                                                                                 14
+[34] Jacob Leverich and Christos Kozyrakis. Reconciling high server uti-            [49] Henry Qin, Qian Li, Jacqueline Speiser, Peter Kraft, and John Ouster-
+     lization and sub-millisecond quality-of-service. In Proceedings of the              hout. Arachne: Core-Aware thread management. In 13th USENIX
+     Ninth European Conference on Computer Systems, EuroSys ’14, New                     Symposium on Operating Systems Design and Implementation (OSDI
+     York, NY, USA, 2014. Association for Computing Machinery.                           18), pages 145–160, Carlsbad, CA, October 2018. USENIX Associa-
+[35] Yueying Li, Nikita Lazarev, David Koufaty, Tenny Yin, Andy Anderson,                tion.
+     Zhiru Zhang, G. Edward Suh, Kostis Kaffes, and Christina Delimitrou.           [50] Rust Team. async/.await Primer. In Asynchronous Programming in
+     LibPreemptible: Enabling fast, adaptive, and hardware-assisted user-                Rust, 2023.
+     space scheduling. In 2024 IEEE International Symposium on High-                [51] Korakit Seemakhupt, Brent E. Stephens, Samira Khan, Sihang Liu,
+     Performance Computer Architecture (HPCA), pages 922–936, 2024.                      Hassan Wassel, Soheil Hassas Yeganeh, Alex C. Snoeren, Arvind Kr-
+[36] Jiazhen Lin, Youmin Chen, Shiwei Gao, and Youyou Lu. Fast core                      ishnamurthy, David E. Culler, and Henry M. Levy. A cloud-scale
+     scheduling with userspace process abstraction. In Proceedings of the                characterization of remote procedure calls. In Proceedings of the 29th
+     30th ACM Symposium on Operating Systems Principles, SOSP ’24,                       Symposium on Operating Systems Principles, SOSP ’23, page 498–514,
+     New York, NY, USA, 2024. Association for Computing Machinery.                       New York, NY, USA, 2023. Association for Computing Machinery.
+[37] Teng Ma, Shanpei Chen, Yihao Wu, Erwei Deng, Zhuo Song, Quan                   [52] Shumpei Shiina, Shintaro Iwasaki, Kenjiro Taura, and Pavan Balaji.
+     Chen, and Minyi Guo. Efficient scheduler live update for linux kernel               Lightweight preemptive user-level threads. In Proceedings of the 26th
+     with modularization. In Proceedings of the 28th ACM International                   ACM SIGPLAN Symposium on Principles and Practice of Parallel
+     Conference on Architectural Support for Programming Languages and                   Programming, PPoPP ’21, page 374–388, New York, NY, USA, 2021.
+     Operating Systems, Volume 3, ASPLOS 2023, page 194–207, New                         Association for Computing Machinery.
+     York, NY, USA, 2023. Association for Computing Machinery.                      [53] Livio Soares and Michael Stumm. FlexSC: flexible system call sched-
+[38] Brian D. Marsh, Michael L. Scott, Thomas J. LeBlanc, and Evangelos P.               uling with exception-less system calls. In Proceedings of the 9th
+     Markatos. First-class user-level threads. In Proceedings of the Thir-               USENIX Conference on Operating Systems Design and Implementa-
+     teenth ACM Symposium on Operating Systems Principles, SOSP ’91,                     tion, OSDI’10, page 33–46, USA, 2010. USENIX Association.
+     page 110–121, New York, NY, USA, 1991. Association for Computing               [54] I. Stoica and H. Abdel-Wahab. Earliest eligible virtual deadline first:
+     Machinery.                                                                          A flexible and accurate mechanism for proportional share resource
+[39] Chris Mason. schbench. https://kernel.googlesource.com/pub/scm/                     allocation. Technical report, USA, 1995.
+     linux/kernel/git/mason/schbench/+/refs/tags/v1.0, 2023.                        [55] Boris Teabe, Vlad Nitu, Alain Tchana, and Daniel Hagimont. The
+[40] Sarah McClure, Amy Ousterhout, Scott Shenker, and Sylvia Ratnasamy.                 lock holder and the lock waiter pre-emption problems: nip them in
+     Efficient scheduling policies for Microsecond-Scale tasks. In 19th                  the bud using informed spinlocks (I-Spinlock). In Proceedings of
+     USENIX Symposium on Networked Systems Design and Implementation                     the Twelfth European Conference on Computer Systems, EuroSys ’17,
+     (NSDI 22), pages 1–18, Renton, WA, April 2022. USENIX Association.                  page 286–297, New York, NY, USA, 2017. Association for Computing
+[41] Sohil Mehta. x86 user interrupts support. https://lwn.net/Articles/                 Machinery.
+     869140/, 2021.                                                                 [56] The kernel development community. CFS Scheduler. https://www.
+[42] Meta Platforms, Inc. RocksDB - A persistent key-value store. https:                 kernel.org/doc/html/latest/scheduler/sched-design-CFS.html, 2024.
+     //rocksdb.org, 2022.                                                           [57] Rob von Behren, Jeremy Condit, Feng Zhou, George C. Necula, and
+[43] Samantha Miller, Anirudh Kumar, Tanay Vakharia, Ang Chen, Danyang                   Eric Brewer. Capriccio: scalable threads for internet services. In
+     Zhuo, and Thomas Anderson. Enoki: High velocity linux kernel sched-                 Proceedings of the Nineteenth ACM Symposium on Operating Systems
+     uler development. In Proceedings of the Nineteenth European Confer-                 Principles, SOSP ’03, page 268–281, New York, NY, USA, 2003.
+     ence on Computer Systems, EuroSys ’24, page 962–980, New York,                      Association for Computing Machinery.
+     NY, USA, 2024. Association for Computing Machinery.                            [58] Kyle B. Wheeler, Richard C. Murphy, and Douglas Thain. Qthreads:
+[44] Jun Nakashima and Kenjiro Taura. MassiveThreads: A thread library                   An API for programming with millions of lightweight threads. In 2008
+     for high productivity languages. In Gul Agha, Atsushi Igarashi, Naoki               IEEE International Symposium on Parallel and Distributed Processing,
+     Kobayashi, Hidehiko Masuhara, Satoshi Matsuoka, Etsuya Shibayama,                   pages 1–8, 2008.
+     and Kenjiro Taura, editors, Concurrent Objects and Beyond: Papers              [59] Adam Wierman and Bert Zwart. Is tail-optimal scheduling possible?
+     dedicated to Akinori Yonezawa on the Occasion of His 65th Birthday,                 Operations Research, 60(5):1249–1257, 2012.
+     pages 222–238, Berlin, Heidelberg, 2014. Springer.                             [60] Irene Zhang, Amanda Raybuck, Pratyush Patel, Kirk Olynyk, Jacob
+[45] Amy Ousterhout, Joshua Fried, Jonathan Behrens, Adam Belay, and                     Nelson, Omar S. Navarro Leija, Ashlie Martinez, Jing Liu, Anna Korn-
+     Hari Balakrishnan. Shenango: Achieving high CPU efficiency for                      feld Simpson, Sujay Jayakar, Pedro Henrique Penna, Max Demoulin,
+     latency-sensitive datacenter workloads. In 16th USENIX Symposium                    Piali Choudhury, and Anirudh Badam. The Demikernel datapath OS
+     on Networked Systems Design and Implementation (NSDI 19), pages                     architecture for microsecond-scale datacenter systems. In Proceedings
+     361–378, Boston, MA, February 2019. USENIX Association.                             of the ACM SIGOPS 28th Symposium on Operating Systems Principles,
+[46] Soyeon Park, Sangho Lee, Wen Xu, HyunGon Moon, and Taesoo Kim.                      SOSP ’21, page 195–211, New York, NY, USA, 2021. Association for
+     libmpk: Software abstraction for intel memory protection keys (intel                Computing Machinery.
+     MPK). In 2019 USENIX Annual Technical Conference (USENIX ATC
+     19), pages 241–254, Renton, WA, July 2019. USENIX Association.
+[47] Simon Peter, Jialin Li, Irene Zhang, Dan R. K. Ports, Doug Woos,
+     Arvind Krishnamurthy, Thomas Anderson, and Timothy Roscoe. Ar-
+     rakis: The operating system is the control plane. In 11th USENIX
+     Symposium on Operating Systems Design and Implementation (OSDI
+     14), pages 1–16, Broomfield, CO, October 2014. USENIX Association.
+[48] George Prekas, Marios Kogias, and Edouard Bugnion. ZygOS: Achiev-
+     ing low tail latency for microsecond-scale networked tasks. In Proceed-
+     ings of the 26th Symposium on Operating Systems Principles, SOSP ’17,
+     page 325–341, New York, NY, USA, 2017. Association for Computing
+     Machinery.
+
+                                                                               15
+

@@ -1,0 +1,1052 @@
+                                                Cage: Hardware-Accelerated Safe WebAssembly
+                                                          Martin Fink                              Dimitrios Stavrakakis                        Dennis Sprokholt
+                                                   martin.fink@cit.tum.de                        dimitrios.stavrakakis@tum.de                d.g.sprokholt@tudelft.nl
+                                                Technical University of Munich                  Technical University of Munich             Delft University of Technology
+                                                      Munich, Germany                                  Munich, Germany                         Delft, The Netherlands
+
+                                                    Soham Chakraborty                                  Jan-Erik Ekberg                          Pramod Bhatotia
+                                                 S.S.Chakraborty@tudelft.nl                      jan.erik.ekberg@huawei.com                 pramod.bhatotia@tum.de
+                                                Delft University of Technology                       Huawei Technologies                  Technical University of Munich
+                                                    Delft, The Netherlands                              Helsinki, Finland                       Munich, Germany
+arXiv:2408.11456v3 [cs.PL] 19 Dec 2024
+
+
+
+
+                                         Abstract                                                                  Keywords: WebAssembly, Memory Safety
+                                         WebAssembly (WASM) is an immensely versatile and increas-                 ACM Reference Format:
+                                         ingly popular compilation target. It executes applications                Martin Fink, Dimitrios Stavrakakis, Dennis Sprokholt, Soham Chak-
+                                         written in several languages (e.g., C/C++) with near-native               raborty, Jan-Erik Ekberg, and Pramod Bhatotia. 2025. Cage: Hard-
+                                         performance in various domains (e.g., mobile, edge, cloud).               ware-Accelerated Safe WebAssembly. In Proceedings of the 23rd
+                                         Despite WASM’s sandboxing feature, which isolates appli-                  ACM/IEEE International Symposium on Code Generation and Opti-
+                                                                                                                   mization (CGO ’25), March 01–05, 2025, Las Vegas, NV, USA. ACM,
+                                         cations from other instances and the host platform, WASM
+                                                                                                                   New York, NY, USA, 16 pages. https://doi.org/10.1145/3696443.3708
+                                         does not inherently provide any memory safety guarantees
+                                                                                                                   920
+                                         for applications written in low-level, unsafe languages.
+                                            To this end, we propose Cage, a hardware-accelerated                   1   Introduction
+                                         toolchain for WASM that supports unmodified applications
+                                         compiled to WASM and utilizes diverse Arm hardware fea-                   WebAssembly (WASM) [22] has been gaining prominence as
+                                         tures aiming to enrich the memory safety properties of                    a versatile compilation target [37]. WASM allows for deploy-
+                                         WASM. Precisely, Cage leverages Arm’s Memory Tagging                      ing and executing native applications written in a variety of
+                                         Extension (MTE) to (i) provide spatial and temporal memory                languages, such as C/C++ and Rust, in a wide spectrum of
+                                         safety for heap and stack allocations and (ii) improve the                environments (e.g., Web, Edge Cloud, IoT devices) [5], while
+                                         performance of WASM’s sandboxing mechanism. Cage fur-                     achieving near-native performance. In principle, WASM en-
+                                         ther employs Arm’s Pointer Authentication (PAC) to prevent                ables the compilation of high-level languages (e.g., C/C++) to
+                                         leaked pointers from being reused by other WASM instances,                its bytecode format, which can then be seamlessly compiled
+                                         thus enhancing WASM’s security properties.                                to native machine code based on the targeted underlying
+                                            We implement our system based on 64-bit WASM. We                       architecture, which justifies its increasing adoption.
+                                         provide a WASM compiler and runtime with support for                         A core design principle of WASM is the sandboxing of
+                                         Arm’s MTE and PAC. On top of that, Cage’s LLVM-based                      untrusted code [4], providing a safety property of Software
+                                         compiler toolchain transforms unmodified applications to                  Fault Isolation (SFI) [54]. Each WASM application is confined
+                                         provide spatial and temporal memory safety for stack and                  in its isolated address space and has no access rights beyond
+                                         heap allocations and prevent function pointer reuse. Our                  that. Thus, WASM protects the host and other guest WASM
+                                         evaluation on real hardware shows that Cage incurs min-                   instances from potentially malicious or buggy code.
+                                         imal runtime (< 5.8 %) and memory (< 5.3 %) overheads                        However, applications compiled to WASM are still vulner-
+                                         and can improve the performance of WASM’s sandboxing                      able to memory safety issues, such as buffer overflows or
+                                         mechanism, achieving a speedup of over 5.1 %, while offering              dangling pointers, within an application’s memory space,
+                                         efficient memory safety guarantees.                                       despite WASM’s sandboxing [34]. Such issues allow attack-
+                                                                                                                   ers to manipulate the memory space of a WASM instance,
+                                         CCS Concepts: • Security and privacy → Systems secu-                      corrupting or leaking sensitive data or manipulating the con-
+                                         rity; • Software and its engineering → Compilers.                         trol flow. This limitation becomes particularly evident when
+                                                                                                                   compiling applications written in memory-unsafe languages,
+                                                                                                                   e.g., C/C++. Importantly, numerous CVEs remain exploitable
+                                                                                                                   when compiled to WASM (§3).
+                                         This work is licensed under a Creative Commons Attribution 4.0 Interna-      Unfortunately, existing memory safety solutions, designed
+                                         tional License.
+                                         CGO ’25, March 01–05, 2025, Las Vegas, NV, USA
+                                                                                                                   for applications compiled to native machine code, cannot be
+                                         © 2025 Copyright held by the owner/author(s).                             directly applied for WASM due to several factors:
+                                         ACM ISBN 979-8-4007-1275-3/25/03                                          – Memory safe languages, such as Rust or OCaml, tackle
+                                         https://doi.org/10.1145/3696443.3708920                                      memory safety at the language level by encoding certain
+CGO ’25, March 01–05, 2025, Las Vegas, NV, USA                         M. Fink, D. Stavrakakis, D. Sprokholt, S. Chakraborty, J.-E. Ekberg, P. Bhatotia
+
+
+   properties in their type system or providing safe abstrac-                                        WebAssembly Runtime
+   tions, e.g., in their standard libraries. However, it is not fea-                WASM Instance #1                #2                   #3
+   sible to port all applications or libraries written in C/C++                          Heap base               Heap base           Heap base
+   to languages with such guarantees.
+– Trip-wire-based memory safety approaches [12, 14, 23,
+   40, 47, 48] do not apply to WASM without altering the                       Linear memory          Runtime Address Space      Guard page
+   WASM memory layout properties, as these approaches
+   rely on shadow memory or guard pages.                                               Figure 1. WASM’s linear memory model.
+– Pointer- or object-based solutions [7, 15, 17, 18, 29, 30,               – Evaluation on real hardware: Evaluation and security
+   36, 38, 40] can be adapted to WASM, but they either modify                analysis of Cage’s implementation on commercially avail-
+   the pointer layout and size, incur significant runtime over-              able Arm hardware. Our evaluation is structured around
+   heads, or rely on custom hardware [55], thus, hindering                   performance and memory overheads and is accompanied
+   production deployment in common WASM environments.                        by an extensive analysis of MTE and PAC performance as
+Hence, we aim to answer the question: How can we design                      implemented on real hardware.
+a practical system to provide memory safety properties for                 We implement our Cage prototype on top of 64-bit WASM,
+unmodified applications compiled to WASM without changing                  consisting of a compiler toolchain based on LLVM and a
+its linear memory model and introducing minimal overheads                  WASM compiler and runtime based on wasmtime incorpo-
+to allow for deployment in production environments?                        rating support for Arm’s MTE and PAC. We conduct an ex-
+   Our key insight is to leverage modern commodity hard-                   tensive analysis of Cage’s security guarantees and evaluate
+ware extensions by designing abstractions for WASM that                    Cage’s performance using the PolyBench/C [45] benchmark
+can be directly used by the compilers. Precisely, Arm re-                  suite. We further analyze Arm’s MTE and PAC performance
+cently introduced new ISA extensions, namely PAC [46] and                  as implemented on production hardware through a set of mi-
+MTE [11], that can serve as a base to design practical, high-              crobenchmarks. Our evaluation on real Arm hardware shows
+performance solutions against memory safety issues.                        that Cage provides its memory safety properties while incur-
+   To this end, we propose Cage, a hardware-accelerated                    ring minimal runtime (< 5.6 %) and memory (< 5.3 %) over-
+WASM toolchain that leverages Arm’s MTE and PAC hard-                      heads and is capable of significantly improving the perfor-
+ware extensions to provide both spatial and temporal mem-                  mance of WASM’s sandboxing feature, achieving a speedup
+ory safety issues for unmodified C/C++ programs. Cage fur-                 of over 5.1 %.
+ther hardens applications against control flow highjacking
+in the form of function pointer reuse between WASM in-
+stances. Additionally, Cage improves the performance of
+the sandboxing mechanism for 64-bit WASM by offloading
+                                                                           2     Background
+the bounds checks to MTE hardware. We design Cage so it
+can fall back to software-based implementations on devices                 2.1     WebAssembly
+lacking the relevant hardware.                                             WebAssembly [22] is a versatile, high-performance compila-
+   To the best of our knowledge, Cage is the first practical,              tion target, initially designed as an alternative to JavaScript.
+comprehensive, and efficient solution for unmodified C/C++                 Its goal is to execute applications written in any language
+programs that can be deployed on commodity hardware                        with near-native performance regardless of the hardware
+and provides strong memory safety guarantees for WASM                      and software stack of the hosting platform. Several high-level
+instances running memory-unsafe code on Arm platforms.                     languages (e.g., C/C++, Rust) can be compiled to WASM’s
+   Altogether, Cage makes the following contributions:                     bytecode format. It is then lowered to the appropriate native
+– WebAssembly extension: A minimal and generic exten-                      machine code, depending on the underlying system archi-
+   sion to the WebAssembly specification to provide memory                 tecture. This feature expands the usability of WASM to vari-
+   safety guarantees and is deployable on every platform,                  ous other domains [5], such as Function-as-a-Service (FaaS)
+   regardless of the availability of specialized hardware.                 workloads or even as an alternative to Linux containers [1].
+– Compiler toolchain: A compiler toolchain that transpar-                     WASM employs a linear memory model (see Fig. 1). Thus,
+   ently hardens unmodified programs to enforce spatial and                applications manage their memory without requiring un-
+   temporal memory safety for stack and heap allocations                   natural idioms, and WASM runtimes can efficiently map the
+   and prevent unintended function pointer reuse.                          WASM instance memory directly to host memory. Impor-
+– WASM runtime: A hardware-accelerated WASM com-                           tantly, WASM’s design does not allow unstructured control
+   piler and runtime, leveraging Arm’s MTE and PAC with                    flow. WASM uses indices into type- and bounds-checked
+   minimal overhead that can be deployed in production.                    tables instead of raw function pointers to make indirect
+                                                                           function calls, while, for jumps, WASM provides a set of
+                                                                           well-defined control flow constructs. Additionally, WASM
+Cage: Hardware-Accelerated Safe WebAssembly                                                      CGO ’25, March 01–05, 2025, Las Vegas, NV, USA
+
+
+         char *buffer = malloc(32);                                                          16 bit                    48 bit
+                                                                      No extension                                    address
+         buffer[33];
+                                                                              MTE            T                        address
+         free(buffer);                        16 bytes
+                                                                              PAC        S            S               address
+         buffer[8];
+                                                                         MTE + PAC     S T         S                  address
+ Figure 2. Example of a heap allocation protected by MTE.                            4 bit 4 bit 7 bit                 48 bit
+ After allocation, the pointer and allocation are tagged
+ with , while the surrounding memory is tagged with .               Figure 3. Pointer layout on aarch64 in Linux with and
+ When accessing memory, the hardware catches out-of-                without MTE and PAC enabled.
+ bounds errors ( ≠ ). When freeing memory, the mem-                safety metadata on a per-object level and ensure memory
+ ory region is retagged with . This prevents use-after-free        safety for pointers with respect to an object, and (iii) pointer-
+ errors ( ≠ ).                                                     based approaches [13, 26, 29, 30, 38, 39, 41, 57] that keep track
+does not expose registers but operates on a verified, well-        of object bounds by either storing them in the pointer itself
+typed stack to ensure compatibility with diverse compilation       (e.g., via fat pointers) or in external data structures. Addition-
+targets that offer different sets of registers.                    ally, specialized solutions [6, 31, 35] have also been proposed
+   WASM also provides sandboxing for programs. The WASM            to mitigate control-flow attacks that occur via memory safety
+runtime must ensure that each instance can only access mem-        bugs and either analyze applications to enforce valid control
+ory within the bounds of its accessible linear memory. This is     flow paths or enforce memory safety for code pointers using
+typically achieved using either (i) explicit bounds checks that    hardware- or software-based techniques.
+are inserted before every memory access, validating that it        Memory tagging approaches [11, 49] combine aspects from
+lies within the WASM instance’s memory range or (ii) guard         object- and pointer-based approaches. They typically asso-
+pages, where 4 GiB of virtual memory is mapped and pages           ciate metadata stored in the unused bits of a pointer with
+beyond the WASM instance’s memory is marked as inacces-            memory objects by assigning tags to allocated memory re-
+sible, and any access in them results in a segmentation fault.     gions and performing checks at runtime.
+This only works for 32 bit pointers, which don’t allow ac-
+cessing memory beyond 4 GiB. Typically, switching to 64-bit        2.3     Memory Safety Hardware Extensions
+WASM entails switching to the more expensive approach (i)          As an alternative to flexible yet slow software-based mem-
+with explicit bounds checks.                                       ory safety solutions, CPU designers develop hardware ex-
+                                                                   tensions [11, 13, 41, 46] to serve as a foundation for efficient
+2.2   Memory Safety                                                memory safety. They provide security primitives to fortify
+Applications written in low-level, memory-unsafe languages         applications with memory safety properties while having
+(e.g., C/C++) are prone to memory safety bugs that enable a        minimal memory and performance overheads, making them
+whole class of attacks on a vulnerable or buggy program [50].      suitable for production deployment.
+Several studies have shown that in large software projects,           Fig. 3 presents an example layout of a pointer on aarch64,
+memory safety bugs make up between 70 % and 75 % of their          the 64-bit variant of the ArmV8 ISA [10]. Only 48 out of the
+security vulnerabilities [2, 52, 53]. These bugs are classified    available 64 bits are used to address memory. The remaining
+as spatial or temporal. Spatial memory safety errors occur         bits are set to 0 or 1 to differentiate between kernel and
+when a memory access is performed beyond the allocated             userspace. Hardware extensions such as Top Byte Ignore
+boundaries of a memory object (e.g., buffer overflows), while      (TBI), MTE (§2.3), or PAC (§2.3) leverage those unused bits
+temporal memory safety bugs refer to accesses to memory            for storing metadata.
+regions before they are allocated or after their release (e.g.,    Memory Tagging Extension (MTE). ARMs MTE provides
+dangling pointers). These vulnerabilities can be exploited         a building block for spatial and temporal memory safety [11].
+by attackers to overwrite data or redirect control flow, for       MTE implements a lock-and-key mechanism where mem-
+instance, by manipulating the return address saved on the          ory regions can be tagged with one of 16 distinct tags, and
+stack to create return-oriented programming (ROP) chains,          memory accesses are only allowed using pointers with the
+chaining existing snippets of code together to create attacks.     corresponding tags. The locking mechanism stores a 4-bit
+    To this end, several memory safety solutions have been         tag in bits 56–59 of an address. Accordingly, a tag is assigned
+proposed, which can be divided into three major categories:        to memory with a granularity of 16 bytes.
+(i) trip-wire-based approaches [12, 14, 23, 40, 47, 48] that em-      Fig. 2 presents how MTE can provide spatial as well as
+ploy guard zones around memory objects and allocate des-           temporal memory safety. Precisely, MTE can ensure spatial
+ignated memory regions, namely shadow memory, that de-             memory safety by assigning different tags to adjacent mem-
+termine whether a memory location is accessible or not,            ory regions, while it also can offer temporal memory safety
+(ii) object-based approaches [7, 15, 17, 18] that track memory     by retagging freed memory regions.
+CGO ’25, March 01–05, 2025, Las Vegas, NV, USA                     M. Fink, D. Stavrakakis, D. Sprokholt, S. Chakraborty, J.-E. Ekberg, P. Bhatotia
+
+
+ Table 1. MTE and PAC instruction throughput (instruc-                                                                        Lower is better ↓
+ tions per cycle, higher is better) and latencies (cycles, lower                            100     none             async     sync                                           90.8
+ is better). We only show PAC instructions using the Data                                    80                                                          72.1
+                                                                                                                                                                   80.3
+
+ A-key (da).
+
+
+
+
+                                                                             Runtime (ms)
+                                                                                             60
+                                                                                                                                                  50.8
+                                                                                                                             44.4      45.9
+                Cortex-X3      Cortex-A715       Cortex-A510                                 40                      35.9
+      Inst                                                                                        30.2     30.9
+                Tp    Lat       Tp    Lat         Tp    Lat                                  20
+
+                                    MTE                                                       0
+      irg       1.34    1.99   1.00 2.00         0.50   3.00                                             Cortex-X3                  Cortex-A715                 Cortex-A510
+
+
+      addg      2.01    1.99   3.81 1.00         2.22   2.00
+                                                                         Figure 4. Performance overhead of MTE sync and async
+      subg      2.01    1.99   3.81 1.00         2.22   2.00
+                                                                         mode for writing 128 MiB of memory. See §7.1 for details
+      subp      3.49    0.99   3.81 1.00         2.50   2.00             on the experimental setup.
+     subps      2.88    0.99   3.80 1.00         2.50   2.00
+      stg       1.00     –     1.81    –         1.00    –             Architectural performance analysis. We evaluate the
+      st2g      1.00     –     1.84    –         0.46    –             performance characteristics of MTE as implemented on the
+      stzg      1.00     –     1.84    –         0.98    –             Tensor G3 chip, such as throughput and latency of the in-
+     st2zg      0.34     –     1.79    –         0.45    –             dividual instructions in Table 1. We run microbenchmarks
+      stgp      1.00     –     1.69    –         0.98    –             executing 1010 instructions in an unrolled loop. To measure
+      ldg       2.92     –     1.91    –         0.93    –             throughput, we execute the instructions without any data de-
+                                    PAC                                pendencies; to measure latency, we force a data dependency
+    pacdza      1.01    4.97   1.51 5.00         0.20   4.99
+                                                                       between subsequent instructions. For instructions storing
+    pacda       1.01    4.97   1.42 5.00         0.20   5.00
+                                                                       and loading memory tags, we only measure throughput.
+    autdza      1.01    4.97   1.51 5.00         0.20   7.99
+    autda       1.01    4.97   1.43 5.00         0.20   7.99              We further measure the raw overhead of enabling MTE.
+    xpacd       1.01    1.99   1.56 2.00         0.20   4.99           We perform a 128 MiB memset with MTE disabled, synchro-
+                                                                       nous, and asynchronous mode. We perform each run with
+    MTE currently can be set in one the following modes:               a clean cache. In Fig. 4, we observe that with synchronous
+(i) disabled, where no tag checks are performed, (ii) synchro-         MTE, memset is 19.1%, 14.4%, and 29.9% slower on the re-
+nous, where a tag mismatch immediately triggers a fault                spective cores compared to the baseline with MTE disabled.
+disallowing the read/write at the affected memory location,            Asynchronous MTE gets closer to the baseline with an over-
+(iii) asynchronous, where a tag mismatch does not cause a              head of 2.6%, 3.3%, and 11.3%, respectively.
+fault directly but sets a CPU flag that is checked at the next
+context switch, thus allowing for a potential read/write at the        3         Motivation
+affected memory location by the triggering command, and
+(iv) asymmetric, where reads are checked asynchronously                WebAssembly is inherently protected by design against a
+and writes are checked synchronously.                                  wide range of attack vectors, such as jumping to arbitrary
+Pointer Authentication (PAC). PAC [46] introduces hard-                addresses or injecting shellcode. Despite its protection mech-
+ware primitives to prevent attackers from forging pointers.            anisms, it is shown that WebAssembly is still susceptible
+PAC places a 7 to 16 bit signature in the upper bits of point-         to attacks originating from memory safety issues, such as
+ers, with the exact layout being dependent on the operating            buffer overflows or dangling pointer accesses [34].
+system, the underlying hardware, and other factors (e.g. if               Importantly, WASM compilers place data in the linear
+MTE is enabled). Signatures are created using the pointer              memory of the WASM instance, where both read and write
+value, a secret key placed in an inaccessible register, and            permissions are granted to the executed code. The lack of
+a user-defined value (modifier). Signed pointers cannot be             read-only memory regions and the ability to map arbitrary
+used directly to access memory; they must be authenticated.            pages in WASM prevents measures, such as Address Space
+Authenticating a pointer consists of validating the signature          Layout Randomization (ASLR) or guard pages, from being
+and stripping out the signature if the validation is successful,       applied. Thus, in case of a successful exploit of a memory
+thus producing a valid pointer. In case of a failed authenti-          safety bug, an attacker can overwrite application data. Ta-
+cation, PAC can either produce a pointer that will trap on             ble 2 presents a set of exploits that were discovered outside
+memory access or trap immediately. This behavior depends               the scope of WASM but serve as examples that showcase
+on whether FEAT_FPAC is implemented [10].                              potential memory safety errors when the vulnerable appli-
+    MTE and PAC can be combined at the cost of bits available          cations run in a WASM instance.
+for the PAC signature. The exact layout of the PAC signature              Additionally, in WASM, a degree of control flow manipu-
+varies depending on the system. On Linux, bits 56–59 are               lation is possible. Precisely, function pointers can be over-
+used for MTE while bits 63–60 and 54–49 are used for PAC, as           written with pointers to other functions that share the same
+shown in Fig. 3. The remaining bit 55 differentiates between           signature. However, it can only occur with functions that are
+kernel- and user-space addresses.                                      1 Although the ROP chain is mitigated, memory corruption is still possible.
+Cage: Hardware-Accelerated Safe WebAssembly                                                      CGO ’25, March 01–05, 2025, Las Vegas, NV, USA
+
+
+   C/C++ source                                                                                Wasmtime
+                   LLVM
+      code                                                                                          WASM
+                                                                                  Hardened                            Modified components
+                     Clang   opt   san-memsafety   san-ptr-auth   codegen
+                                                                                   WASM
+     WASI-libc                                                                                                        New components
+                                                                                                  MTE + PAC
+
+ Figure 5. Overview of Cage’s components and instrumentation pipeline: Unmodified C/C++ code is compiled along with our
+ modified WASI-libc. After optimizations, two sanitizer passes for memory safety and pointer authentication run, inserting
+ new WASM instructions. Wasmtime processes this hardened WASM and emits MTE and PAC.
+
+ Table 2. An exemplary list of memory safety errors, their              1 struct VTable { void (*f)(); void (*g)(); };
+ underlying cause, and the level of their mitigation.                   2 void vulnerable(char *input) {
+                                                                        3       struct VTable vtable = {.f = foo, .g = bar};
+       CVE               Cause          Mitigated in WASM               4       char buf[16];
+   CVE-2023-4863      Out-of-bounds             No                      5       strcpy(buf, input);
+   CVE-2014-0160      Out-of-bounds             No                      6       vtable.f();
+   CVE-2021-3999      Out-of-bounds          Partially1                 7}
+   CVE-2018-14550     Out-of-bounds             No
+   CVE-2021-22940     Use-after-free            No                           Listing 1. Vulnerable overflow allowing attackers to redi-
+   CVE-2021-33574     Use-after-free            No                           rect control flow to call foo instead of bar.
+   CVE-2020-1752      Use-after-free            No
+                                                                            Recently, manufacturers have started shipping hardware sup-
+   CVE-2019-11932      Double-free           Partially1
+                                                                            porting both PAC and MTE, with the Google Pixel 8 being
+present in the function table, i.e., functions that are targets             the first commercially available device to feature both. These
+of virtual function calls, such as virtual functions in C++.                extensions offer strong security guarantees with very low
+This results in a similar property as code-pointer separa-                  overhead, as shown in Table 1 and Fig. 4.
+tion (CPS) [31]. Listing 1 showcases such a vulnerability, as               Cage. To tackle the aforementioned memory safety issues,
+an attacker can overwrite a function pointer and redirect                   we design Cage, an extension to WASM that efficiently pre-
+an indirect call to another function. When WASM is used                     vents memory safety and function-pointer reuse exploits
+in a WebOS-like scenario [28, 32, 56], i.e., running multiple               by leveraging Arm’s MTE and PAC. On top of that, Cage
+instances in a single process, leaking function pointers in                 implements hardware-based sandboxing using MTE to cir-
+one program is even more vulnerable, especially if instances                cumvent the overhead of software-based checks and prevent
+share a common library.                                                     vulnerabilities, e.g., CVE-2023-26489.
+WebAssembly sandboxing. WASM engines use various
+techniques to protect their sandboxes against malicious code.               4     Design
+While virtual memory and guard pages are preferred for
+                                                                            Cage consists of a WASM extension to provide memory
+performance reasons, some settings (e.g., 64-bit WASM) ne-
+                                                                            safety guarantees within a WASM instance and improve the
+cessitate software-based bounds checks, which come at a
+                                                                            performance of the sandboxing mechanism. Its core design
+higher performance cost. Based on our evaluation, switching
+                                                                            principles are to be (i) minimally invasive and (ii) applicable
+from 32-bit to 64-bit WASM results in a roughly 6–8 % over-
+                                                                            on diverse platforms using various approaches, including
+head on out-of-order CPUs, which can speculate through
+                                                                            hardware extensions, such as MTE and PAC, software-based
+bounds checks, and 52 % overhead on in-order CPUs (§ 7.2).
+                                                                            techniques, or hybrid solutions similar to HWASan [49].
+The measurements on out-of-order CPUs align with previous
+                                                                               Figure 5 presents an overview of Cage. Precisely, un-
+works [51]. The fallback to software-based bounds checks
+                                                                            modified C/C++ source code is compiled using the LLVM
+is especially painful when running on low-power in-order
+                                                                            toolchain [33], where Cage includes a sanitizer that instru-
+cores using 64-bit WASM or in environments without an OS,
+                                                                            ments stack allocations and function pointers, along with
+such as embedded devices. Additionally, software bounds
+                                                                            a modified libc based on WASI [21] that protects heap al-
+checks or the guard pages technique may suffer from imple-
+                                                                            locations. LLVM’s backend generates the hardened WASM
+mentation bugs and must be protected against spectre-style
+                                                                            binaries that can be executed in wasmtime [9], which imple-
+attacks [27]. An example is CVE-2023-26489 [3], where an
+                                                                            ments our extension using MTE and PAC.
+erroneous code lowering rule allowed malicious WASM in-
+stances to access memory outside the sandbox.                               4.1    System Model
+   WASM is, despite limitations such as high overhead when
+                                                                            Threat model. Figure 6 highlights two aspects of memory
+running 64-bit WASM or the lack of a practical and low-
+                                                                            safety, present in WASM, namely internal and external mem-
+overhead solution to prevent memory safety issues in pro-
+                                                                            ory safety. We depict trusted components ( ) in green and
+grams written in C/C++, steadily growing in adoption [5].
+                                                                            untrusted components ( ) in red. We further annotate the
+                                                                            hardened component by Cage in each of these models ( ).
+CGO ’25, March 01–05, 2025, Las Vegas, NV, USA                       M. Fink, D. Stavrakakis, D. Sprokholt, S. Chakraborty, J.-E. Ekberg, P. Bhatotia
+
+
+               Runtime                              Runtime
+                                                                                   (new instructions) 𝑒 F segment.new 𝑜
+  Input     WASM Instance                        WASM Instance
+                                                                                                            | segment.set_tag 𝑜
+(a) Internal memory safety.            (b) External memory safety.                                          | segment.free 𝑜
+ Figure 6. Internal and external memory safety in WASM.                                                     | i64.pointer_sign
+   The internal memory safety model (Fig. 6a) mirrors the                                                   | i64.pointer_authenticate
+threat environment of a standard non-WASM program. In
+                                                                           Figure 7. Cage’s new instructions: Segment instructions
+this case, the application in the sandbox and its runtime, in-             take a constant unsigned offset 𝑜, which allows compilers
+cluding the compiler, are considered trusted and assumed to                to fold in constant offsets when manipulating segments.
+be bug-free. Untrusted input (e.g., network data) originates
+                                                                                           Allocation n         Allocation n + 1
+outside the sandbox and can be controlled by an attacker.
+This implies that common memory safety bugs, such as buffer                Heap                                    Untagged allocator metadata
+overflows or use-after-free, can be exploited to tamper with
+the WASM memory. WebAssembly’s design inherently mit-                    (a) Heap layout with untagged allocator metadata slots, ensuring
+                                                                         no tag collisions for adjacent allocations.
+igates some threats common in non-WASM environments
+                                                                             Frame n         Frame n + 1          Frame n + 2
+(§ 2.1), so we do not consider ROP-style attacks or those
+relying on unstructured control flow.                                      Stack                                   Guard allocations
+   The external memory safety model (Fig. 6b) refers to the
+security of the sandbox. Threats originate from running un-              (b) Stack layout with guard slots ensuring tag collisions never occur
+trusted programs, which may be adversarial or contain bugs.              for adjacent allocations.
+Typical attacks include sandbox escapes, where an attacker                 Figure 8. Untagged slots serving as guard slots to prevent
+attempts to break out of the sandbox’s restrictions and ac-                tag collisions for adjacent allocations.
+cess host resources, or side-channel attacks, where attackers            for selected memory allocations. It builds on wasm64 [20],
+exploit timing differences or resource usage patterns to infer           the 64-bit variant of WebAssembly. Wasm64 extends point-
+sensitive information. In this setting, we assume that the op-           ers within a WASM instance to 64 bits. Out of those, only
+erating system and the underlying architecture do not have               48 are used to index memory. This allows Cage to utilize
+exploitable bugs. Importantly, we do not make assumptions                the remaining 16 bits to store its required memory safety
+about potential spectre-like [27] attacks. We do not protect             metadata.
+against protected against side-channel attacks.                          Memory safety. Cage introduces the notion of segments
+Programming model. Cage currently supports unmodi-                       and tagged pointers in the context of WASM. It further fea-
+fied applications written in C/C++ that target 64-bit WASM.              tures five new instructions, shown in Fig. 7, that allow the
+Note that our toolchain is not bound to any language and                 creation of segments and the derivation of tagged pointers
+can handle other languages compiled to LLVM in the future.               from raw pointers. The Cage pointers carry provenance
+Cage provides spatial and temporal heap safety to applica-               and can only access the segment they were created with.
+tions that use its adapted WASI-libc that comes with a hard-             Conversely, segments can only be accessed by the tagged
+ened allocator. For applications using their own allocator, we           pointers created with them.
+expose Cage’s memory safety primitives to C, enabling pro-                  At an instance startup, the linear memory consists of a
+grammers to implement the same security guarantees. Lastly,              single segment that can be accessed via untagged indices,
+Cage reserves the unused upper 16 bits of 64-bit pointers to             allowing unmodified code to run under our new semantics
+place memory safety metadata.                                            without modifications. This design choice allows the grad-
+Deployment model. Cage’s prototype is highly optimized                   ual integration of safety primitives into specific parts of
+to use Arm’s hardware extensions to minimize the runtime                 WebAssembly applications where enhanced security is re-
+overheads. Therefore, its primary deployment target is Arm               quired. Thus, Cage can achieve security properties similar
+CPUs with Arm PAC and MTE extensions. However, Cage                      to those of specialized hardware designed mainly for mem-
+can also be deployed on any platform, regardless of the un-              ory safety [57] by combining the concept of segments with
+derlying hardware, where the respective memory safety pro-               Arm’s hardware extensions (e.g., MTE).
+tection mechanisms have an equivalent software fallback,                 Heap safety. In Cage, the memory allocator must be aware
+resulting in higher performance overheads.                               of segments to provide heap safety. Adapting a memory al-
+                                                                         locator to utilize Cage’s memory safety extensions requires
+4.2   WebAssembly Extension                                              minimal modifications. When allocating memory, the allo-
+Cage essentially is an extension to WebAssembly that in-                 cator must align the requested size to 16 bytes, perform the
+troduces primitives that can be used by a modified standard              allocation, and create a segment. The corresponding tagged
+library or sanitizers to provide memory safety guarantees                pointer is then returned to the caller. Cage randomly selects
+Cage: Hardware-Accelerated Safe WebAssembly                                                            CGO ’25, March 01–05, 2025, Las Vegas, NV, USA
+
+
+ Algorithm 1: Detect and harden safe and unsafe stack                                                       WASM Instance
+
+ allocations.                                                                   Sig       Pointer              trap                 Function Table
+Input : Allocations                                                                   i64.ptr_auth                            0    0x8000'5f00
+Output : Hardened stack allocations                                                                                           1    0x8000'6500
+handle_stack_allocations(allocations)                                           0         Pointer          call_indirect      2    0x8000'8650
+                                                                                                                             ...        ...
+begin                                                                                 i32.wrap_i64           Pointer
+     allocsToInstrument ← ∅
+     foreach alloc ∈ allocations do
+           if escapes(𝑎𝑙𝑙𝑜𝑐 ) then
+                 allocsToInstrument ← allocsToInstrument ∪ { alloc }
+                                                                             Figure 9. Our modified instruction sequence for indirect
+           else if isUsedByUnsafeGEP(𝑎𝑙𝑙𝑜𝑐 ) then                            function calls.
+                 allocsToInstrument ← allocsToInstrument ∪ { alloc }
+           end                                                                                          𝐶 memory = 𝑛
+     end
+     foreach alloc ∈ allocsToInstrument do                                                    𝐶 ⊢ segment.new 𝑜 : i64 i64 → i64
+           insertTaggingCode(alloc )
+           insertUntaggingCode(alloc )                                                                  𝐶 memory = 𝑛
+     end
+     if allocsToInstrument ≠ ∅ ∧ allocations[0] ∉ allocsToInstrument then                   𝐶 ⊢ segment.set_tag 𝑜 : i64 i64 i64 → 𝜖
+           insertGuardAlloc()
+     end
+                                                                                                        𝐶 memory = 𝑛
+end                                                                                            𝐶 ⊢ segment.free 𝑜 : i64 i64 → 𝜖
+a tag for each allocation. When freeing memory, Cage’s al-                                       𝐶 ⊢ i64.pointer_sign : i64 → i64
+locator uses the segment.free instruction that ensures the
+detection of potential use-after-free and double-free errors.                                    𝐶 ⊢ i64.pointer_auth : i64 → i64
+    Further, Cage has to ensure that there are no tag collisions             Figure 10. Typing rules of Cage’s new instructions. For
+for adjacent allocations to provide protection against off-by-               the definition of context 𝐶, see the WASM paper [22].
+one buffer overflows/underflows. This is achieved by design
+                                                                            Pointer authentication. Cage provides pointer authentica-
+as Cage places metadata at the beginning of every heap allo-
+                                                                            tion primitives that prevent function pointer reuse between
+cation, and the corresponding memory region is preserved
+                                                                            WASM instances. On the instantiation of a WASM module, a
+untagged, as shown in Fig. 8a. Thus, adjacent allocations are
+                                                                            secret key is generated. The key is not accessible by the user
+always separated by an untagged memory segment.
+                                                                            code. Cage’s authentication operations leverage this key to
+Stack safety. To provide memory safety for the stack, Cage
+                                                                            sign and authenticate pointers using a cryptographic hash
+creates segments for the stack slots when entering a function.
+                                                                            function. The signature is placed in the unused 16 bits of a
+Cage generates a random tag per function for the first stack
+                                                                            WASM pointer, alongside the pointer tag, if applicable. Point-
+allocation. Subsequent stack allocations use this tag and
+                                                                            ers containing a signature cannot directly access memory.
+increment it by one. As the available tag bits are limited,
+                                                                            On authentication, the signature is checked and stripped, if
+the tag wraps around on overflow. Before returning from a
+                                                                            it is valid. Otherwise, the WASM module traps. While func-
+function, all stack slots are untagged and reassigned to the
+                                                                            tion pointer reuse within a WASM instance is still possible,
+original stack frame. This allows other functions to use the
+                                                                            Cage prevents the reuse across different instances, as each
+memory and prevents stack slots from being accessed after
+                                                                            instance generates its own key.
+returning from a function. Note that each stack allocation
+                                                                            While memory64 [20] extends function pointers to 64 bits,
+needs to be aligned to 16 bytes and gets processed when
+                                                                            the indices for the WASM function table remain 32 bit wide.
+entering/exiting from a function.
+                                                                            Cage uses the instruction sequence in Fig. 9 to authenticate
+    Similarly to the heap, Cage must guarantee protection
+                                                                            function pointers and perform indirect function calls. 64-bit
+for off-by-one overflows/underflows on the stack. Therefore,
+                                                                            pointers are first authenticated, which traps in case of a in-
+Cage must ensure that two adjacent stack allocations be-
+                                                                            valid signature. If successful, the signature is stripped and
+tween functions do not share the same tag. To achieve this,
+                                                                            the pointer is truncated to 32 bits. Similarly, when creating
+Cage inserts a single untagged stack guard slot at the be-
+                                                                            function pointers, indices into the function table are first
+ginning of the frame if no such untagged stack slot exists,
+                                                                            zero-extended to 64 bits and then signed.
+as shown in Fig. 8b. Without the guard allocation, adjacent
+allocations in stack frames 𝑛 + 1 and 𝑛 + 2 would share the
+same tag (blue) and, thus, Cage would not be able to detect                 5         Semantics
+overflows.                                                                  5.1        Typing Rules
+    To further reduce its performance and memory overheads,                 Cage extends the typing rules of the original WASM pa-
+Cage omits the instrumentation of stack allocations that                    per [22], as shown in Figure 10. We adopt the notation used
+(i) do not escape the function or (ii) are only accessed using              in previous work [43]. Specifically, the rules are of the form
+statically verifiable indices. In Algorithm 1, we present a                 of 𝐶 ⊢ 𝑒 : tf . An instruction 𝑒 is valid under the context
+simplified version of Cage’s algorithm for the identification               𝐶, with 𝐶 memory being used to access a context component,
+of the (un)safe stack allocations.                                          such as the memory. The rule 𝐶 memory = 𝑛 ensures that the
+CGO ’25, March 01–05, 2025, Las Vegas, NV, USA                                    M. Fink, D. Stavrakakis, D. Sprokholt, S. Chakraborty, J.-E. Ekberg, P. Bhatotia
+
+
+                                                             (store) 𝑠 F {. . . , inst inst ∗ }
+                                                                  inst F {. . . , tag taginst ∗ , key 𝑘𝑠 }
+                                                               taginst F 𝑏 ∗
+
+                                         𝑠; (i64.const 𝑘 ) (𝑡 .load 𝑎 𝑜 ) ↩→𝑖 (𝑡 .const 𝑏 ∗ )            if 𝑠 tag (𝑖, 𝑘 + 𝑜, |𝑡 | ) = tag(𝑘 ) ∧ 𝑠 mem (𝑖, 𝑘 + 𝑜, |𝑡 | ) = 𝑏 ∗    (1)
+                                         𝑠; (i64.const 𝑘 ) (𝑡 .load 𝑎 𝑜 ) ↩→𝑖 trap                       otherwise                                                               (2)
+                           𝑠; (i64.const 𝑘 ) (𝑡 .const 𝑐 ) (𝑡 .store 𝑎 𝑜 ) ↩→𝑖 𝑠 ′ ; 𝜖                   if 𝑠 tag (𝑖, 𝑘 + 𝑜, |𝑡 | ) = tag(𝑘 )                                    (3)
+                                                                                                                   ′                                       |𝑡 |
+                                                                                                             ∧ 𝑠       = 𝑠 with mem(𝑖, 𝑘 + 𝑜, |𝑡 | ) = bits𝑡 (𝑐 )
+                           𝑠; (i64.const 𝑘 ) (𝑡 .const 𝑐 ) (𝑡 .store 𝑎 𝑜 ) ↩→𝑖 trap                      otherwise                                                               (4)
+                   𝑠; (i64.const 𝑘 ) (i64.const 𝑙 ) (segment.new 𝑜 ) ↩→𝑖 𝑠 ′ ; (i64.const 𝑡 )            if 𝑡 = new_tag(𝑘 + 𝑜 ) ∧ 𝑠 ′ = 𝑠 with tag(𝑖, 𝑘 + 𝑜, 𝑙 ) = 𝑡             (5)
+                   𝑠; (i64.const 𝑘 ) (i64.const 𝑙 ) (segment.new 𝑜 ) ↩→𝑖 trap                            otherwise                                                               (6)
+  𝑠; (i64.const 𝑘 ) (i64.const 𝑡 ) (i64.const 𝑙 ) (segment.set_tag 𝑜 ) ↩→𝑖 𝑠 ′ ; 𝜖                       if 𝑠 ′ = 𝑠 with tag(𝑖, 𝑘 + 𝑜, 𝑙 ) = 𝑡                                   (7)
+  𝑠; (i64.const 𝑘 ) (i64.const 𝑡 ) (i64.const 𝑙 ) (segment.set_tag 𝑜 ) ↩→𝑖 trap                          otherwise                                                               (8)
+                    𝑠; (i64.const 𝑘 ) (i64.const 𝑙 ) (segment.free 𝑜 ) ↩→𝑖 𝑠 ′ ; 𝜖                       if 𝑡 = free_tag(𝑘 + 𝑜 ) ∧ 𝑠 tag (𝑖, 𝑘 + 𝑜, |𝑡 | ) = tag(𝑘 )             (9)
+                                                                                                                   ′
+                                                                                                             ∧ 𝑠 = 𝑠 with tag(𝑖, 𝑘 + 𝑜, 𝑙 ) = 𝑡
+                    𝑠; (i64.const 𝑘 ) (i64.const 𝑙 ) (segment.free 𝑜 ) ↩→𝑖 trap                          otherwise                                                              (10)
+                                   𝑠; (i64.const 𝑘 ) i64.pointer_sign ↩→𝑖 (i64.const 𝑘 ′ )               if 𝑘 ′ = sign(𝑘, 𝑘𝑠 )                                                  (11)
+                                  𝑠; (i64.const 𝑘 ) i64.pointer_auth ↩→𝑖 (i64.const 𝑘 ′ )                if 𝑘 ′ = strip(𝑘 ) ∧ 𝑘 = sign(𝑘 ′ , 𝑘𝑠 )                               (12)
+                                  𝑠; (i64.const 𝑘 ) i64.pointer_auth ↩→𝑖 trap                            otherwise                                                              (13)
+
+ Figure 11. Small-step reduction rules of the new instructions and added rules for load/stores. See the WASM paper [22] for
+ the definitions of all rules and auxiliary constructs.
+
+instruction can only be used when memory is declared. The                                • 𝑡 ′ = free_tag(𝑡): Creates a tagged pointer 𝑡 ′ for the pur-
+type tf = 𝑡 1∗ → 𝑡 2∗ describes how the instruction manipu-                                 pose of freeing a segment. The tag is different from the
+lates the operand stack. The instruction 𝑒 expects an operand                               tag stored in 𝑡.
+stack where it pops 𝑡 1∗ and pushes 𝑡 2∗ .                                               • 𝑘 ′ = sign(𝑘, 𝑘𝑠 ): Creates a cryptographic signature based
+                                                                                            on the index 𝑘 and a per-instance secret key 𝑘𝑠 and inserts
+5.2   Small-Step Reduction Rules                                                            it into the upper bits of 𝑘.
+Figure 11 highlights how Cage extends the WASM small-                                    • 𝑘 ′ = strip(𝑘): Removes the cryptographic signature from
+step reduction rules [22] using the notation established by                                 the upper bits of 𝑘.
+previous work [44]. The lower part of Fig. 11 presents the                               Further, Figure 11 presents the added and modified compo-
+new tag-aware load/store rules that replace the load/store                               nents in the rules. Each reduction rule is depicted with the
+rules from the WASM paper as well as new rules tailored                                  top of the operand stack and the state, 𝑠, on the left side,
+based on the introduced instructions. To signal a trap, we                               representing the pre-execution state. The resulting stack and
+reuse operators from the original WASM rules, including                                  state after the execution of the instruction is placed on the
+the trap operator. The store, 𝑠, is augmented with a storage                             right side. For rules with ↩→𝑖 , 𝑖 represents the instance in
+mechanism that assigns a tag, 𝑡, to each 16-byte memory                                  which the instruction is executed. Cage modifies the seman-
+granule and a per-instance secret key 𝑘𝑠 . The key is unique                             tics of load/store instructions by adding new rules for loads
+per WASM instance and ensures that leaked signatures can-                                and stores in Eqs. (1) to (4), which trap on tag mismatches.
+not be used in another instance or in another run of the same                               Additionally, Cage introduces new rules that express its
+instance. Precisely, we use the following notation:                                      new instructions, which are described below:
+• 𝑡 = 𝑠 tag (𝑖, addr, len): Extracts the tag 𝑡 for a memory region                       • segment.new: It creates a new, zeroed memory segment
+  in instance 𝑖 accessed at address addr with length len, if the                            for a given pointer and size and returns a tagged pointer
+  tag is the same for all bytes in the range [addr, addr + len).                            (Eq. (5)).
+• 𝑠 ′ = 𝑠 with tag(𝑖, addr, len) = 𝑡: Updates the state with new                         • segment.set_tag: It transfers ownership for a given point-
+  tags for the memory region at address addr with length                                    er and size to a tagged pointer (Eq. (7)). This results in the
+  len, if addr is aligned to 16 bytes and the memory region                                 tagged pointer being able to access the memory segment
+  is in bounds of the memory.                                                               and can be used to merge adjacent segments.
+• 𝑡 = tag(pointer): Extracts the tag from a tagged pointer.                              • segment.free: It invalidates a segment specified by a
+• 𝑡 ′ = new_tag(𝑡): Creates a tagged pointer 𝑡 ′ from an un-                                pointer and length by tagging the segment with a new,
+  tagged pointer 𝑡 to be used for a new segment. The tag is                                 implementation-defined tag (Eqs. (9) and (10)), ensuring
+  randomly chosen from a pool of tags.                                                      accesses to the freed segment are caught. This instruction
+Cage: Hardware-Accelerated Safe WebAssembly                                                 CGO ’25, March 01–05, 2025, Las Vegas, NV, USA
+
+
+                         WebAssembly Runtime                                                    WebAssembly Runtime
+
+                         WebAssembly Instance                                     WASM Instance #1             #2            #3
+                      Code                       Tables       ...                Code    Tables ...
+                             Linear Memory
+                                                                                   Heap base
+
+
+                         Runtime Address Space                                                  Runtime Address Space
+
+OS                                                                     OS
+                              Virtual Memory                                                          Virtual Memory
+
+HW                                                                     HW
+                   Physical Memory                        Tag Memory                     Physical Memory                   Tag Memory
+
+(a) Internal memory safety, as implemented in wasmtime using           (b) External memory safety enforced by MTE. The linear memory
+MTE. Memory segments are tagged, with different colors repre-          of each instance is assigned a unique tag, which is stored in the
+senting different tags. The virtual memory maps to physical and        heap base pointer and is used for effective address calculation.
+tag memory, which stores the tags assigned to memory granules.
+           Figure 12. System design of internal and external memory safety as implemented using MTE in Cage.
+
+   also traps if a segment is freed twice, i.e., the given tagged         The first sanitizer pass is designed to provide memory
+   pointer cannot access the memory region.                            safety for stack allocations when compiling the source code
+• i64.pointer_sign: It signs a pointer and places a cryp-              to WebAssembly. It analyzes functions for stack allocations,
+   tographic hash in its upper bits (Eq. (11)).                        applies padding, and creates the memory segments (§4.2),
+• i64.pointer_auth: It validates a signed pointer to ensure            ensuring temporal and spatial safety of stack allocations.
+   the hash in the upper bits matches the address in the lower            The second sanitizer pass enforces pointer authentication
+   bits. If the hash matches, the hash is removed from the             for indirect function calls. Cage instruments code taking ref-
+   upper bits (Eq. (12)). Otherwise, it produces a trap (Eq. (13)).    erences to functions and performing indirect calls. We do not
+Using the above rules, the Eqs. (6), (8) and (10) of Figure 11         handle other operations on code pointers, as pointer arith-
+ensure traps when code tries to create, modify, or free un-            metic on function pointers is undefined behavior in C [24,
+aligned segments or segments outside the linear memory for             §6.5.6/2, §6.5.2/1] and C++ [25, §7.6.6/1, §6.8/8, §31.8.4/4].
+a given instance. Cage requires all segments to be aligned                Note that both sanitizer passes run after all LLVM opti-
+to 16 bytes.                                                           mizations. This ensures that Cage does not block passes that
+                                                                       might remove stack allocations, such as mem2reg.
+
+6     Implementation                                                   6.2   WASI Libc Modifications
+Cage is built based on LLVM 17, wasi-libc, and wasmtime                We port the WebAssembly System Interface (WASI) and wasi-
+16.0.0. Cage consists of a modified LLVM toolchain (§6.1),             libc to wasm64 to run applications relying on libc on wasm64.
+wasi-libc (§6.2) and implementation of the memory safety               To achieve this, Cage adapts the size and the pointer types
+extension in wasmtime (§6.3, §6.4).
+                                                                       from 32 to 64 bits. Further, we modify dlmalloc, the default
+                                                                       allocator in wasi-libc, to provide memory safety for heap
+6.1   LLVM Compiler Toolchain                                          allocations. Cage’ allocator creates memory segments and
+In Cage, we use LLVM [33] to compile our C/C++ applica-                returns tagged pointers to these segments. Thus, it protects
+tions to WebAssembly. We extend its existing WASM back-                both allocator metadata and adjacent allocations from being
+end to be able to emit the new Cage’s instructions. We fur-            accessed or modified through heap overflows, as illustrated
+ther introduce new intrinsic functions that correspond and             in Fig. 8a. When freeing or reallocating memory, segments
+are lowered to Cage’s WASM instructions by the compiler.               are freed, ensuring temporal safety. Lastly, we recompile
+The clang frontend and the Cage compiler passes are mainly             WASI-libc with pointer authentication to ensure function
+responsible for inserting calls to Cage’s new intrinsic func-          pointers are signed and authenticated by library code.
+tions when necessary. Precisely, we introduce two WASM-
+specific sanitizer passes that can be enabled in the LLVM              6.3   Internal Memory Safety
+pipeline via compiler flags. In clang, we introduce new built-         Figure 12a illustrates an overview of Cage’s implementation
+in functions, which directly map to these intrinsics and allow         of the internal memory safety (§4.1) extension in wasmtime
+programmers to use the new instructions, e.g., to build a              using MTE. We modify wasmtime and its supporting libraries
+segment-aware memory allocator.                                        to parse, process, and enforce the memory safety extension
+CGO ’25, March 01–05, 2025, Las Vegas, NV, USA                      M. Fink, D. Stavrakakis, D. Sprokholt, S. Chakraborty, J.-E. Ekberg, P. Bhatotia
+
+
+                index          mask                                                        index           mask
+
+               heap base        add                   address                            heap base             add                      address
+
+(a) Sandboxing with MTE, with all tags being reserved for the           (b) MTE sandboxing and the memory safety extension combined,
+runtime to isolate WASM guests.                                         with three tags reserved for the guest.
+                            Figure 13. Pointer masking to ensure bounds tags cannot be manipulated.
+
+described in §4.2. More specifically, we add support for MTE                   Table 3. Runtime benchmarking configurations.
+and PAC in the form of new instructions and lowering rules.                 Variant                Ptr width     Internal   External    Ptr auth
+We implement segments using MTE. Cage provides memory                       baseline wasm32        32-bit        No         No          No
+safety for the heap via its modified allocator that protects                baseline wasm64        64-bit        No         No          No
+                                                                            Cage-mem-safety        64-bit        Yes        No          No
+heap allocations by creating segments. Respectively, to pro-
+                                                                            Cage-ptr-auth          64-bit        No         No          Yes
+vide memory safety for the stack, Cage adapts the stack                     Cage-sandboxing        64-bit        No         Yes         No
+allocations; the first segment in each function is assigned a               Cage                   64-bit        Yes        Yes         Yes
+random tag and successive allocations increment the tag by
+                                                                        number of tags (16). Cage reserves the zero tag for the run-
+one (§4.2), eventually wrapping around. This ensures adja-
+                                                                        time, leaving the remaining 15 for the sandboxes. In a future
+cent allocations on the stack never share a tag. Importantly,
+                                                                        version of Cage, the number of available sandboxes can be
+Cage uses synchronous MTE to trap on memory safety vio-
+                                                                        increased by ensuring tags are only reused for memory re-
+lations before their effects become observable.
+                                                                        gions outside the address range reachable by WASM pointers,
+   For pointer authentication, Cage ensures that each WASM
+                                                                        i.e., via combining guard pages with memory tagging.
+instance receives a distinct secret key to sign pointers. If mul-
+                                                                           We must exclude certain tags from being generated by
+tiple WASM instances run in a single process, Cage initializes
+                                                                        MTE instructions, as Cage uses the tag bit 56 to distinguish
+a global random value per instance used as the PAC’s instruc-
+                                                                        between runtime and guest memory. On top of that, Cage
+tions modifier. This is required, as PAC keys are shared per
+                                                                        must also exclude the zero tag from the guest, as this tag is
+process. Otherwise, Cage uses PAC instructions without a
+                                                                        reserved for guard slots and untagged segments. To this end,
+modifier.
+                                                                        at runtime startup, we specify which tags can be generated
+6.4   External Memory Safety                                            using the prctl mechanism.
+Fig. 12b presents how Cage utilizes memory tagging to re-
+                                                                        7     Evaluation
+place software-based bounds checks and preserve external
+memory safety (§4.1) for each WASM instance. Initially, the             7.1     Experimental Setup
+runtime assigns a tag to each instance on module instantia-             We conduct our benchmarks on a Google Pixel 8 equipped
+tion, which is stored in the heap base address. The effective           with an ArmV9 Tensor G3 chip, including one Cortex-X3
+memory access address is calculated by adding the accessed              (2.91 GHz, out-of-order), four Cortex-A715 (2.37 GHz, out-
+index to the tagged heap base address. The memory of the                of-order), and four Cortex-A510 (1.7 GHz, in-order) cores.
+runtime is tagged with zero. It enables MTE to catch any                All cores feature MTE and PAC with FEAT_FPAC enabled,
+access outside the sandbox due to the tag mismatch.                     making PAC trap on authentication.
+   Cage can further combine both its external and its internal          Methodology. We evaluate Cage on the PolyBench/C 3.2
+memory safety extensions by splitting the pointer tag bits              suite [45] and microbenchmarks with the configurations out-
+among them. The upper bits are used for internal memory                 lined in Table 3. These include wasm32 and wasm64 as base-
+safety, while the lower bits are reserved for sandboxing. In            lines and the memory-safety, pointer-authentication (§6.3),
+Cage’s prototype, we assign three bits for internal memory              and sandboxing (§6.4) components from Cage, as well as all
+safety and one bit for enforcing external memory safety. This           components of Cage combined. We perform and compare
+isolates a single WASM instance while assigning three bits              each benchmark on every type of CPU core available on the
+for internal memory safety.                                             Tensor G3 by pinning benchmarks to a single core.
+   Lastly, Cage must ensure that adding an untrusted pointer
+to the heap base does not allow WASM code to craft arbitrary            7.2     Performance Overheads
+values to escape the sandbox. To provide these guarantees,              Figure 14 illustrates the mean runtime overheads for the
+Cage masks the WASM index before address computation, as                PolyBench/C benchmarks.
+shown in Fig. 13. Cage masks bits 56–59 when only external              Cage memory safety. Compared to wasm64, our memory
+memory safety is enabled (Fig. 13a) and bit 56 when both                safety extension has a mean overhead of 3.6±6.9 %, 5.6±4.3 %,
+internal and external memory safety are enabled (Fig. 13b).             and 1.5 ± 3.3 %. Cage sandboxing. MTE-based sandboxing
+Limitations. A natural limitation of Cage is the number of              achieves a mean speedup of 3.7 ± 6.5 %, 5.1 ± 4.0 %, and 33.9 ±
+sandboxes within a single process. MTE provides a limited               2.4 % over wasm64. Cage. When combining our memory
+Cage: Hardware-Accelerated Safe WebAssembly                                                                                                                                     CGO ’25, March 01–05, 2025, Las Vegas, NV, USA
+
+
+                                                                               Lower is better ↓                                                              Table 4. Variants for initializing and tagging memory.
+                                              baseline wasm32                     Cage-mem-safety                         Cage-sandboxing
+                    150%
+                                              baseline wasm64                     Cage-ptr-auth                           Cage                                       Variant    Instr    Granule      Sets 0   memset
+                    125%                                                                                                                                             memset        -         -         No       Yes
+ Runtime overhead
+
+
+
+
+                                            103.6                                      105.6
+                                    100.0           101.3                                                                 100.0 101.5 101.5
+                                                                                                                                                                        stg      stg     16 bytes      No        No
+                                                            96.3 97.9          100.0           99.8
+                             94.4                                       92.0                           94.9 95.5
+                    100%
+
+                    75%                                                                                            65.6                       66.1
+                                                                                                                                                     70.7
+                                                                                                                                                                       st2g      st2g    32 bytes      No        No
+                    50%                                                                                                                                                stgp      stgp    16 bytes      Yes       No
+                    25%                                                                                                                                                stzg      stzg    16 bytes      Yes       No
+                     0%                                                                                                                                               st2zg     st2zg    32 bytes      Yes       No
+                                        Cortex-X3                                 Cortex-A715                                Cortex-A510
+                                                                                                                                                                   stg+memset    stg     16 bytes      Yes      Yes
+ Figure 14. PolyBench/C runtime overheads of differ-                                                                                                              st2g+memset    st2g    32 bytes      Yes      Yes
+ ent configurations described in Table 3, normalized to                                                                                                     should be considered an over-approximation; in reality, the
+ wasm64.                                                                                                                                                    memory overhead of Cage is lower. We measure the mean
+                                                                               Lower is better ↓                                                            overhead of wasm64 over wasm32 at 0.6 % and thus estimate
+                    150%
+                                                                                                      static         dynamic                     ptr-auth   Cage’s overhead at < 5.3 %.
+                    125%                     122.2          120.9
+                                                                                         115.3          115.2                      115.9       115.4
+ Runtime overhead
+
+
+
+
+                    100%
+                              100.0                                       100.0                                       100.0                                 7.4   Security Guarantees
+                    75%                                                                                                                                     We evaluate the security guarantees from the perspective of
+                    50%                                                                                                                                     internal and external memory safety (Section 4.1).
+                    25%                                                                                                                                     External memory safety. Cage implements sandboxing
+                     0%
+                                       Cortex-X3                                  Cortex-A715                                 Cortex-A510
+                                                                                                                                                            with MTE in synchronous mode, which enforces sandboxes
+                                                                                                                                                            through hardware. This prevents sandbox escapes, such as
+                       Figure 15. Overheads of pointer authentication.                                                                                      CVE2023-26489, from accessing memory outside the linear
+safety extension with MTE-based sandboxing, we see a mean                                                                                                   memory. We prevent malicious code from forging tags to
+speedup of 2.1 ± 5.6 %, 4.5 ± 4.1 %, and 29.2 ± 2.5 % compared                                                                                              escape the sandbox, as described in §6.4. However, we limit
+to wasm64, while providing stronger security guarantees.                                                                                                    the number of sandboxes in one process to at most 15, which
+Cage pointer authentication. As the PolyBench/C test                                                                                                        is required to assign a distinct tag to each sandbox and one
+suite does not exercise virtual function calls, we only see                                                                                                 to the runtime.
+an overhead within error margins over 64-bit WASM. We                                                                                                       Internal memory safety. Our choice to utilize a memory-
+perform a microbenchmark, comparing static against dy-                                                                                                      tagging-based approach does not provide complete memory
+namic and authenticated dynamic function calls in Fig. 15.                                                                                                  safety, as we rely on a limited number of tags. As we reserve
+We observe virtually no overhead occurring as the result of                                                                                                 one tag for guard allocations and untagged segments, the
+pointer authentication, as adding pointer authentication only                                                                                               probability for a tag collision is 1/15 = 6.6 %. If we utilize
+adds 5 cycles of latency, which is not noticeable. Switching                                                                                                MTE for sandboxing, the chance of a tag collision rises to
+from static to dynamic function calls results in a 15 %–22 %                                                                                                1/7 ≈ 14.3 %. Cage deterministically protects against off-by-
+overhead, depending on the CPU being run on.                                                                                                                one overflows, use-after-free, and double-free errors, which
+Cage Startup Overhead. We measure the startup overhead                                                                                                      are caught at least until the reuse of a memory allocation.
+for a WASM instance with a static memory of 128 MiB, call-                                                                                                  Signing function pointers further reduces the possible at-
+ing a function that immediately returns. The overhead of                                                                                                    tack surface. As WASM already provides strong guarantees
+tagging the linear memory is hidden by the runtimes startup                                                                                                 against control-flow-based attacks, adding pointer authen-
+overhead.                                                                                                                                                   tication primitives does not substantially improve security.
+                                                                                                                                                            Cage protects against reusing leaked function pointers be-
+                                                                                                                                                            tween instances and statically deducing function pointers.
+7.3                        Memory Overheads                                                                                                                 We recommend Cage to be used as a secondary defense
+The memory overheads of Cage consist of two factors: (i)                                                                                                    mechanism to mitigate classes described in Table 2. With the
+the overhead of switching from 32-bit to 64-bit WASM and                                                                                                    ability to deploy the prototype in production, bugs may be
+(ii) the overhead of memory tags caused by MTE, which is                                                                                                    found in production environments not discovered by testing
+1/32 of the memory with MTE enabled. Tags are stored in a                                                                                                   workloads.
+separate physical address space, the tag PA space [10]. This                                                                                                Initializing tagged memory. We benchmark several prim-
+space is not managed by the operating system and is not in-                                                                                                 itives to initialize an uncached 128 MiB large memory region
+cluded in maximum resident set size (rss) measurements. We                                                                                                  while setting its allocation tag, representing the scenario of
+thus estimate the memory overhead with MTE by factoring                                                                                                     setting up a WASM instance. We run the configurations in
+in 4 bits for every 16 byte of memory, which results in an ad-                                                                                              Table 4 with synchronous MTE and measure the results in
+ditional 1/32 = 3.125 %. As our maximum rss measurements                                                                                                    Fig. 16. stzg, stz2g, and stgp are slightly faster than a raw
+include the runtimes memory, which does not use MTE, this                                                                                                   memset, even though they initialize memory and set tags.
+CGO ’25, March 01–05, 2025, Las Vegas, NV, USA                                                                                                                        M. Fink, D. Stavrakakis, D. Sprokholt, S. Chakraborty, J.-E. Ekberg, P. Bhatotia
+
+
+                                                                           Lower is better ↓                                                                              directly supported by RichWasm’s type-driven safety model.
+                                                                                                                                                                          In contrast, Cage targets languages that do not encode safety
+                                                                                                                                                                138
+                140                  memset                         stgp               stzg                      stg+memset                               133
+
+                                     stg                            st2g               stz2g                     st2g+memset
+                120
+                                                                                                                         96.6          98.1
+                                                                                                                                                                          in their runtime or type system.
+                100
+                                                                                                                                                                             Wasm memcheck (wmemcheck) [8] is a tool in wasmtime
+ Runtime (ms)
+
+
+
+
+                                                                                                                  91.9
+                                                                                                                                83.1
+                                                                                                                                              78.0 77.2
+                 80
+
+                 60                                                                                  53.3 52.0
+                                                                                                                                                                          providing the ability to check for invalid mallocs, double-
+                                                                                                                                                                          frees, reads, and writes inside a WASM module, assuming
+                                                                     48.9 49.1 46.7 46.8 48.0 46.7
+                                                        44.4 45.5
+                 40   33.6 32.8 31.3 33.3 32.5
+                                                 29.5
+
+                 20                                                                                                                                                       certain properties about malloc and free. It is conceptually
+                  0
+                                  Cortex-X3                                     Cortex-A715                                      Cortex-A510
+                                                                                                                                                                          similar to Valgrind memcheck [40].
+
+ Figure 16. Performance results of the benchmarking vari-                                                                                                                 9     Conclusion
+ ants from Table 4 on 128 MiB of memory.                                                                                                                                  In this paper, we present Cage, a hardware-accelerated We-
+We believe this is the case as they do not perform tag checks                                                                                                             bAssembly toolchain to provide memory safety, consisting
+before accessing memory [10]. The Cortex-X3 core compen-                                                                                                                  of a minimally invasive and adaptable WASM extension, a
+sates for its lower throughput (Table 1) with a higher clock                                                                                                              compiler toolchain based on LLVM, a modified wasi-libc that
+speed (2.91 GHz) compared to the Cortex-A715 (2.37 GHz).                                                                                                                  includes a custom allocator to provide spatial and tempo-
+                                                                                                                                                                          ral memory safety, and a wasmtime implementation, that is
+8                 Related Work                                                                                                                                            responsible for compiling and running the Cage’s WASM
+Prior research exists on enriching WASM with memory                                                                                                                       extension using MTE and PAC. Further, Cage improves the
+safety properties. A significant project is MS-WASM [16, 36],                                                                                                             performance of WASM sandboxing mechanism by utilizing
+a memory safety extension for WASM that introduces a new                                                                                                                  MTE as a replacement for software-based bounds checks.
+segment memory distinct from the linear memory, preventing                                                                                                                Our evaluation of Cage highlights that Cage is a memory
+access through arbitrary offsets. The segment memory re-                                                                                                                  safety solution for WASM that is suitable for production
+lies on accesses through unforgeable handles, akin to CHERI                                                                                                               deployment as it incurs minimal runtime and memory over-
+pointers [57]. On the contrary, Cage does not introduce a                                                                                                                 heads while providing efficient memory safety guarantees.
+distinct memory region and a new pointer type, but rather                                                                                                                 Software artifact. Cage is publicly available with its entire
+builds upon 64-bit WASM without altering its memory lay-                                                                                                                  experimental setup [19]. Detailed information can be found
+out to be able to minimize its runtime overheads on devices                                                                                                               in Appendix A.3.
+supporting Arm’s MTE.
+   RichWasm is another approach towards memory safety                                                                                                                     Acknowledgement
+for WASM [42]. It provides a richly typed intermediate lan-                                                                                                               We thank the anonymous reviewers for their helpful feed-
+guage for safe memory interactions between languages with                                                                                                                 back. We also thank Fritz Rehde, Janne Mantyla, and Car-
+varying memory management models. RichWasm allows                                                                                                                         los Chinea Perez for their work and feedback in the early
+for static detection of memory safety violations in the con-                                                                                                              stages of the project. This work was partially supported
+text of mixed-language interoperability between strongly                                                                                                                  by a research grant from Huawei Research Finland, the
+typed languages like Rust or OCaml. Unsafe languages (e.g.,                                                                                                               TUM Innovation Network Resilient, Trustworthy, Sustain-
+C/C++) lack information for static safety analysis and are not                                                                                                            able (ReTruSt), a Google Safe Compilation grant, and an ERC
+                                                                                                                                                                          Starting Grant (ID: 101077577).
+Cage: Hardware-Accelerated Safe WebAssembly                                                    CGO ’25, March 01–05, 2025, Las Vegas, NV, USA
+
+
+A     Artifact Appendix                                                A.3.2 Hardware Dependencies. The evaluation is performed
+A.1   Abstract                                                         on a Google Pixel 8 with Arm MTE and PAC. We cross-compile
+                                                                       LLVM, wasmtime, and the benchmarks on an x86 machine.
+This appendix provides the necessary information to build
+the artifacts and reproduce the experiments of the CGO’25              A.3.3 Software Dependencies. We require the following set of
+paper “Cage: Hardware-Accelerated Safe WebAssembly” by                 software on the Google Pixel 8 device:
+                                                                         • Termux
+M. Fink, D. Stavrakakis, D. Sprokholt, S. Chakraborty, J.-E.
+                                                                         • sshd
+Ekberg., and P. Bhatotia. Cage provides a memory safety                  • bash
+abstraction for WebAssembly, with an implementation in                    We require the following set of software on the x86 machine to
+LLVM to transparently compile unmodified C/C++ programs,               compile LLVM, wasmtime, and evaluate the benchmarks:
+a modified libc that provides memory safety for heap alloca-             • Linux (tested with 6.8.12)
+tions, and an implementation in wasmtime that utilizes Arm               • nix (tested with 2.18.5): All other dependencies are fetched and
+MTE and PAC to implement the abstraction. We provide an                    pinned to a specific version using the nix package manager
+artifact including pre-compiled binaries and all sources and               and can be found in the nix/ directory in the artifact.
+scripts to build and evaluate the artifact to reproduce the            A.3.4 Benchmarks. We run the PolyBench/C benchmark suite
+results and figures in this paper.                                     to measure the runtime and memory overhead of Cage’s compo-
+                                                                       nents compared to the 32- and 64-bit baselines. To measure startup
+A.2   Artifact Check-List (Meta-Information)                           overheads, we measure the overhead of instantiating a module
+  • Program: LLVM with Cage modifications, source included;            declaring a 128 MiB memory and calling an empty function. To
+    wasmtime with Cage modifications, source included; wasi-libc       measure pointer authentication overheads, we measure a modified
+    with Cage modifications, source included.                          version of PolyBench/C’s 2mm benchmark, where the matrix mul-
+  • Compilation: Clang 17, rustc 1.80                                  tiplication is moved into a function call that is either performed
+  • Transformations: Stack allocation hardening as an LLVM             statically or dynamically through a vtable.
+    pass.
+  • Binary: Pre-built binaries for wasmtime, LLVM, wasi-sdk in-        A.4      Installation
+    cluded. Source code and makefiles to re-generate binaries in-      To get started, download the artifact from Zenodo, navigate to the
+    cluded.                                                            artifact directory, and run the following command to download all
+  • Run-time environment: Provided binaries built for Linux            required dependencies using nix.
+    6.8.12 (nixOS) and Android 14.                                    1 curl -L -o cgo-artifact.zip https://zenodo.org/records
+  • Hardware: We require an AArch64 device with both PAC and                   /13772996/files/cgo-artifact.zip?download=1
+    MTE (Pixel 8) and an x86-64 machine for cross-compilation.        2 nix-shell -p unzip --run 'unzip cgo-artifact.zip'
+  • Metrics: Average runtime overhead; estimated memory over-         3 cd cgo-artifact
+    head                                                              4 cd nix
+  • Output: PDFs for the plots; Text files with raw data for tables   5 nix develop
+    and claims in text.                                               6 cd ..
+
+  • Experiments: Makefile to run all experiments is included.
+                                                                         This opens a new shell with all dependencies required to build,
+  • How much disk space required (approximately)?: 25 GiB.
+                                                                       run, and evaluate all benchmarks.
+  • How much time is needed to prepare workflow (approxi-
+    mately)?: 2–3 hours.                                               A.4.1 SSH Connection to the Pixel 8. Install Termux from the
+  • How much time is needed to complete experiments (ap-               Play Store or F-Droid. Once Termux is opened, install and start
+    proximately)?: 2–3 days.                                           sshd, then connect to the x86 machine and open a port forwarding,
+  • Publicly available?: Yes.                                          allowing the x86 machine to connect to the Pixel 8.
+  • Code licenses (if publicly available)?: Apache License with       1 pkg install sshd
+    LLVM Exceptions (LLVM, wasi-libc); Apache License (wasm-          2 sshd
+    time).                                                            3 ssh -R 8023:localhost:8022 user@x86machine
+  • Workflow framework used?: Makefiles.
+  • Archived (provide DOI)?: 10.5281/zenodo.13772996                     To connect to the Pixel 8, replace the following two lines in
+                                                                       config.mk with the values corresponding to your device.
+A.3   Description                                                     1 export SSH_HOST=u0_a265@localhost
+A.3.1 How Delivered. All source code can be found at the git          2 export SSH_PORT=8023
+repositories below, as well as the following persisted DOI for the
+artifact: 10.5281/zenodo.13772996, which contains all source code      A.5      Experiment Workflow
+as well as the scripts to build and evaluate all artifacts.
+  • https://github.com/TUM-DSE/llvm-memsafe-wasm                       All required software (LLVM, wasmtime, benchmarks) is cross-
+  • https://github.com/TUM-DSE/wasmtime-mte                            compiled on the x86 machine and copied to the Pixel 8 using a set
+  • https://github.com/TUM-DSE/wasm-tools-mte                          of provided scripts.
+  • https://github.com/martin-fink/wasi-libc
+ CGO ’25, March 01–05, 2025, Las Vegas, NV, USA                       M. Fink, D. Stavrakakis, D. Sprokholt, S. Chakraborty, J.-E. Ekberg, P. Bhatotia
+
+
+    Building LLVM, wasmtime, wasi-sdk, and the Benchmarks:                all three types of cores found in the Pixels chipset. Running the
+ [1 human-minute + 2–3 compute-hours]                                     benchmarks on the low-power Cortex-A510 cores takes up most of
+    For convenience and to reduce build times, we have included           the runtime. To perform the evaluation, run:
+ pre-built versions of wasi-sdk and LLVM in the artifact. To build       1 make -j$(nproc) evaluate
+ them from scratch, delete the following files:
+1 rm -rf toolchain/wasi-sdk-20
+                                                                              This copies all benchmarks and artifacts to the connected Pixel
+2 rm -rf toolchain/wasi-sdk-20+memory64
+                                                                          8, performs benchmarks, copies the results to the x86 machine,
+3 rm -rf toolchain/wasi-sdk-20+memory64+memsafety                         and creates plots and results claimed in the paper. The results can
+4 rm -rf toolchain/wasi-sdk-20+memory64+memsafety+ptr-auth                be found in the results/ directory. We reproduce the following
+5 rm -rf toolchain/wasi-sdk-20+memory64+ptr-auth                          figures/claims:
+                                                                             • Runtime overhead (Fig. 14): results/runtime.pdf
+    To build the toolchain and benchmarks, run:                              • Pointer auth. overhead (Fig. 15): results/ptr-auth.pdf
+1 make -j$(nproc) build                                                      • Memory overhead (Section 7.3): results/mem.txt
+                                                                             • Startup overhead (Section 7.2): results/startup.txt
+   This produces the following artifacts, as well as the benchmarks          • Memory tagging overheads (Fig. 16): results/stg.pdf
+ used in this paper:                                                      Additionally, we reproduce the following architectural analysis
+1 # wasmtime:                                                             results from §2:
+2 ./toolchain/wasmtime/target/aarch64-linux-android/release/                 • MTE sync/async mode overhead (Fig. 4):
+       wasmtime                                                                results/mte-mode.pdf
+3 # llvm:
+                                                                             • MTE instruction latencies/throughput (Table 1):
+4 ./toolchain/wasi-sdk-20+memory64+memsafety+ptr-auth/wasi-sdk
+                                                                               results/inst-cycles.txt
+       -wasi-sdk-20+memory64+memsafety+ptr-auth/bin/clang
+5 # wasi-sdk with different configurations
+                                                                          A.7    Notes
+6 ./toolchain/wasi-sdk-20
+7 ./toolchain/wasi-sdk-20+memory64
+                                                                          We provide hardware with the required software preinstalled for
+8 ./toolchain/wasi-sdk-20+memory64+memsafety                              the CGO’25 artifact reviewers.
+9 ./toolchain/wasi-sdk-20+memory64+ptr-auth
+10 ./toolchain/wasi-sdk-20+memory64+memsafety+ptr-auth                    A.8    Methodology
+                                                                          Submission, reviewing and badging methodology:
+ A.6   Evaluation and Expected Result                                       • http://cTuning.org/ae/submission-20190109.html
+                                                                            • http://cTuning.org/ae/reviewing-20190109.html
+ Expected duration: [1 human-minute + 2–3 compute-days]
+                                                                            • https://www.acm.org/publications/policies/artifact-review-
+ Running the experiments on the Pixel 8 devices takes a long time.
+                                                                              badging
+ This is primarily caused by our choice to run all experiments on
+Cage: Hardware-Accelerated Safe WebAssembly                                                             CGO ’25, March 01–05, 2025, Las Vegas, NV, USA
+
+
+References                                                                     [20] WebAssembly Community Group. 2024. Memory64: 64-bit Memory
+ [1] [n. d.]. Docker docs - Wasm workloads (Beta). https://docs.docke               Indexing for WebAssembly. https://github.com/WebAssembly/mem
+     r.com/desktop/wasm/. https://docs.docker.com/desktop/wasm/                     ory64 Proposal for 64-bit memory addressing in WebAssembly.
+     Accessed on May 15, 2024.                                                 [21] WebAssembly Community Group. 2024. WebAssembly System Inter-
+ [2] [n. d.]. Memory Safety. https://www.chromium.org/Home/chromium-                face - WASI. https://github.com/WebAssembly/WASI
+     security/memory-safety/. https://www.chromium.org/Home/chromi             [22] Andreas Haas, Andreas Rossberg, Derek L Schuff, Ben L Titzer, Michael
+     um-security/memory-safety/ Accessed on March 14, 2024.                         Holman, Dan Gohman, Luke Wagner, Alon Zakai, and JF Bastien. 2017.
+ [3] 2019. CVE-2023-26489. Available from NIST National Vulnerability               Bringing the web up to speed with WebAssembly. In Proceedings of
+     Database, CVE-ID CVE-2023-26489.. https://nvd.nist.gov/vuln/detail             the 38th ACM SIGPLAN Conference on Programming Language Design
+     /CVE-2023-26489                                                                and Implementation. 185–200.
+ [4] 2024. WebAssembly - Security. https://webassembly.org/docs/secur          [23] Niranjan Hasabnis, Ashish Misra, and R. Sekar. 2012. Light-Weight
+     ity/. https://webassembly.org/docs/security/ Accessed on May 15,               Bounds Checking. In Proceedings of the Tenth International Symposium
+     2024.                                                                          on Code Generation and Optimization (San Jose, California) (CGO ’12).
+ [5] 2024. WebAssembly Use Cases. https://webassembly.org/docs/use-                 Association for Computing Machinery, New York, NY, USA, 135–144.
+     cases/ Accessed on March 28, 2024.                                             https://doi.org/10.1145/2259016.2259034
+ [6] Martín Abadi, Mihai Budiu, Ulfar Erlingsson, and Jay Ligatti. 2009.       [24] International Organization for Standardization 2018. ISO/IEC 9899:2018
+     Control-flow integrity principles, implementations, and applications.          Programming languages – C. International Organization for Standard-
+     ACM Transactions on Information and System Security (TISSEC) 13, 1             ization, Geneva, Switzerland. https://www.iso.org/standard/74528.h
+     (2009), 1–40.                                                                  tml
+ [7] Periklis Akritidis, Manuel Costa, Miguel Castro, and Steven Hand. 2009.   [25] International Organization for Standardization 2020.             ISO/IEC
+     Baggy Bounds Checking: An Efficient and Backwards-Compatible                   14882:2020 Programming languages – C++. International Organiza-
+     Defense against Out-of-Bounds Errors.. In USENIX Security Symposium,           tion for Standardization, Geneva, Switzerland. https://www.iso.org/st
+     Vol. 10. 96.                                                                   andard/79358.html
+ [8] Bytecode Alliance. 2024. Wasm memcheck. https://docs.wasmtime.            [26] Trevor Jim, J Gregory Morrisett, Dan Grossman, Michael W Hicks,
+     dev/wmemcheck.html                                                             James Cheney, and Yanling Wang. 2002. Cyclone: a safe dialect of C..
+ [9] Bytecode Alliance. 2024. Wasmtime. https://github.com/bytecodeall              In USENIX Annual Technical Conference, General Track. 275–288.
+     iance/wasmtime A fast and secure runtime for WebAssembly.                 [27] Paul Kocher, Jann Horn, Anders Fogh, Daniel Genkin, Daniel Gruss,
+[10] ARM Ltd. [n. d.]. Arm Architecture Reference Manual for A-profile              Werner Haas, Mike Hamburg, Moritz Lipp, Stefan Mangard, Thomas
+     architecture. White Paper. https://developer.arm.com/documentatio              Prescher, et al. 2020. Spectre attacks: Exploiting speculative execution.
+     n/ddi0487/latest/ Accessed: 2024-03-21.                                        Commun. ACM 63, 7 (2020), 93–101.
+[11] ARM Ltd. 2019. ArmV8.5-A Memory Tagging Extension. White Paper.           [28] Pierre Krieger. 2024. The redshirt operating system. https://github.c
+     https://developer.arm.com/documentation/102925/latest/ Accessed:               om/tomaka/redshirt
+     2023-12-14.                                                               [29] Taddeus Kroes, Koen Koning, Erik Kouwe, Herbert Bos, and Cristiano
+[12] Kartal Kaan Bozdoğan, Dimitrios Stavrakakis, Shady Issa, and Pramod            Giuffrida. 2018. Delta pointers: buffer overflow checks without the
+     Bhatotia. 2022. SafePM: A sanitizer for persistent memory. In Pro-             checks. 1–14. https://doi.org/10.1145/3190508.3190553
+     ceedings of the Seventeenth European Conference on Computer Systems.      [30] Dmitrii Kuvaiskii, Oleksii Oleksenko, Sergei Arnautov, Bohdan
+     506–524.                                                                       Trach, Pramod Bhatotia, Pascal Felber, and Christof Fetzer. 2017.
+[13] Intel Corporation. 2013. Introduction to Intel(R) Memory Protection            SGXBOUNDS: Memory Safety for Shielded Execution. In Proceedings
+     Extensions. https://software.intel.com/en-us/Articles/introduction-            of the Twelfth European Conference on Computer Systems (Belgrade,
+     to-intel-memory-protection-extensions Accessed 2024-05-09.                     Serbia) (EuroSys ’17). Association for Computing Machinery, New York,
+[14] Thurston Dang, Petros Maniatis, and David Wagner. 2015. The Per-               NY, USA, 205–221. https://doi.org/10.1145/3064176.3064192
+     formance Cost of Shadow Stacks and Stack Canaries. ASIACCS 2015 -         [31] Volodymyr Kuznetzov, László Szekeres, Mathias Payer, George Can-
+     Proceedings of the 10th ACM Symposium on Information, Computer and             dea, R Sekar, and Dawn Song. 2018. Code-pointer integrity. In The
+     Communications Security (04 2015), 555–566. https://doi.org/10.1145/           Continuing Arms Race: Code-Reuse Attacks and Defenses. 81–116.
+     2714576.2714635                                                           [32] kwast os. 2024. Kwast: Rust operating system running WebAssembly
+[15] Dinakar Dhurjati, Sumant Kowshik, and Vikram Adve. 2006. SAFE-                 as userspace in ring 0. https://github.com/kwast-os/kwast
+     Code: enforcing alias analysis for weakly typed languages. In PLDI        [33] Chris Lattner and Vikram Adve. 2004. LLVM: A compilation frame-
+     ’06: Proceedings of the 2006 ACM SIGPLAN conference on Programming             work for lifelong program analysis & transformation. In International
+     language design and implementation (Ottawa, Ontario, Canada). ACM,             symposium on code generation and optimization, 2004. CGO 2004. IEEE,
+     New York, NY, USA, 144–157. https://doi.org/10.1145/1133981.1133999            75–86.
+[16] Craig Disselkoen, John Renner, Conrad Watt, Tal Garfinkel, Amit Levy,     [34] Daniel Lehmann, Johannes Kinder, and Michael Pradel. 2020. Ev-
+     and Deian Stefan. 2019. Position paper: Progressive memory safety              erything old is new again: Binary security of WebAssembly. In 29th
+     for webassembly. In Proceedings of the 8th International Workshop on           USENIX Security Symposium (USENIX Security 20). 217–234.
+     Hardware and Architectural Support for Security and Privacy. 1–8.         [35] Hans Liljestrand, Thomas Nyman, Kui Wang, Carlos Chinea Perez,
+[17] Gregory Duck and Roland Yap. 2016. Heap bounds protection with                 Jan-Erik Ekberg, and N Asokan. 2019. {PAC} it up: Towards pointer
+     low fat pointers. 132–142. https://doi.org/10.1145/2892208.2892212             integrity using {ARM} pointer authentication. In 28th USENIX Security
+[18] Gregory J. Duck, R. Yap, and L. Cavallaro. 2017. Stack Bounds Protec-          Symposium (USENIX Security 19). 177–194.
+     tion with Low Fat Pointers. In Network and Distributed System Security    [36] Alexandra E Michael, Anitha Gollamudi, Jay Bosamiya, Evan Johnson,
+     Symposium (NDSS).                                                              Aidan Denlinger, Craig Disselkoen, Conrad Watt, Bryan Parno, Marco
+[19] Martin Fink, Stavrakakis Dimitrios, Sprokholt Dennis, Chakraborty              Patrignani, Marco Vassena, et al. 2023. Mswasm: Soundly enforcing
+     Soham, Ekberg Jan-Erik, and Bhatotia Pramod. 2024. "Cage: Hardware-            memory-safe execution of unsafe code. Proceedings of the ACM on
+     Accelerated Safe WebAssembly" Artifact. https://doi.org/10.5281/zeno           Programming Languages 7, POPL (2023), 425–454.
+     do.13772996                                                               [37] Marius Musch, Christian Wressnegger, Martin Johns, and Konrad
+                                                                                    Rieck. 2019. New Kid on the Web: A Study on the Prevalence of
+                                                                                    WebAssembly in the Wild. In Detection of Intrusions and Malware, and
+CGO ’25, March 01–05, 2025, Las Vegas, NV, USA                                M. Fink, D. Stavrakakis, D. Sprokholt, S. Chakraborty, J.-E. Ekberg, P. Bhatotia
+
+
+     Vulnerability Assessment: 16th International Conference, DIMVA 2019,              arXiv:2311.09394 (2023).
+     Gothenburg, Sweden, June 19–20, 2019, Proceedings 16. Springer, 23–42.       [49] Kostya Serebryany, Evgenii Stepanov, Aleksey Shlyapnikov, Vlad
+[38] Santosh Nagarakatte, Jianzhou Zhao, Milo MK Martin, and Steve                     Tsyrklevich, and Dmitry Vyukov. 2018. Memory Tagging and how
+     Zdancewic. 2009. SoftBound: Highly compatible and complete spatial                it improves C/C++ memory safety. arXiv preprint arXiv:1802.09517
+     memory safety for C. In Proceedings of the 30th ACM SIGPLAN Confer-               (2018).
+     ence on Programming Language Design and Implementation. 245–258.             [50] Laszlo Szekeres, Mathias Payer, Tao Wei, and Dawn Song. 2013. Sok:
+[39] George C Necula, Scott McPeak, and Westley Weimer. 2002. CCured:                  Eternal war in memory. In 2013 IEEE Symposium on Security and Pri-
+     Type-safe retrofitting of legacy code. In Proceedings of the 29th ACM             vacy. IEEE, 48–62.
+     SIGPLAN-SIGACT symposium on Principles of programming languages.             [51] Raven Szewczyk, Kimberley Stonehouse, Antonio Barbalace, and Tom
+     128–139.                                                                          Spink. 2022. Leaps and bounds: Analyzing WebAssembly’s perfor-
+[40] Nicholas Nethercote and Julian Seward. 2007. Valgrind: a framework                mance with a focus on bounds checking. In 2022 IEEE International
+     for heavyweight dynamic binary instrumentation. ACM Sigplan notices               Symposium on Workload Characterization (IISWC). IEEE, 256–268.
+     42, 6 (2007), 89–100.                                                        [52] Gavin Thomas. [n. d.]. A proactive approach to more secure code.
+[41] Oleksii Oleksenko, Dmitrii Kuvaiskii, Pramod Bhatotia, Pascal Felber,             https://msrc.microsoft.com/blog/2019/07/a-proactive-approach-to-
+     and Christof Fetzer. 2017. Intel MPX Explained: An Empirical Study of             more-secure-code/. https://msrc.microsoft.com/blog/2019/07/a-
+     Intel MPX and Software-based Bounds Checking Approaches. CoRR                     proactive-approach-to-more-secure-code/ Accessed on March 14,
+     abs/1702.00719 (2017). arXiv:1702.00719 http://arxiv.org/abs/1702.007             2024.
+     19                                                                           [53] Jeff Vander Stoep and Chong Zhang. [n. d.]. Queue the Hardening
+[42] Zoe Paraskevopoulou, Michael Fitzgibbons, Michelle Thalakottur, No-               Enhancements. https://security.googleblog.com/2019/05/queue-
+     ble Mushtak, Jose Sulaiman Mazur, and Amal Ahmed. 2024. RichWasm:                 hardening-enhancements.html. https://security.googleblog.com/20
+     Bringing Safe, Fine-Grained, Shared-Memory Interoperability Down                  19/05/queue-hardening-enhancements.html Accessed on March 14,
+     to WebAssembly. arXiv preprint arXiv:2401.08287 (2024).                           2024.
+[43] Benjamin C Pierce. 2002. Types and programming languages. MIT                [54] Robert Wahbe, Steven Lucco, Thomas E Anderson, and Susan L Gra-
+     press.                                                                            ham. 1993. Efficient software-based fault isolation. In Proceedings of the
+[44] Gordon D Plotkin. 1981. A structural approach to operational seman-               fourteenth ACM symposium on Operating systems principles. 203–216.
+     tics. (1981).                                                                [55] Robert N M Watson, Alexander Richardson, Brooks Davis, John Bald-
+[45] Louis-Noel Pouchet. [n. d.]. Polybench: The polyhedral benchmark                  win, David Chisnall, Jessica Clarke, Nathaniel Filardo, Simon W Moore,
+     suite. https://web.cs.ucla.edu/~pouchet/software/polybench/                       Edward Napierala, Peter Sewell, and Peter G Neumann. 2020. CHERI
+     Accessed: 2024-03-25.                                                             C/C++ Programming Guide. (June 2020).
+[46] Qualcomm Technologies, Inc. 2017. Pointer Authentication on ArmV8.3:         [56] Elliott Wen and Gerald Weber. 2020. Wasmachine: Bring IoT up to
+     Design and Analysis of the New Software Security Instructions. White              Speed with A WebAssembly OS. In 2020 IEEE International Confer-
+     Paper. https://www.qualcomm.com/content/dam/qcomm-martech/                        ence on Pervasive Computing and Communications Workshops (PerCom
+     dm-assets/documents/pointer-auth-v7.pdf Accessed: 2023-12-14.                     Workshops). 1–4. https://doi.org/10.1109/PerComWorkshops48775.2
+[47] Konstantin Serebryany, Derek Bruening, Alexander Potapenko, and                   020.9156135
+     Dmitriy Vyukov. 2012. AddressSanitizer: A fast address sanity checker.       [57] Jonathan Woodruff, Robert NM Watson, David Chisnall, Simon W
+     In 2012 USENIX annual technical conference (USENIX ATC 12). 309–318.              Moore, Jonathan Anderson, Brooks Davis, Ben Laurie, Peter G Neu-
+[48] Kostya Serebryany, Chris Kennelly, Mitch Phillips, Matt Denton, Marco             mann, Robert Norton, and Michael Roe. 2014. The CHERI capability
+     Elver, Alexander Potapenko, Matt Morehouse, Vlad Tsyrklevich, Chris-              model: Revisiting RISC in an age of risk. ACM SIGARCH Computer
+     tian Holler, Julian Lettner, et al. 2023. GWP-ASan: Sampling-Based                Architecture News 42, 3 (2014), 457–468.
+     Detection of Memory-Safety Bugs in Production. arXiv preprint
+                                                                                  Received 2024-05-23; accepted 2024-07-22
+

@@ -1,0 +1,1411 @@
+1
+2
+         HyperAlloc: Efficient VM Memory De/Inflation via                                                                                    56
+                                                                                                                                             57
+3
+4
+            Hypervisor-Shared Page-Frame Allocators                                                                                          58
+                                                                                                                                             59
+5                                                                                                                                            60
+6
+                                           Anonymous Author(s), Submission Id: 517                                                           61
+7                                                                                                                                            62
+     Abstract                                                             Azure and Alibaba could be deflated by 30–50 percent most
+8                                                                                                                                            63
+     The provisioning of the right amount of DRAM to virtual              of their time for a performance impact of less than 1 percent.
+9                                                                                                                                            64
+     machines (VMs) is still a major challenge and cost driver               Memory overcommitment [53] would increase utilization;
+10                                                                                                                                           65
+     in virtualization settings. Many VMs run applications with           however, cloud providers often refrain from doing this ag-
+11                                                                                                                                           66
+     highly volatile memory demands, which either leads to mas-           gressively due to the difficulties of still providing their cus-
+12                                                                                                                                           67
+     sive overprovisioning in low-demand phases or poor QoS               tomers a defined QoS [6]. Instead, they strive towards more
+13                                                                                                                                           68
+     in high-demand phases. Memory hotplugging and ballooning             elasticity by finer-grained cost models for physical memory
+14                                                                                                                                           69
+     have become established techniques (in Linux/KVM available           usage. An example is Amazon, which charges customers by
+15                                                                                                                                           70
+     via virtio-mem and virtio-balloon) to dynamically de/inflate         GiB·s on their Lambda function-as-a-service (FaaS) infrastruc-
+16                                                                                                                                           71
+     the physical memory of a VM in a cooperative manner, by              ture. However, compared to the on-demand microservices in
+17                                                                                                                                           72
+     having the guests give back unused memory to the hyper-              FaaS settings, VM instances running in the cloud have much
+18                                                                                                                                           73
+     visor. However, current VM deflation techniques are either           longer lifespans and much higher preemption costs, which
+19                                                                                                                                           74
+     not DMA-safe, preventing the pass-through of important               imposes challenges for transferring such pricing model to
+20                                                                                                                                           75
+     devices like GPUs or NICs, or are not flexible/fast enough to        infrastructure-as-a-service (IaaS) settings.
+21                                                                                                                                           76
+22
+     cope with the frequently changing demands of the guest.              Cooperative VM Memory De/Inflation Nevertheless,                   77
+23
+        We present HyperAlloc, a DMA-safe and extremely effi-             many clients would prefer to pay only for the memory they          78
+24
+     cient mechanism for virtual machine de/inflation. The core           actually need at a given time [5, 11]. Some authors have even      79
+25
+     idea is to provide the hypervisor direct access to the guest’s       suggested real-time auctioning of physical memory among            80
+26
+     page-frame allocator, greatly reducing the communication             VMs [6]. However, being accustomed to virtual memory,              81
+27
+     overhead. HyperAlloc can shrink virtual machines 362 times           clients usually do not know how much physical memory               82
+28
+     faster than virtio-balloon and 10 times faster than virtio-          they need. But their OS does! With an extra component run-         83
+29
+     mem while having no measurable impact on the guest’s per-            ning as a proxy inside the guest VM’s OS, the hypervisor can       84
+30
+     formance. HyperAlloc’s automatic reclamation provides for            approach the guest’s physical memory-management subsys-            85
+31
+     better memory elasticity by reducing the average memory              tem to find idling (unutilized) page frames in low-demand          86
+32
+     footprint of a clang compilation by 17 percent compared to           phases, which it then safely can reclaim. Examples of such         87
+33
+     virtio-balloon’s free-page reporting while, again, having no         cooperative reclaiming techniques include memory balloon-          88
+34
+     measurable impact on the guest’s performance.                        ing [24], memory hotplugging, [23] and memory probing              89
+35                                                                        [55]. While these techniques have proven useful in practice,       90
+36                                                                        we argue that they are still not flexible and fast enough to       91
+37   1   Introduction                                                     cope with frequently changing guest demands because of             92
+38   Physical memory is generally considered to be the scarcest           their high overheads for probing, communication, and guest-        93
+39   resource in cloud computing. Its provisioning remains a ma-          side defragmentation. Additionally, some of them are not           94
+40   jor challenge for providers due to high hardware and energy          DMA-safe, preventing the pass though of devices like GPUs          95
+41   costs of DRAM on the one side and quality of service (QoS)           into VMs [55].                                                     96
+42   demands on the other side. DRAM already accounts for over            Our Contributions We present HyperAlloc, a new ap-                 97
+43   30 percent of Meta’s rack costs and power consumption [35].          proach for virtual machine de/inflation. HyperAlloc inte-          98
+44   Hence, a good utilization of the scarce physical memory              grates the concept of cooperative memory management di-            99
+45   resources across multiple VMs is of utmost importance.               rectly into the guest’s page-frame allocator, which it accesses    100
+46       However, compared to other resources, the preemption             via a lock-free memory-mapped interface, greatly reducing          101
+47   and virtualization costs of memory are much higher: While            the communication overhead. In our evaluation with Lin-            102
+48   it is technically easy and cheap for a hypervisor to dynam-          ux/QEMU, HyperAlloc shrinks VMs up to 362 times faster             103
+49   ically detect (and redistribute) underutilized processors or         than virtio-balloon and 10 times faster than virtio-mem.           104
+50   network interfaces, it is a lot more expensive to do the same           By its direct integration into the guest’s page-frame al-       105
+51   with idling memory. This limits elasticity, as many VM work-         locator, HyperAlloc additionally provides DMA safety by            106
+52   loads exhibit highly fluctuating memory demands over the             design, providing for reclamation also in VMs that require         107
+53   different phases of their execution [24]. Fuerst et al. have         device pass through. Its automatic reclamation mode reduces        108
+54   shown [19] that the memory resources of VMs running on               the memory footprint (in GiB·min) of a clang compilation by        109
+55                                                                    1                                                                      110
+      EUROSYS’25, March 30–April 3, 2025, Rotterdam                                                                    Anon. Submission Id: 517
+
+
+111   17 percent compared to virtio-balloon’s free-page reporting              virtio-mem, the hypervisor interacts with a guest-level hot-       166
+112   without any significant impact on the guest’s performance.               plug driver to extend/shrink the guest-physical memory by          167
+113                                                                            adding/removing virtual DIMMs at 2 MiB granularity. DMA            168
+114   2    Problem Analysis                                                    safety is achieved by prepopulating all guest-physical frames      169
+115
+      We first discuss the fundamental challenges for the                      when adding the DIMM; hence, no EPT and IO page faults             170
+116
+      hypervisor-guest memory interface on the example of the                  will occur later on. However, this pre-population leads to         171
+117
+      existing approaches, laying the ground for our HyperAl-                  overprovisioning. Furtheremore, virtio-mem does not sup-           172
+118
+      loc design, as well as providing an overview of the directly             port elasticity by automatic reclamation.                          173
+119
+      related work. Fundamentally, in all cases, the hypervisor                   To overcome this, Wang et al. [55] propose VProbe, an           174
+120
+      relies on a cooperating guest that points him to reclaimable             automatic deflation mechanism that also provides for DMA           175
+121
+      memory, which ideally does not contain data that has to be               safety. Here, the hypervisor gets memory-mapped access to          176
+122
+      migrated, saved, or restored.                                            the Linux guest’s physical-frame metadata (struct page),           177
+123
+         In the case of memory ballooning [45, 53], the hypervisor             which also contains the frame’s reference counter. Thereby,        178
+124
+      interacts with a guest-level kernel module (called the balloon           VProbe can automatically detect and reclaim unused mem-            179
+125
+      driver) that allocates guest-physical frames from the guest’s            ory (refcount=0) without the need for explicit host–guest          180
+126
+      page-frame allocator and reports them back to the hypervisor.            communication. For DMA safety, VProbe needs to detect              181
+127
+      The hypervisor then can remove the respective frames from                when a reclaimed frame is allocated by the guest’s allocator.      182
+128
+      the VM and its extended page tables (EPTs), shrinking the                For this, it write-protects the underlying struct page in the      183
+129
+      amount of host-physical memory available for the guest. To               EPT. As a side effect of allocation, the Linux buddy alloca-       184
+130
+      give back memory, the hypervisor instructs the guest-level               tor increases the refcount in struct page, so an EPT fault         185
+131
+      kernel module to free the previously allocated frames, which             occurs, in which the hypervisor can repopulate the guest-          186
+132
+      on the next access are faulted (back) into the EPT.                      physical page. However, as the guest’s allocator remains           187
+133                                                                            still agnostic to reclaimed memory, contradicting allocation       188
+134   Elasticity The virtio-balloon implementation [43] for Lin-               patterns may lead to a high number of faults and un/map            189
+135   ux/QEMU provides an additional automatic mode (free page                 operations – when the guest frequently allocates reclaimed         190
+136   reporting), where the balloon driver periodically reports free           frames even though others are available. The Linux buddy           191
+137   frames to the hypervisor to be reclaimed, facilitating dy-               allocator, for instance, maintains per-core caches of free         192
+138   namic memory elasticity. Automatically reclaimed frames                  frames to reduce contention; the respective frames have a          193
+139   are not allocated from the guest’s allocater, but remain logi-           much higher probability of being allocated next [56].              194
+140   cally free for the guest so that they can still be allocated. If                                                                            195
+141   this happens, they are as above faulted (back) into the EPT                                                                                 196
+      on the next access.                                                      3 HyperAlloc: Bilateral Memory Allocation
+142                                                                                                                                               197
+143      As virtio-balloon reclaims individual 4 KiB pages, it has to          Instead of such indirect interaction with the guest’s page-        198
+144   issue a lot of hypercalls and subsequent unmap syscalls on               frame allocator via guest-level proxies or side effects of al-     199
+145   the host and may induce a lot of EPT faults. This can lead               location, HyperAlloc overcomes all these limitations by the        200
+146   to a substantial performance overhead. Hu et al. [24] have               direct integration with the guest’s allocator. In particular,      201
+147   shown that the overhead could be significantly improved by               we give the hypervisor write access to the allocator state so      202
+148   increasing the granularity to 2 MiB huge pages.                          that it can detect and directly mark guest-physical pages as       203
+149   DMA Safety The substantial limitation of virtio-balloon                  allocated or reclaimed; the allocator is used bilaterally by       204
+150   is that it cannot be used in conjunction with device pass                both guest and hypervisor. For our implementation, we build        205
+151   through. As described above, a reclaimed guest-physical                  upon LLFree, a scalable page-frame allocator suggested by          206
+                                                                               Wrenger et al. [56], which replaces the Linux buddy alloca-
+152   frame is logically still available to the guest’s allocator, which                                                                          207
+                                                                               tor. LLFree is particularly suitable for our approach due to
+153   itself is not aware of reclamation and, hence, might select                                                                                 208
+154   it upon some allocation. If this frame is then accessed by a             its lock-free and pointer-free design, which constructively        209
+155   CPU, an EPT fault occures, in which the hypervisor actually              avoids control-flow dependencies between hypervisor and            210
+156   installs a host-physical frame for it. However, if the guest             guest, as all operations are implemented by atomic memory          211
+157   has instead given the frame to a peripheral device for DMA,              transactions.                                                      212
+158   the DMA transfer will fail, as most DMA-capable devices are                                                                                 213
+159   unable to trigger IO page faults [8, 51]. So due to its reliance         3.1   HyperAlloc in a Nutshell                                     214
+160   on page faults, virtio-balloon is inherently incompatible with           Fig. 1 gives an overview of the HyperAlloc approach and            215
+161   device pass through, which limits its applicability for IO-              illustrates the process of reclaiming unused memory from           216
+162   intensive applications.                                                  a VM without transitioning to the guest: In a QEMU/KVM             217
+163      Hildenbrand and Schulz [23] suggest to use memory hot-                setup, the virtual-machine monitor is split into an in-kernel      218
+164   plugging [45] as an DMA-safe alternative to ballooning. In               part (KVM) that abstracts hardware-virtualization primitives       219
+165                                                                        2                                                                      220
+      HyperAlloc: Efficient VM Memory De/Inflation via Hypervisor-Shared Page-Frame Allocators                                 EUROSYS’25, March 30–April 3, 2025, Rotterdam
+
+                                                                                                      controls
+221                        Peripheral Devices                            QEMU Monitor                                              KVM Virtual Machine                                                         276
+222                                                                                                                                                                                                            277
+223                     Network Card                                    Reclamation                                                Guest Virtual Memory                                                        278
+224                                   exclusively attached      ➊ Evict (+ allocate) 2 MiB                                                         (de-)allocate                                               279
+                                                                                                                                              guest physical memory
+225                                                             ➋ Unmap host phys. mem                                                         (4K, 8K,...,2M,4M)                                              280
+
+
+
+
+                                                                                                      LLFree
+226                                                             ➌ Update reclaim state                                                                                                                         281
+                                                                                                               Shared
+227                                                                                                            Mapping                 LLFree Allocator                                                        282
+                       DMA                                              Reclaim State                                          alloc’d free    free    evicted             evicted
+228                                                                                                                                                                                                            283
+                       Access            inaccessible                    I   I   S    H
+                                                                                                                                (4K) (4K)     (2M)      +free              +alloc’d
+229                                      for devices                                                                                                                                                           284
+230                                                                                                                                                                                                            285
+                       I/O Virtual Address Space                 VFIO Objs            Mem Objs.                                    Guest Physical Memory
+231                                                                                                                                                                                                            286
+232                     GP0     GP1     GP2      GP3                                                                            GP0           GP1      GP2                 GP3                                 287
+                                                                    p                                (u
+                                                                                                       n-)
+                                                                 ma
+233                                                                                                                                                                                                            288
+                          IOMMU Page Tables                     -)          al          Ho         ma                              Extended Page Tables
+234                                                          (un     hy
+                                                                        sic                st
+                                                                                              Ph       p                                                                                                       289
+                                                                    P                           y s
+235                    HP34 HP47                             H o st        KVM Hypervisor           ica
+                                                                                                        l                      HP34 HP47                                                                       290
+236                                                                                                                                                                                                            291
+237   Figure 1. Overview of HyperAlloc Concept. The controlling QEMU monitor has shared-memory access to the VM’s allocator state and                                                                          292
+238   marks those huge pages as evicted/allocated that it removes from the EPT and the IOMMU page table. The virtual machine requests (not                                                                     293
+239   shown) evicted huge pages on allocation from the monitor, thus ensuring DMA safety.                                                                                                                      294
+240                                                                                                                                                                                                            295
+      (i.e., EPTs, virtual CPUs) for a user-space monitor process                                       Host State                                                          Guest State
+241                                                                                                                                    controls                                                                296
+      (QEMU) that emulates devices and decides on high-level                                                       ha
+                                                                                                                                                         allo
+                                                                                                                                                                c
+242                                                                                                  R: I       recla rd                                                         A: 0         ha               297
+      resources (e.g., memory size).                                                                                 im                                             free                   recla rd
+243                                                                                                  M: 1                                                                        E: 0           im             298
+          With HyperAlloc, the QEMU monitor has shared access                                                               R: H                      A: 1                                              A: 1
+                                                                                                     reclaim
+
+
+
+
+                                                                                                                                                                                 reclaim
+                                                                                           install
+
+
+
+244                                                                                                                                                                                                            299
+                                                                                                       soft
+
+
+
+
+                                                                                                                                                                                   soft
+      to the guest-physical allocator’s state to identify unused                                               retu
+                                                                                                                    rn      M: 0                      E: 0                                 retu
+                                                                                                                                                                                                rn      E: 1
+245                                                                                                                                                                                                            300
+      memory and to mark memory as reclaimed/allocated for                                           R: S                                                                        A: 0
+                                                                                          ger
+
+
+
+
+                                                                                                                      d                                                                           d
+                                                                                                                  har                 (triggers)             1 a
+                                                                                                                                                             ⃝                                har
+                                                                                                                       im                                                                          im
+                                                                                       trig
+
+
+
+
+246                                                                                                  M: 0        recla                                               lloc        E: 1        recla             301
+      the guest. For example, if we want to shrink the maximally                          1
+                                                                                          ⃝
+247                                                                                                                                                                                                            302
+      available guest memory, we can remove the host-physical                                                                        Reclaim State                                           Alloc’d Flag
+248                                                                                                   Guest Operation                                           R: S            A: 0                           303
+      frame 47 (HP47), which is available as guest-physical frame
+249                                                                                                   Host Operation                  EPT Mapped                M: 0            E: 1                           304
+      1 (GP1) and currently marked as free, as follows:                                                                                                                                      Evicted Hint
+250                                                                                                                                                      Combined State for one                                305
+                                                                                                      Host Op. (in auto mode)                              2 MiB Page Frame
+251                                                                                                                                                                                                            306
+            ➊ HyperAlloc marks GP1 as evicted and allocated in the
+252                                                                                           Figure 2. State Transition Diagram for one Memory Frame                                                          307
+              guest-physical allocator’s state.
+253                                                                                                                                                                                                            308
+            ➋ It unmaps the host-physical frame HP47 from the
+254
+              EPT and the IOMMU page tables via standard KVM                             𝑀 ↦→ {0, 1}: Mapped indicates whether the page is                                                                     309
+255
+              interfaces, giving it back to the host allocator.                              backed with host-physical memory in all relevant                                                                  310
+256
+            ➌ The QEMU monitor updates HyperAlloc’s authorita-                               hypervisor-level page tables (i.e., EPT, IOMMU).                                                                  311
+257
+              tive reclamation state for GP1 to hard reclaimed (H),                       𝑅 ↦→ {𝐼 , 𝑆, 𝐻 }: In the reclamation state, HyperAlloc                                                               312
+258
+              which marks, in contrast to soft reclaimed (S), that the                       keeps track whether a page is currently Installed, Soft                                                           313
+259
+              frame should not be repopulated on demand.                                     reclaimed, or Hard reclaimed. For a reclaimed page                                                                314
+260                                                                                          𝑀 = 0 holds.                                                                                                      315
+261                                                                                                                                                                                                            316
+                                                                                       On the guest side, we additionally maintain:
+262   3.2     Reclamation States                                                                                                                                                                               317
+                                                                                          𝐸 ↦→ {0, 1}: The evicted hint informs the guest that the
+263   In the following, we look at the abstract state of a single                                                                                                                                              318
+                                                                                             page was reclaimed and is not backed by physical
+264   memory page frame and its state transitions during recla-                                                                                                                                                319
+                                                                                             memory. 𝐸 is a one-way synchronized copy of ¬𝑀.
+265   mation. While we usually reclaim memory on huge-page                                                                                                                                                     320
+                                                                                          𝐴 ↦→ {0, 1}: Allocated indicates whether the huge page,
+266   granularity, our HyperAlloc concept is not restricted to this                                                                                                                                            321
+                                                                                             or parts of it, is allocated within the guest.
+267   granularity. In Sec. 4.1, we will discuss the mapping of these                                                                                                                                           322
+268   states to the LLFree allocator.                                                  Guest-Level Allocation The guest’s physical-memory                                                                      323
+269                                                                                    allocator can free and allocate non-evicted frames by tog-                                                              324
+270   Page States For HyperAlloc, the state of a page (Fig. 2) is                      gling the allocated flag (blue arrows) without hypervisor                                                               325
+271   a tuple with four elements that consists of a host (𝑀, 𝑅) and                    interaction. Only for allocations of evicted pages (𝐸 = 1), the                                                         326
+272   a guest part (𝐸, 𝐴). Only the guest part is accessible by both                   guest has to trigger the hypervisor (via virtio-queue) once                                                             327
+273   parties to ensure safety and security. On the host side, we                      to install a host-physical page and also remove the evicted                                                             328
+274   have:                                                                            hint (𝐸 ← 0).                                                                                                           329
+275                                                                               3                                                                                                                            330
+      EUROSYS’25, March 30–April 3, 2025, Rotterdam                                                                 Anon. Submission Id: 517
+
+
+331   Reclamation HyperAlloc can reclaim memory that is not                allows a non-conforming guest to resist memory reclama-             386
+332   allocated (𝐴 = 0) by the guest in two modes: hard and soft           tion (i.e., to not cooperate), it bears no safety or security       387
+333   reclamation. For hard reclamation (𝑅 ← H), where the goal            implications. Given a fine-grained memory pricing model,            388
+334   is to remove the memory permanently (i.e., reducing the              the guest would just have to pay for the extra memory.              389
+335   maximal guest memory), the host marks the frame for the                 Regarding safety, we must also consider concurrent               390
+336   guest as allocated and evicted (𝐴 ← 1, 𝐸 ← 1). This ensures          host/guest operations: As we access the shared state exclu-         391
+337   that the frame is not available for the guest allocator. For         sively through atomic operations, the shared state itself does      392
+338   soft reclamation, the QEMU monitor only sets the evicted             not pose a problem. However, on the host side, concurrent           393
+339   hint (𝐴 = 0, 𝐸 ← 1), keeping the frame as usable for guest           reclaim, return, and install operations may impose race con-        394
+340   allocations but at a higher cost. After updating the guest           ditions inside the monitor. In our current implementation,          395
+341   state, we remove (𝑀 ← 0) the frame from all guest-accessible         the hypervisor synchronizes these operations with a per-VM          396
+342   mappings (i.e., EPT and IOMMU), perform TLB invalidations,           lock. We also considered per-frame locking via a “lock” recla-      397
+343   return the memory to the host allocator, and update 𝑅.               mation state but left this for future work, as we could barely      398
+344      In both reclamation modes, the guest is informed about            notice any contention, even for highly parallel workloads.          399
+345   the reclaimed state of the frame, which he can use to steer                                                                              400
+346   its allocation policy. In our prototype, we extended LLFree          3.3   Management Policies                                           401
+347   to prefer non-evicted over evicted frames for allocations.           HyperAlloc uses the provided reclamation mechanisms (hard           402
+348                                                                        and soft) to implement two management policies:                     403
+349   Return and Install The hypervisor can explicitly be in-              Adaptable Memory Hard Limit QEMU already supports
+                                                                                                                                               404
+350   structed (e.g., via the management console) to return hard-          an adjustable upper memory limit, whose reduction below
+                                                                                                                                               405
+351   reclaimed memory to the guest by setting the state of the            the initial allocation is usually implemented via memory
+                                                                                                                                               406
+352   respective frames to soft-reclaimed on both sides (𝐴 ← 0,            ballooning or hotplugging. With HyperAlloc, we use hard
+                                                                                                                                               407
+353   𝐸 = 1) and (𝑅 ← S). This allows us to implement a flexible                                                                               408
+                                                                           reclamation to decrease the maximal memory size of a guest
+354   soft limit while having an adaptable hard limit.                     if triggered from the QEMU console or QEMU’s QOM API.
+                                                                                                                                               409
+355      To actually install soft-reclaimed frames, we let the guest       In contrast to others [23, 24, 45, 53], HyperAlloc usually
+                                                                                                                                               410
+356   allocator issue a hypercall on allocation, which triggers the        does not have to transition to the guest or stop it. Only if
+                                                                                                                                               411
+357   hypervisor to provide host memory, map it in all guest-              there is not enough free memory in the guest’s allocator, we
+                                                                                                                                               412
+358   accessible page tables, and update its reclamation state. In-                                                                            413
+                                                                           instruct the guest to free the remaining memory from its
+359   stalling memory on access (i.e., waiting for the EPT fault)                                                                              414
+                                                                           caches and retry our hard reclamation afterward. To increase
+360   is not sufficient for DMA-safety, as the OS is then still free       the upper limit, we use the return operation to add more
+                                                                                                                                               415
+361   to reclaim or remap the accessed pages at any time (see              soft-reclaimed guest-physical memory, delaying the actual
+                                                                                                                                               416
+362   Sec. 2). Instead, we have to explicitly pin the VM’s memory          memory allocation until the guest triggers install. While
+                                                                                                                                               417
+363   pages when they are mapped. Still, this install-on-access            our current implementation does not allow growing a VM
+                                                                                                                                               418
+364   should perform equally good, as: (a) An explicit hypercall                                                                               419
+                                                                           beyond its initial memory allocation, it would be possible to
+365   is, performance-wise, not inherently more expensive than                                                                                 420
+                                                                           combine HyperAlloc with memory hotplugging (Sec. 6).
+366   an implicit EPT fault. (b) Unlike with virtual memory, page                                                                              421
+367   frames requested from the guest’s physical memory alloca-            Soft Limit by Automatic Reclamation With automatic                  422
+368   tor are likely to be accessed shortly thereafter, so we cannot       reclamation enabled, HyperAlloc periodically removes un-            423
+369   expect significant benefits from delayed provisioning.               used frames from the running guest, shrinking the currently         424
+370                                                                        attached host-physically memory. Every 5 seconds, we scan           425
+371   Invalid Guest States Like with any approach for coop-                the reclamation-state array for installed (𝑅 = 𝐼 ) pages and        426
+372   erative host–guest memory management (e.g., ballooning               inspect the guest’s allocator state if the page is free (𝐴 = 0).    427
+373   [24, 45, 53], hotplugging [23, 45]), both sides have to adhere       Both data structures are densely packed, so this linear search      428
+374   to an interaction protocol. For our reclamation protocol, both       bears only a tiny cache load and, thus, minimal performance         429
+375   guest and host inspect and update the shared per-frame guest         impact. In our current implementation (2 bits for 𝑅, 16 bits        430
+376   state. Therefore, we need to discuss the potential safety/se-        for 𝐴), we access 2·512   16·512
+                                                                                              8·64 + 8·64 = 18 consecutive cache lines         431
+377   curity implications of non-conforming or malicious guests:           to scan 1 GiB of guest-physical memory for free huge pages.         432
+378      HyperAlloc never makes decisions upon 𝐸 but has its own                                                                               433
+379   frame-state tracking (𝑅), making the 𝐸 flag a mere read-only         4     HyperAlloc in Linux                                           434
+380   copy of 𝐸 ← (𝑅 ≠ I). Thus, a maliciously manipulated 𝐸 has           To integrate HyperAlloc with Linux, we use and extend LL-           435
+381   no impact on the hypervisor. Similarly, HyperAlloc updates           Free [56], a lock- and log-free allocator that replaces the         436
+382   𝐴 on the hard reclamation and return transition, where we            Linux buddy allocator and primarily focuses on multicore            437
+383   set 𝐴 ← (𝑅 = 𝐻 ). Only for the reclamation decision, the             scalability and fragmentation avoidance. For us, its lock-free      438
+384   hypervisor inspects 𝐴 to find reclaimable pages. While this          design enables the efficient access to the guest allocator from     439
+385                                                                    4                                                                       440
+      HyperAlloc: Efficient VM Memory De/Inflation via Hypervisor-Shared Page-Frame Allocators       EUROSYS’25, March 30–April 3, 2025, Rotterdam
+
+            Guest: Reserved Trees             Hypervisor
+441
+                                                              Free counter
+                                                                                 State Mapping We integrate the guest part (𝐴, 𝐸) of Hy-             496
+            Unmovable
+442
+              Movable                                         Allocated          perAlloc’s per-frame state (see Fig. 2) into the area-index         497
+443
+                 Huge                                                            entry and use the existing huge-frame–allocated flag for 𝐴.         498
+                                       0 4 7 9 3
+444                            Trees
+                                       0 1 1 1 0 - Reserved
+                                                                                 As the area counter and flag require 11 bits, we can choose         499
+445                                    h h m f m - Kind                          one bit for the evicted hint (𝐸) from the 5 remaining bits. By      500
+446
+                                          8                    Used for          co-locating counter, allocated flag, and evicted hint in the        501
+447                                                           HyperAlloc         same 16-bit word, it is also ensured that the host can induce       502
+448
+                    2 MiB Areas
+                                   0 0 0 3 0 4 4 4                               guest transitions atomically with a CAS operation.                  503
+                                   0 0 0 0 1 1 1 0 - Evicted Hint
+449                                                                                                                                                  504
+                                   1 0 0 0 1 0 0 0 - Allocated as HP             Reservation Policy Besides using the eviction hint for
+450                                                                                                                                                  505
+                                   512                                           the allocation policy, we also modified the tree-reservation
+451         Bit Field                                                                                                                                506
+                                                                                 policy to further improve its fragmentation avoidance: The
+452                                                                                                                                                  507
+                                                                                 original LLFree uses per-core tree reservations to avoid false
+453   Figure 3. LLFree Allocator State [56]. Interlayer connections (ar-                                                                             508
+                                                                                 sharing. In our experiments, we saw that a few long-living al-
+454   rows) are not implemented with pointers but via offset arithmetic.                                                                             509
+                                                                                 locations (e.g., in the page cache) provoke higher huge-frame
+455                                                                                                                                                  510
+                                                                                 fragmentation. Therefore, we removed the per-core reserva-
+456   different privilege levels, while its fragmentation-awareness                                                                                  511
+                                                                                 tions in favor of per-type reservations: Linux distinguishes
+457   improves the availability of free huge frames to reclaim.                                                                                      512
+                                                                                 between three allocation types, which usually have different
+458                                                                                                                                                  513
+      4.1   LLFree Overview                                                      lifetimes: unmovable kernel allocations, movable user allo-
+459                                                                                                                                                  514
+                                                                                 cations, and huge allocations. We separate these types into
+460   From a high-level perspective (Fig. 3), LLFree is a bitmap                                                                                     515
+                                                                                 different trees by having one global reservation per type and
+461   allocator that uses two levels of free-counter indexes (trees                                                                                  516
+                                                                                 by introducing a 2-bit type field in the tree-index entry. Our
+462   consist of areas) to speed up and steer the search for free                                                                                    517
+                                                                                 application-level experiments showed no negative perfor-
+463   memory: For each base frame, a bit in the bit field indicates                                                                                  518
+                                                                                 mance impact of removing the per-core trees. We assume
+464   whether it is free. An area covers 512 such bits, which corre-                                                                                 519
+                                                                                 that other bottlenecks within the memory-management of
+465   sponds exactly to one huge frame and is associated with a                                                                                      520
+                                                                                 Linux, as measured by [56], dominate the results.
+466   16-bit index entry. This entry includes a 9-bit counter indicat-                                                                               521
+                                                                                    The per-type reservations lead to less fragmentation in
+467   ing how many base frames are free and an allocated flag that                                                                                   522
+                                                                                 the long run. They also increase the effectiveness of Linux’s
+468   allows for the atomic allocation of the entire huge frame. If                                                                                  523
+                                                                                 active defragmentation (memory compaction). While Linux
+469   the area counter is 512 and the flag indicates free, the covered                                                                               524
+                                                                                 developers have undertaken attempts to separate allocations,
+470   huge frame is entirely free and can be allocated as a huge                                                                                     525
+                                                                                 our experiments showed that our LLFree-based type separa-
+471   frame with a single compare-and-swap (CAS) operation.                                                                                          526
+                                                                                 tion performs better, and increases the availability of huge
+472      A fixed number of consecutive areas (e.g., 8) form a tree,                                                                                  527
+                                                                                 frames (see Sec. 5.5). Additionally, we reduced the tree size
+473   whose index entry also contains a free-frame counter. Trees                                                                                    528
+                                                                                 from 32 areas (64 MiB) to 8 areas (16 MiB) to make the reser-
+474   are also essential for LLFree’s anti-fragmentation policy,                                                                                     529
+                                                                                 vation policy and its fragmentation avoidance more accurate.
+475   which tries to avoid allocating frames from “almost full”                                                                                      530
+                                                                                    Linux additionally divides the physical memory into zones
+476   trees (where most frames are free). For this, CPUs dynam-                                                                                      531
+                                                                                 based on their physical address and NUMA locality. On
+477   ically reserve trees, preferring “half depleted” and “almost                                                                                   532
+                                                                                 x86, there are the global DMA zone (16-bit addressable) and
+478   depleted” over “almost full” trees, from which they allocate                                                                                   533
+                                                                                 DMA32 zone (32-bit addressable) plus for each NUMA node a
+479   memory until allocations fail. Due to this reservation pol-                                                                                    534
+                                                                                 Normal zone. Every populated zone has its individual LLFree
+480   icy, “almost full” trees (and areas) defragment without active                                                                                 535
+                                                                                 instance. When reclaiming memory, the host starts with the
+481   memory compaction.                                                                                                                             536
+                                                                                 LLFree instances of the Normal zones before continuing with
+482      For HyperAlloc, two properties of the LLFree data struc-                                                                                    537
+                                                                                 the DMA32 zone. The tiny DMA zone (16 KiB) is ignored.
+483   tures are most important: (1) Bit fields and counter indices                                                                                   538
+484   are stored as densely packed arrays, where frame states can                Locating the Allocator State To interact with the guest             539
+485   be located through simple offset arithmetic without relying                allocator, HyperAlloc has to locate the allocator state in mem-     540
+486   on guest-side pointers. (2) All operations on the state are                ory. During boot, the guest uses virtio queues to commu-            541
+487   performed lock-free using atomic CPU instructions only –                   nicate the guest-physical address of the LLFree metadata            542
+488   there are no locks involved.                                               to the QEMU monitor. LLFree’s compact state, consisting             543
+489                                                                              mainly of the three state arrays, is well suited for sharing        544
+490   4.2   Integration with LLFree and KVM                                      with the hypervisor as it is only accessed by LLFree and does       545
+491   For our integration, we chose to reclaim unused memory on                  not contain any unrelated metadata (unlike the struct page          546
+492   the granularity of huge frames, which reduces the reclama-                 used by VProbe [55]). The monitor maps the state into its           547
+493   tion overhead but also ties the reclamation effectiveness to               own virtual address space and creates a cloned LLFree object        548
+494   the huge-page fragmentation behavior of the guest.                         that works on the shared state. From then on, both sides can        549
+495                                                                          5                                                                       550
+      EUROSYS’25, March 30–April 3, 2025, Rotterdam                                                                            Anon. Submission Id: 517
+
+
+551   inspect and modify the same LLFree instance directly over                                                                                           606
+                                                                                    Table 1. Evaluation candidates and their properties.
+552   shared memory without a host-guest transition. This is done                                                                                         607
+                                                                               Name               Granu-    Manual   Auto    DMA      Implementation
+553   for every memory zone of the guest and, respectively, every                                  larity    Limit   Mode    Safety   taken from
+                                                                                                                                                          608
+554   LLFree instance.                                                         virtio-balloon     4 KiB                      ×      Debian 12
+                                                                                                                                                          609
+555                                                                                                                                   Own reimpl.1        610
+      KVM/QEMU Integration For our prototype, we decided                       . . . -huge [24]
+                                                                               virtio-mem [23]
+                                                                                                  2 MiB
+                                                                                                  2 MiB
+                                                                                                              
+                                                                                                              
+                                                                                                                       
+                                                                                                                       ×
+                                                                                                                               ×
+                                                                                                                                     Debian 12
+556                                                                                                                                                       611
+      to integrate HyperAlloc into QEMU, the user-space moni-                  VProbe [55]        4 KiB       ×                     unavailable
+557                                                                                                                                   Own1                612
+      tor for kernel-managed KVM guests (see Sec. 3.1). Thereby,               HyperAlloc         2 MiB                      
+558                                                                                                                                                       613
+      HyperAlloc requires no modifications to the host’s kernel.                   1 All artefacts are available at [redacted for double-blindness]
+559                                                                                                                                                       614
+      The downside is that HyperAlloc, as a user-level component,
+560                                                                                                                                                       615
+      has no direct access to the related page tables but instead            DMA safety, as all plug/unplug operations are explicit. To
+561                                                                                                                                                       616
+      has to use system calls to manipulate guest mappings. For              quantify the performance impact of DMA safety, we measure
+562                                                                                                                                                       617
+      example, we have to use madvise(DONT_NEED) to remove                   HyperAlloc and virtio-mem with and without device pass
+563                                                                                                                                                       618
+      EPT mappings and VFIO for IOMMU mappings. Installing a                 through of a VFIO-managed network card. Although our
+564                                                                                                                                                       619
+      frame requires two mode switches (guest – QEMU – kernel),              benchmarks do not use the card, its IO page tables must be
+565                                                                                                                                                       620
+      whereas only one would be necessary if HyperAlloc were                 kept synchronized, resulting in additional runtime costs.
+566                                                                                                                                                       621
+      part of KVM. To ease this issue, we aggregate huge frames                 We also would have liked to compare against VProbe,
+567                                                                                                                                                       622
+      during reclamation and unmap them with a single syscall,               which provides for both auto deflation and DMA safety [55].
+568                                                                                                                                                       623
+      which has proven effective due to LLFree’s compact alloca-             Unfortunately, the authors could not provide us with its
+569                                                                                                                                                       624
+      tion behavior (linear scan) and anti-fragmentation policy.             source code, as it relies on additional proprietary modifica-
+570                                                                                                                                                       625
+         Another disadvantage, which we share with all other                 tions that are only available within Alibaba’s environment.
+571                                                                                                                                                       626
+      monitor-level deflation techniques [23, 24], is that KVM han-          We discuss their concept further in Sec. 6.
+572                                                                                                                                                       627
+      dles EPT faults directly within the kernel without informing
+573                                                                          5.2   Environment                                                            628
+      the monitor process. This is a known limitation of KVM, by
+574                                                                                                                                                       629
+      which a non-conforming guest may allocate host-physical                All experiments were conducted on a machine with two Intel
+575                                                                                                                                                       630
+      memory for evicted frames without giving HyperAlloc the                Xeon Gold 6252 CPUs (2x24 cores @ 2.1 GHz) and 384 GB
+576                                                                                                                                                       631
+      possibility to update its reclamation state. The effects of such       of DDR4 memory, split evenly across two NUMA nodes. To
+577                                                                                                                                                       632
+      behavior would be similar to those discussed in Sec. 3.2: The          increase reproducibility, we disabled Intel Hyper-Threading
+578                                                                                                                                                       633
+      extra memory does not imply security/safety issues, and the            and Turbo Boost, locked the cores to their maximum clock
+579                                                                                                                                                       634
+      host can detect it by comparing the reclamation state with             speed, and pinned the VMs to the first node.
+580                                                                                                                                                       635
+      the resident-set size (RSS) of the QEMU process. Thus, in the             Both hypervisor and guest used Debian 12 (bookworm)
+581                                                                                                                                                       636
+      case of fine-grained memory accounting, the guest does not             with a Linux 6.1 kernel and QEMU/KVM 8.2.50. While we
+582                                                                                                                                                       637
+      benefit from this extra memory.                                        employed the provided Debian configuration for the host,
+583                                                                                                                                                       638
+                                                                             the guests used the default x86 kernel configuration with
+584                                                                                                                                                       639
+      5     Evaluation                                                       enabled virtio, VFIO, and transparent huge pages. For the
+585                                                                                                                                                       640
+                                                                             HyperAlloc scenarios, we additionally replaced the buddy
+586   Memory reclamation techniques compete in two dimensions:                                                                                            641
+                                                                             allocator with LLFree [56] in the guest’s kernel and used
+587   The overhead of reclamation and the elasticity, that is, how                                                                                        642
+                                                                             HyperAlloc instead of virtio-balloon/virtio-mem. For virtio-
+588   tight we can shrink a guest to its actual memory demand.                                                                                            643
+                                                                             balloon-huge, we used our reimplemented version from [24].
+589                                                                                                                                                       644
+                                                                             All kernel- and QEMU-variants were built with the LLVM
+590   5.1   Benchmark Competitors                                                                                                                         645
+                                                                             14.0.6 toolchain and the default compiler flags.
+591   We compare HyperAlloc to the state-of-the-art memory de-                  Unless specified otherwise, we used a VM with 12 vCPUs                    646
+592   flation techniques (see Tab. 1). For ballooning, we chose              and 20 GiB of memory. For virtio-mem, we split that into                     647
+593   virtio-balloon, which is supported by both QEMU and Linux              2 GiB of regular and 18 GiB hotpluggable system memory by                    648
+594   out of the box. As its performance is limited by its 4 KiB             allowing virtio-mem to plug it into the movable zone, so it                  649
+595   page granularity, we recreated huge-page ballooning from               can be unplugged later.                                                      650
+596   Hu et al. [24] (virtio-balloon-huge). Both variants support                                                                                         651
+597   manual and automatic memory reclamation via free-page                  5.3   Reclamation Speed                                                      652
+598   reporting but, as they rely on page faults, are not DMA-safe           First, we determine each candidate’s raw performance for                     653
+599   on their own [8, 51].                                                  resizing a VM with four micro benchmarks:                                    654
+600      For memory hotplugging, we pick virtio-mem [23], which                                                                                           655
+                                                                             Reclaim This is the speed for reclaiming and unmapping
+601   is also part of QEMU but is mainly designed for growing VMs                                                                                         656
+                                                                               memory. We ensure that the memory is present by writing
+602   efficiently. While shrinking the VM is possible, it can only                                                                                        657
+                                                                               into 19 GiB of guest pages1 before the benchmark.
+603   reliably reclaim memory from the Movable zone and does                                                                                              658
+604   not support automatic reclamation. However, it provides                1 Requesting all 20 GiB would trigger an OOM error.                          659
+605                                                                      6                                                                                660
+      HyperAlloc: Efficient VM Memory De/Inflation via Hypervisor-Shared Page-Frame Allocators                                              EUROSYS’25, March 30–April 3, 2025, Rotterdam
+
+
+661              virtio-balloon                                                                                        the guest did not touch the memory. The speedup results only         716
+          virtio-balloon-huge
+                                                                                                                       from the reduced EPT-manipulation costs. Virtio-balloon-
+
+
+
+
+                                                                                               Reclaim
+662                                                                                                                                                                                         717
+                    virtio-mem
+663         virtio-mem+VFIO                                                                                            huge with its 2 MiB granularity mitigates this bottleneck,           718
+                    HyperAlloc
+664
+            HyperAlloc+VFIO
+                                                                                                                       increasing performance 143 times.                                    719
+665
+                              10   −1
+                                        10   0
+                                                  10   1
+                                                           10   2
+                                                                    10   3
+                                                                             10   4
+                                                                                      10   5                              Similarly, virtio-mem also works with 2 MiB huge pages.           720
+666                                          Speed [GiB/s] - logarithmic                                               Its performance falls in between the two previous candidates,        721
+
+
+
+
+                                                                                               Reclaim Untouched
+667              virtio-balloon                                                                                        reaching speeds of 34 GiB/s. Reclaiming untouched memory             722
+668       virtio-balloon-huge
+                    virtio-mem
+                                                                                                                       is faster, as it is not faulted in and does not have to be un-       723
+669         virtio-mem+VFIO                                                                                            mapped by the hypervisor. The main bottleneck in both cases          724
+670                 HyperAlloc
+            HyperAlloc+VFIO
+                                                                                                                       appears to be the hot(un)plugging infrastructure. With an            725
+671
+                              10   −1
+                                        10   0
+                                                  10   1
+                                                           10   2
+                                                                    10   3
+                                                                             10   4
+                                                                                      10   5
+                                                                                                                       attached device, virtio-mem also has to manage the IOMMU             726
+672                                          Speed [GiB/s] - logarithmic                                               memory mappings with VFIO, which results in a 52 percent             727
+673              virtio-balloon                                                                                        slowdown. Since virtio-mem does neither interact with the            728
+674       virtio-balloon-huge                                                                                          guest’s allocator nor uses a virtual IOMMU [8, 51], it only          729
+
+
+
+
+                                                                                               Return
+                    virtio-mem
+675         virtio-mem+VFIO                                                                                            achieves DMA safety by immediately pinning and mapping               730
+676                 HyperAlloc                                                                                         all memory when the memory limit grows. When virtio-                 731
+            HyperAlloc+VFIO
+677                                                                                                                    mem+VFIO shrinks the VM, these operations are not only               732
+                              10−1      100       101      102      103      104      105
+678                                          Speed [GiB/s] - logarithmic                                               reversed, but they also have to flush the IOTLB, even if the         733
+679                                                                                                                    memory was never touched. Because of this pre-population,            734
+                                                                                               Return + Install
+
+
+
+                 virtio-balloon
+680       virtio-balloon-huge                                                                                          virtio-mem+VFIO shows no real difference between remov-              735
+                    virtio-mem
+681
+            virtio-mem+VFIO
+                                                                                                                       ing touched and untouched memory.                                    736
+682                 HyperAlloc                                                                                            With a shrink rate of 344.8 GiB/s, HyperAlloc outperforms         737
+            HyperAlloc+VFIO
+683                                                                                                                    all competitors, being 10 and 3 times faster than virtio-mem         738
+                                  0     1          2       3        4        5        6
+684                                              Speed [GiB/s] - linear                                                and virtio-balloon-huge. Removing untouched memory is                739
+685
+      Figure 4. Speed of reclaiming/returning memory (logarithmic                                                      even faster (4.92 TiB/s), since we only modify allocator and         740
+686   scale). For HyperAlloc this measures the hard reclamation.                                                       reservation state, and can skip the expensive unmap oper-            741
+687                                                                                                                    ations. With an attached device, the IOMMU-management                742
+688    Reclaim Untouched This measures the speed for reclaim-                                                          overheads make shrinking 6.3 times slower; still HyperAl-            743
+689     ing memory that was unmapped before but has not been                                                           loc is the best DMA-safe technique. Removing untouched               744
+690     installed since. For this, we reclaim the VM in advance and                                                    memory remains unaffected, as we only have to update the             745
+691     grow it again before starting this benchmark.                                                                  IOMMU for memory that the guest previously allocated.                746
+692    Return This measures how fast we can increase the mem-                                                                                                                               747
+693     ory limit of a virtual machine without allocating or touch-                                                    Return Growing the VM’s memory limit is faster for most              748
+694     ing the returned memory.                                                                                       candidates, as the returned pages are populated lazily (on           749
+695    Return+Install This measures how fast we can increase                                                           EPT faults / install hypercalls). Again, virtio-balloon is the       750
+696     the VM’s memory limit and use the returned pages. For                                                          slowest competitor and can only grow the VM with 2.3 GiB/s           751
+697     this, we use a guest-kernel module to allocate 19 GiB of                                                       as deflating the balloon requires that the previously allocated      752
+698     memory1 and write into each 4 KiB frame.                                                                       4 KiB frames are returned one-by-one2 to the guest allocator.        753
+699
+      For the reclamation, we shrunk the VM’s hard limit to 2 GiB                                                      Virtio-balloon-huge provides a sizable performance increase          754
+700
+      (from 20 GiB) and vice versa for returning. We repeated this                                                     (139×), with growing being about twice as fast as shrinking.         755
+701
+      procedure 10 times for each candidate. The guest-kernel                                                             Virtio-mem can grow the memory limit by 102 GiB/s, once           756
+702
+      module in return+install was executed single-threaded. Fig. 4                                                    again falling short of virtio-balloon-huge. The reason for           757
+703
+      shows the achieved grow/shrink rate, while the error bars                                                        this difference is that virtio-mem makes hypercalls for ev-          758
+704
+      denote the 95 percent confidence interval. Please note the                                                       ery plugged 2 MiB block, while the virtio-balloon(-huge)             759
+705
+      logarithmic x-axis for the first three graphs.                                                                   guest driver returns pages without extra hypercalls (both            760
+706                                                                                                                    ultimately populate on EPT-fault). Virtio-mem with VFIO is           761
+      Reclaim The reclamation of touched memory is primarily
+707                                                                                                                    21 × slower than without VFIO because it has to pre-populate         762
+      affected by the used granularity. Virtio-balloon, due to its
+708                                                                                                                    the memory for DMA-safety.                                           763
+      4 KiB page granularity, performs poorly with a speed of only
+709                                                                                                                       HyperAlloc outperforms all candidates by a considerable           764
+      0.95 GiB/s. Here, each 4 KiB page is allocated, sent to the
+710                                                                                                                    margin, working at 84 and 26 times the speed of virtio-mem           765
+      hypervisor2 and discarded with a madvise syscall, which
+711                                                                                                                    and virtio-balloon-huge. As with removing untouched mem-             766
+      results in significant transition overheads. These also occur if
+712                                                                                                                    ory, returning it just modifies the respective bits in the alloca-   767
+713   2 Even though the hypercalls are aggregated (up to 256 pages per hypercall),                                     tor state, taking 229 ns per huge page (compared to 388 ns for       768
+714   the other syscalls and page operations are not.                                                                  reclaiming an untouched huge page). As expected, adding a            769
+715                                                                                                                7                                                                        770
+      EUROSYS’25, March 30–April 3, 2025, Rotterdam                                                                                                              Anon. Submission Id: 517
+
+                                                                                                                  1 thread(s)                    4 thread(s)                   12 thread(s)
+771                                                                                                                                                                                           826
+            Table 2. 1st percentile for STREAM and FTQ benchmarks.                                   10.0
+
+
+
+
+                                                                                   Bandwith [GB/s]
+772                                                                                                                                   20
+                                                                                                                                                                   60                         827
+                                                                                                      7.5
+773                               STREAM [GB/s]              FTQ [𝑒 6 ]                                                                                                                       828
+                                                                                                                                                                   40
+                                     Threads                 Threads                                  5.0
+774                                                                                                                                   10                                                      829
+                                                                                                      2.5                                                          20
+775             Candidate          1      4     12     1        4         12                                                                                                                  830
+                                                                                                      0.0                              0                            0
+776               Baseline        10.3   26.0   69.0   9.4     10.2   30.6                                  0      50      100             0      50     100            0        50    100    831
+                                                                                                                 Runtime [s]                    Runtime [s]                    Runtime [s]
+777            virtio-balloon     6.2    10.9   30.9   5.9     7.5    24.9                                                                                                                    832
+778         virtio-balloon-huge   10.1   25.5   67.8   9.5     10.1   30.1                                      virtio-balloon                 virtio-mem                   HyperAlloc+VFIO
+                                                                                                                                                                                              833
+                                                                                                                virtio-balloon-huge            virtio-mem+VFIO
+                 virtio-mem       10.2   13.1   31.9   9.5      8.6   28.7
+779                                                                                                                                                                                           834
+             virtio-mem+VFIO      10.3   12.6   18.4   9.4      8.4   28.3
+780                                                                                                                                                                                           835
+                 HyperAlloc       10.3   26.3   70.1   9.5     10.2   30.7         Figure 5. Memory bandwidth over time as reported by STREAM
+781         HyperAlloc +VFIO      10.3   26.1   70.3   9.5     10.2   30.7         running on different numbers of threads.                                                                   836
+782                                                                                                                                                                                           837
+783                                                                                                                                                                                           838
+      device to the VM does not affect the performance. Memory                     and decrease the VM’s hard limit to 2 GiB. At 90 s, we in-
+784                                                                                                                                                                                           839
+      is only mapped to the IOMMU once the guest allocates it.                     crease it back to its original 20 GiB. While we largely follow
+785                                                                                                                                                                                           840
+786   Return+Install As ballooning, virtio-mem without VFIO,                       the procedure of [23], we extended it in two ways: (1) In-                                                 841
+787   and HyperAlloc all populate the returned memory lazily,                      stead of running the benchmarks only single threaded, we                                                   842
+788   we also measured the speed of returning and accessing the                    also explore multi-threaded workloads (4 and 12 threads)                                                   843
+789   memory (Return+Install). Again, virtio-balloon’s 4 KiB gran-                 to better understand different system loads. (2) While the                                                 844
+790   ularity makes it the slowest candidate. Virtio-balloon-huge                  original benchmark only shrank the VM, we also include a                                                   845
+791   reaches the highest data rate of 4.2 GiB/s, shortly followed                 subsequent growing phase.                                                                                  846
+792   by both virtio-mem and HyperAlloc with 4 GiB/s. To put this                     As baseline, we use the virtio-balloon configuration, but                                               847
+793   into perspective: our benchmark accesses mapped pages at                     do not resize it (Tab. 2). However, we exclude it from the                                                 848
+794   17 GiB/s. Even though HyperAlloc’s install hypercalls are                    plots to improve readability. Since there were no significant                                              849
+795   about 6 percent slower than virtio-mem’s EPT faults (due to                  differences between HyperAlloc with and without device                                                     850
+796   having an additional context switch to QEMU which then                       pass through, the plots only include the former.                                                           851
+797   uses madvise to manipulate the VM), the faster initial re-                   Memory Bandwidth To simulate a memory-intensive                                                            852
+798   turn time compensates for this difference. Therefore, the                    task, we use a customized version of the STREAM [37] bench-                                                853
+799   combined return+install times are almost equal. The same                     mark, which repeatedly measures the bandwidth of mem-                                                      854
+800   is true for device pass through (VFIO), where virtio-mem                     copy operations (≈1 GiB per operation). We modified the                                                    855
+801   prepopulates the IOMMU, thus having more upfront costs                       benchmark to only run one of its four measurements (Copy)                                                  856
+802   than HyperAlloc, which pays the mapping costs on demand.                     and to export per-sample memcopy bandwidth rates. As                                                       857
+803      Overall, we see that HyperAlloc is significantly faster than              STREAM’s iteration time varies between thread counts, we                                                   858
+804   the competition for reclaiming and returning memory while                    chose the number of iterations for each thread configuration                                               859
+805   being DMA-safe. Only installing returned memory is slightly                  so that the slowest candidate took 140 s.                                                                  860
+806   slower than virtio-balloon-huge due to the additional context                   The scatter plots in Fig. 5 show the bandwidth of each                                                  861
+807   switch to the QEMU monitor. However, this overhead would                     iteration over time. To judge the impact of high-frequency                                                 862
+808   probably disappear if we integrated HyperAlloc into KVM                      resizing on latency-sensitive tasks, Tab. 2 contains 1st per-                                              863
+809   itself, removing the extra context switch.                                   centile bandwidths. Running the experiment inside a vir-                                                   864
+810                                                                                tualized environment introduces some noise, particularly                                                   865
+      5.4     Guest Performance Impact
+811                                                                                for larger thread counts. However, analysis of our baseline                                                866
+812   In addition to raw speed, we also analyzed the impact of                     indicates that the influence on the 1st percentile is negligible                                           867
+813   reclamation on the guest performance. To do so, we change                    compared to the actual observed performance degradation.                                                   868
+814   the VM’s memory limit while running memory- and CPU-                         While there are slight differences in memory bandwidth be-                                                 869
+815   intensive workloads. For comparability to previous work, we                  tween candidates while idling (before 20 s and once resizing                                               870
+816   based our procedure on Hildenbrand and Schulz [23].                          is complete), they are within run-to-run variance.                                                         871
+817   Experiment Procedure The VM is prepared by simulat-                             With STREAM running on a single thread, only shrinking                                                  872
+818   ing a realistic workload: We execute 9 memory-intensive                      via virtio-balloon significantly impacts the guest’s perfor-                                               873
+819   SPECrate2017 benchmarks [49], recreating the preparation                     mance due to its 4 KiB page granularity and subsequent com-                                                874
+820   step from [23]. For each benchmark, we start as many in-                     munication overhead. Our virtio-balloon-huge implemen-                                                     875
+821   stances as needed to consume close to 19 GiB of memory and                   tation eliminates this overhead almost completely. While                                                   876
+822   run it for 180 seconds. This preparation grows the VM to                     virtio-mem shows a negligible spike at 20 s, HyperAlloc does                                               877
+823   its maximum size and randomizes the guest’s allocator state.                 not show any measurable impact on performance. As a result,                                                878
+824   After a 20 s cool-down period, we start the actual benchmark                 with HyperAlloc STREAM finishes ≈8.9 s faster compared to                                                  879
+825                                                                            8                                                                                                              880
+      HyperAlloc: Efficient VM Memory De/Inflation via Hypervisor-Shared Page-Frame Allocators                                               EUROSYS’25, March 30–April 3, 2025, Rotterdam
+
+                          1 thread(s)                       4 thread(s)                      12 thread(s)
+881                                             10.0                              30                                    noticeable, as evidenced by the 1st percentiles (Tab. 2). Virtio-    936
+882               8
+                                                 7.5                                                                    balloon causes the most significant performance degrada-             937
+      Work [e6]
+
+
+
+
+                                                                                  20
+883               6
+                                                 5.0
+                                                                                                                        tion, with shrinking being more expensive than growing.              938
+                  4
+884
+                                                 2.5
+                                                                                  10                                    Both virtio-mem and virtio-balloon with huge pages have a            939
+                  2
+885                                                                                                                     negligible impact at higher thread counts, even though the           940
+                  0                              0.0                               0
+886                   0    1         2                 0     1         2               0       1         2              duration is much shorter than in the previous experiment.            941
+                            Cycles       1e11                 Cycles       1e11                 Cycles       1e11
+887                                                                                                                     Notably, virtio-mem with device pass through generates no            942
+                          virtio-balloon                   virtio-mem                      HyperAlloc+VFIO
+888                       virtio-balloon-huge              virtio-mem+VFIO
+                                                                                                                        extra CPU overhead, regardless of memory pinning. Hyper-             943
+889                                                                                                                     Alloc has no significant effect. Even under full system load,        944
+890
+      Figure 6. Aggregated work as measured by FTQ for different num-                                                   its 1 percent lows are above the baseline. As a result, its min-     945
+891
+      bers of threads.                                                                                                  imum CPU performance is 23 and 6.8 percent higher than               946
+892                                                                                                                     virtio-balloon and virtio-mem.                                       947
+893                                                                                                                                                                                          948
+894                                                                                                                     5.5   Automatic Soft Reclamation                                     949
+      virtio-balloon. Apart from virtio-balloon, the 1st percentiles
+895                                                                                                                     Continuous Integration (CI) jobs often require large and             950
+      show no significant performance degradation.
+896                                                                                                                     varying amounts of memory for short bursts of time. Build-           951
+         On multiple threads, resizing the VM becomes increas-
+897                                                                                                                     farm VMs, which provide strict isolation, must accommodate           952
+      ingly noticeable. In addition to shrinking, virtio-balloon
+898                                                                                                                     the peak memory demand regardless of the job frequency. If           953
+      starts to cause slowdowns while growing the VM as well.
+899                                                                                                                     we can deflate these VMs dynamically and efficiently, more           954
+      Virtio-mem has a noticeable impact while shrinking, per-
+900                                                                                                                     VMs could run on the same physical host. We evaluate Hy-             955
+      forming even worse than virtio-balloon for ≈10 s with lows
+901                                                                                                                     perAlloc’s suitability for this scenario by compiling Clang          956
+      reaching 31.9 GB/s. When unplugging memory, virtio-mem
+902                                                                                                                     16.0.0. To increase memory pressure, we reduce the VM’s              957
+      removes blocks in decreasing address order, requiring the
+903                                                                                                                     memory to 16 GiB for our measurements, which is the ob-              958
+      guest OS to migrate used subblocks to other memory lo-
+904                                                                                                                     served maximum of the workload. As the automatic recla-              959
+      cations. Still, growing has no immediate effect on memory
+905                                                                                                                     mation mechanisms were designed to have no significant               960
+      bandwidth. New memory blocks are plugged in, but no mem-
+906                                                                                                                     performance impact, we focus on the memory footprint (in             961
+      ory is preallocated on the host. However, when passing a
+907                                                                                                                     GiB·min), which is calculated from the resident set size (RSS)       962
+      device to the VM, the memory needs to be populated and
+908                                                                                                                     of the QEMU process, representing its actually consumed              963
+      pinned, resulting in an even larger performance degradation
+909                                                                                                                     memory (sampled at 1 Hz). Similar metrics are also used by           964
+      than virtio-balloon (1.7 ×). Virtio-balloon-huge outperforms
+910                                                                                                                     cloud providers (e.g., AWS Lambda) to price memory usage.            965
+      virtio-mem but still shows a small impact while shrinking.
+911                                                                                                                        HyperAlloc and virtio-balloon (with free-page-reporting)          966
+      Even under full system load, HyperAlloc does not have a sig-
+912                                                                                                                     can automatically reclaim memory. As virtio-mem lacks an             967
+      nificant impact on memory bandwidth, with its 1st percentile
+913                                                                                                                     automatic reclaim mechanism, we simulated one: We track              968
+      bandwidth being 2.3 and 2.2 times higher than virtio-balloon
+914                                                                                                                     the number of free huge pages in the guest and (un-)plug             969
+      and virtio-mem. In contrast to the other evaluated solutions,
+915                                                                                                                     memory with a granularity of 1 GiB with a frequency of               970
+      reclaiming and returning memory from/to the guest does
+916                                                                                                                     1 s. Frequency and granularity were hand tuned for this              971
+      not involve fine granular guest-hypervisor communication
+917                                                                                                                     benchmark to minimize the overhead while still avoiding              972
+      or expensive memory migration.
+918                                                                                                                     out-of-memory errors. If directly integrated into virtio-mem,        973
+919   CPU Utilization To assess the impact on CPU-intensive                                                             automatic reclamation would most likely be more efficient,           974
+920   workloads, we employed the Fixed-Time-Quantum (FTQ) [29]                                                          but our simulation already shows that it is also limited by          975
+921   benchmark. It samples the amount of work performed by                                                             huge-page availability, like virtio-balloon.                         976
+922   a CPU thread within a fixed time interval by repeatedly                                                              Fig. 7 compares the Buddy and LLFree allocator baselines          977
+923   incrementing a counter. Usually, each thread is measured                                                          against virtio-balloon’s free-page-reporting, virtio-mem and         978
+924   independently, but to present the data more clearly, we aggre-                                                    HyperAlloc. The baselines, which statically use 16 GiB for the       979
+925   gate the work of all threads. This approach could introduce                                                       entire runtime, have the highest memory footprint. LLFree’s          980
+926   inaccuracies due to desynchronization. In practice, however,                                                      footprint is slightly smaller because of its shorter runtime.        981
+927   the sampling interval was sufficiently large to ensure that                                                       The different auto-reclamation techniques can reduce the             982
+928   the overall noise was negligible for all our experiments. We                                                      memory footprint from 24 to 45 percent, usually without no-          983
+929   sampled 1096 times at 228 -cycle intervals (≈140 s total).                                                        ticeable runtime overheads (which is by design). HyperAlloc          984
+930      The scatter plots in Fig. 6 show the amount of work per-                                                       has the lowest memory footprint, followed by the differ-             985
+931   formed per time interval. For easy comparison, we have                                                            ent configurations of virtio-balloon and lastly the simulated        986
+932   chosen the number of samples so that the runtime is equal                                                         virtio-mem mechanism.                                                987
+933   to the STREAM runs. The impact on CPU performance ap-                                                                The right most columns contain the total CPU times of all         988
+934   pears closely related to memory bandwidth, though far less                                                        12 threads of the QEMU processes, separated into user and            989
+935                                                                                                                 9                                                                        990
+       EUROSYS’25, March 30–April 3, 2025, Rotterdam                                                                                                                                                  Anon. Submission Id: 517
+
+
+991                       baseline Buddy                                                                                                                       virtio-balloon                            HyperAlloc               1046
+                                    LLFree
+                                                                                                                                                16
+
+
+
+
+                                                                                                                     Memory consumption [GiB]
+992                     o=9 d=2000 c=32                                                                                                                                                                                           1047
+                                                                                                                                                14
+       virtio-balloon
+
+
+
+
+                        o=9 d=2000 c=512
+993                       o=9 d=100 c=32                                                                                                                                                                                          1048
+                         o=9 d=100 c=512                                                                                                        12
+994                      o=0 d=2000 c=32                                                                                                                                                                                          1049
+                        o=0 d=2000 c=512
+                                                                                                                                                10
+995                       o=0 d=100 c=32                                                                                                         8
+                                                                                                                                                                                                                                  1050
+                         o=0 d=100 c=512
+996                                                                                                                                              6                                                                                1051
+                                 virtio-mem
+997                       virtio-mem+VFIO                                                                                                        4                                                                                1052
+                                 HyperAlloc
+998                       HyperAlloc+VFIO                                                                                                        2                                                                                1053
+                                              0   500       0       50        0      500     0      100                                          0
+999                                       Footprint [GiB·min] Runtime [min]   CPU User [min] CPU System [min]                                        0   10     20    30        40    50     0   10      20    30     40     50
+                                                                                                                                                                                                                                  1054
+1000   Figure 7. Average memory footprint, total runtime, and user/sys-                                                                                         Time [min]                               Time [min]               1055
+1001   tem CPU times of the QEMU process for a clang compilation (re-                                                                                          VM memory             small       huge          cached
+                                                                                                                                                                                                                                  1056
+1002   peated 6 times per candidate). For virtio-balloon, we compare dif-                                            Figure 8. Clang compilation with virtio-balloon’s free-page-                                                 1057
+1003   ferent parameters with the default configuration in bold.                                                     reporting (default) and HyperAlloc’s automatic soft-reclamation.                                             1058
+1004                                                                                                                                                                                                                              1059
+1005   system (page faults, KVM exits, and other syscalls). We see                                                                                            virtio-mem+VFIO                          HyperAlloc+VFIO
+                                                                                                                                                                                                                                  1060
+       that system and user time of LLFree-based benchmarks is                                                                                  16
+
+
+
+
+                                                                                                                     Memory consumption [GiB]
+1006                                                                                                                                                                                                                              1061
+1007   shorter than Buddy-based ones. An in-depth investigation                                                                                 14
+                                                                                                                                                                                                                                  1062
+                                                                                                                                                12
+1008   revealed that those runs incur about half as much EPT faults                                                                             10                                                                                1063
+1009   and TLB misses. LLFree’s contiguous allocation pattern ap-                                                                                8                                                                                1064
+1010   pears to be more suitable for VMs that are often backed by                                                                                6                                                                                1065
+1011   huge pages. As the user time also includes the VM work-                                                                                   4
+                                                                                                                                                                                                                                  1066
+1012   load, we can infer the reclamation overheads by comparing                                                                                 2
+                                                                                                                                                                                                                                  1067
+1013   it to their respective baselines. The overhead of HyperAl-                                                                                0
+                                                                                                                                                     0   10     20     30       40    50     0   10      20    30       40   50   1068
+1014   loc (0.51 ± 0.18%) is a minimally higher than virtio-balloon                                                                                             Time [min]                               Time [min]
+                                                                                                                                                                                                                                  1069
+1015   (default: 0.15 ± 0.42%). This is because HyperAlloc reclaims                                                                                            VM memory             small       huge          cached
+                                                                                                                                                                                                                                  1070
+1016   more memory, leading to more work in the QEMU process                                                         Figure 9. Clang compilation with HyperAlloc and virtio-mem with                                              1071
+1017   and more madvise syscalls.                                                                                    VFIO-based DMA safety.                                                                                       1072
+1018      The default configuration for virtio-balloon (Fig. 7 in bold)                                                                                                                                                           1073
+1019   reduces the memory footprint by 34 percent. We tuned the                                                      is an indicator of the degree of fragmentation within the                                                    1074
+1020   configuration parameters of virtio-balloon to see if we can in-                                               page allocator. (3) The size of the guest’s page cache. (4) The                                              1075
+1021   crease its efficiency. These parameters include the REPORT-                                                   amount of assigned VM memory (RSS) which reclamation                                                         1076
+1022   ING_ORDER (o), denoting the size of reclaimed memory                                                          reduces. As small and cached are defined by the workload,                                                    1077
+1023   blocks (we used 4 KiB and 2 MiB), the REPORTING_DELAY                                                         they are expected to remain the same across all candidates.                                                  1078
+1024   (d), specifying the delay between the freeing of chunk of the                                                 In the best-case scenario, the assigned VM memory, the used                                                  1079
+1025   specified order and the subsequent reclamation (from 2 s to                                                   huge pages, and the allocated small pages would all be equal,                                                1080
+1026   100 ms), and the REPORTING_CAPACITY (c), denoting the                                                         showing perfect memory efficiency.                                                                           1081
+1027   size of the reclaim buffer that is sent to the host (from 32                                                     Fig. 8 shows the results of a single run for virtio-balloon                                               1082
+1028   to 512). If the mechanism uses huge pages (o=9) we see no                                                     (o=9, d=2000, c=32) and HyperAlloc. As expected, the size                                                    1083
+1029   significant difference between the delay (d) and capacity (c)                                                 of the page cache and the guest’s memory utilization are                                                     1084
+1030   values. Only for 4 KiB pages (o=0), they have a noticeable                                                    consistent. However, one minor difference in the page cache                                                  1085
+1031   effect. Two configurations can even further reduce the mem-                                                   size can be observed at around 29 min: The VM with virtio-                                                   1086
+1032   ory footprint (by 42% for d=2 s and c=512). However, they                                                     balloon reaches its hard memory limit, resulting in page                                                     1087
+1033   also increase the runtime by 19 percent. Similarly, the user                                                  cache eviction. As HyperAlloc has less fragmentation, it                                                     1088
+1034   and system CPU times are significantly higher.                                                                does not suffer from this. Over the entire runtime, HyperAl-                                                 1089
+1035   In-depth Analysis To better understand the mechanisms,                                                        loc’s VM memory follows the guest’s memory consumption                                                       1090
+1036   we extend on the Clang benchmark: On the time axis, we                                                        (small) much more closely due to LLFree’s efficient fragmen-                                                 1091
+1037   wait for 200 s after the build finished and run make clean                                                    tation avoidance. This decreases the memory footprint by                                                     1092
+1038   to remove any build artifacts; after another 200 s, we drop                                                   17 percent compared to virtio-balloon, without noticeable                                                    1093
+1039   the guest’s page cache to see how much memory can be                                                          runtime costs.                                                                                               1094
+1040   reclaimed at best. We sample four memory-usage metrics                                                           By the end of compilation, the page cache occupies a sub-                                                 1095
+1041   (see Fig. 8) with a frequency of 1 Hz: (1) The memory con-                                                    stantial part of the guest’s total memory. This prevents many                                                1096
+1042   sumed by (partially) used huge pages in the guest allocator.                                                  poorly utilized huge pages from being freed and reclaimed.                                                   1097
+1043   (2) The memory consumed by actually allocated small pages                                                     Running make clean, thereby removing all build artifacts,                                                    1098
+1044   (4 KiB) in the guest. The difference between small and huge                                                   reduces the cache size significantly. As a result, HyperAlloc                                                1099
+1045                                                                                                            10                                                                                                                1100
+       HyperAlloc: Efficient VM Memory De/Inflation via Hypervisor-Shared Page-Frame Allocators                                EUROSYS’25, March 30–April 3, 2025, Rotterdam
+
+
+1101                                        virtio-balloon                       HyperAlloc
+                                                                                                          difference increases to 55 percent after the third iteration.        1156
+                                  16
+                                                                                                          Overall, this leads to an overall reduction in memory foot-
+       Memory consumption [GiB]
+
+
+
+
+1102                                                                                                                                                                           1157
+                                  14
+1103                                                                                                      print from 202 GiB·min to 159 GiB·min. This difference be-           1158
+                                  12
+1104
+                                  10
+                                                                                                          comes even more pronounced if the idle times increase.               1159
+1105                               8                                                                         After dropping the page cache, the memory consumption             1160
+1106                               6                                                                      drops to 1.28 GiB for HyperAlloc and 4.37 GiB for virtio-            1161
+1107                               4                                                                      balloon. This large difference can be attributed to LLFree’s         1162
+1108                               2
+                                                                                                          better fragmentation characteristics and shows that Hyper-           1163
+                                   0
+1109                                   0   10         20     30      0      10         20       30        Alloc allows for greater elasticity of VMs.                          1164
+1110                                            Time [min]                       Time [min]                                                                                    1165
+1111                                        VM memory        small       huge          cached
+                                                                                                          6   Discussion                                                       1166
+1112   Figure 10. Repeated SPEC2017 blender runs with auto deflation.                                                                                                          1167
+                                                                                                          VProbe Due to the discussed availability issues (see
+1113                                                                                                                                                                           1168
+                                                                                                          Sec. 5.1), we could not compare HyperAlloc quantitatively to
+1114                                                                                                                                                                           1169
+       can shrink the VM by 3.8 GiB. In contrast, virtio-balloon only                                     the seemingly similar VProbe [55] approach. VProbe avoids
+1115                                                                                                                                                                           1170
+       reduces the size by 0.7 GiB, due to internal fragmentation of                                      explicit communication, achieves DMA-safe auto deflation,
+1116                                                                                                                                                                           1171
+       the buddy allocator. Even when dropping the entire cache,                                          and gives the hypervisor access to the guest state. However,
+1117                                                                                                                                                                           1172
+       virtio-balloon only decreases the VM size to 8 GiB compared                                        VProbe aims to be transparent for the guest and tracks the
+1118                                                                                                                                                                           1173
+       to HyperAlloc’s 1.9 GiB. Generally, in these file-intensive                                        guest-side page-frame allocations only indirectly by write-
+1119                                                                                                                                                                           1174
+       workloads, we see that the page cache has a major impact on                                        protecting the guest’s page-frame metadata (struct page).
+1120                                                                                                                                                                           1175
+       the memory footprint. We discuss its role further in Sec. 6.                                       Thereby, VProbe tracks the same guest events as HyperAlloc
+1121                                                                                                                                                                           1176
+          Regarding DMA-safety, we compared virtio-mem and Hy-                                            but relies on the side effects of these events, which has two
+1122                                                                                                                                                                           1177
+       perAlloc in Fig. 9, both using VFIO for device pass through.                                       disadvantages: (1) VProbe’s coupling to the guest allocator
+1123                                                                                                                                                                           1178
+       Even though both mechanisms have no significant runtime                                            is fragile when (newer) guest kernels perform different steps
+1124                                                                                                                                                                           1179
+       costs, virtio-mem has a 39.8 percent higher memory foot-                                           on allocation, resulting in unreliable allocation detection. (2)
+1125                                                                                                                                                                           1180
+       print than HyperAlloc. For virtio-mem, we track the number                                         The hypervisor has to back the page-frame metadata with
+1126                                                                                                                                                                           1181
+       of free huge pages and resize accordingly. We also tried to                                        host-physical base frames instead of huge frames, inducing
+1127                                                                                                                                                                           1182
+       follow the free base pages, which leads to more aggressive                                         higher TLB pressure. In contrast, HyperAlloc’s explicit install
+1128                                                                                                                                                                           1183
+       reclamation. However, in this case, virto-mem has to com-                                          hypercall evolves with the guest kernel code and requires
+1129                                                                                                                                                                           1184
+       pact and migrate memory, which turned out to be too slow,                                          no fine-grained backing of struct page.
+1130                                                                                                                                                                           1185
+1131
+       and virtio-mem was unable to resize the VM fast enough to                                          Adoption in Production HyperAlloc requires the user to               1186
+1132
+       prevent OOMs. Therefore, our virtio-mem-based reclama-                                             replace the guest’s page allocator, so our co-design approach        1187
+1133
+       tion is still limited by the availability of huge pages, which                                     can be considered as more intrusive as having only an extra          1188
+1134
+       is a significant advantage of basing HyperAlloc on the LL-                                         balloon or hotplug driver within the guest. Therefore, the           1189
+1135
+       Free allocator. Virtio-mem without VFIO is 3.7 percent more                                        question arises if HyperAlloc is a viable solution for produc-       1190
+1136
+       efficient because it does not pre-populate memory. For Hy-                                         tion environments – and why would customers switch to Hy-            1191
+1137
+       perAlloc, the additional overhead to maintain the IO page                                          perAlloc? We expect that economic reasoning will become a            1192
+1138
+       tables is negligible.                                                                              good argument: In the longer term, IaaS will follow the trend        1193
+1139   Repeated Workloads Another common use case for VMs                                                 of FaaS [46] and start billing memory by the second, giving          1194
+1140   is (micro-) services that are executed on demand or period-                                        customers a monetary incentive to give back unused memory            1195
+1141   ically. Here, the VMs might idle for significant amounts of                                        immediately. Up to now, memory often becomes a stranded              1196
+1142   time between runs. Even though the host can easily detect                                          asset [32] for cloud providers when they are confronted with         1197
+1143   idle vCPUs and schedule accordingly, detecting idle memory                                         a CPU-intense workload mix, as they cannot shift memory              1198
+1144   is not so simple and an ideal use-case for memory recla-                                           between VM hosts. However, the emerging CXL [16] tech-               1199
+1145   mation. We simulated such a repeated workload with idle                                            nology allows building disaggregated memory pools [32],              1200
+1146   periods using the Blender benchmark from SPEC2017. We                                              making physical memory not only an expensive [35] but also           1201
+1147   executed three consecutive runs with 4 min idle time in be-                                        more valuable commodity, as unused memory could be re-               1202
+1148   tween. The page cache was dropped once at the end, again                                           distributed among the complete rack. Compared to existing            1203
+1149   to see its impact on the VM’s memory consumption.                                                  techniques, HyperAlloc achieves higher reclamation rates at          1204
+1150      The two candidates in Fig. 10 perform roughly the same                                          basically no interference (Sec. 5.5), making it an ideal feature     1205
+1151   while Blender is running due to its static allocation behav-                                       for the disaggregated cloud.                                         1206
+1152   ior. However, a huge difference can be observed in between                                         Concept Generalization Since HyperAlloc requires                     1207
+1153   runs. After the first iteration, HyperAlloc reduces memory                                         offset-addressable access to per-frame data, integration with        1208
+1154   consumption by 43 percent compared to virtio-balloon. This                                         other guest allocators is challenging, as they usually rely on       1209
+1155                                                                                                 11                                                                        1210
+       EUROSYS’25, March 30–April 3, 2025, Rotterdam                                                                 Anon. Submission Id: 517
+
+
+1211   lock-based synchronization and pointer-linked data. Letting            the reclamation-information deficit by indirectly interacting     1266
+1212   the hypervisor directly participate in those guest protocols           with the guest’s OS frame allocator. However, the interaction     1267
+1213   poses a safety and security risk. Nevertheless, if host and            via in-guest proxy drivers is costly [24, 55]. By integrating     1268
+1214   guest agree on an auxiliary memory-mapped interface to                 reclamation directly into the guest’s frame allocator, Hyper-     1269
+1215   exchange 𝐴 and 𝐸, HyperAlloc is applicable.                            Alloc drastically reduces this overhead and enables the guest     1270
+1216      More generally, we believe that lock-free write access to           to improve its allocation policy based on the reclamation         1271
+1217   the guest state is a promising direction to improve resource           state.                                                            1272
+1218   management in IaaS settings without introducing (much) in-                                                                               1273
+1219   terference and latency variations. For example, a logical next         DMA safety With the emergence of the IOMMU [1–3],                 1274
+1220   step could be to also expose the page cache to HyperAlloc,             the OS got another virtual memory component to keep in            1275
+1221   which could then shrink the VM from the outside. Although              sync [13]. Moreover, most devices cannot [31, 55] trigger IO      1276
+1222   this requires rethinking even more kernel components, the              page faults, which are, however, necessary for most deflation     1277
+1223   resulting lock-free kernel structures often prove to be more           techniques [24, 38, 45, 53]. Only a few techniques [23, 55]       1278
+1224   scalable than the existing mechanisms [56].                            have been designed for DMA safety, while the others require       1279
+1225                                                                          further IOMMU virtualization [8, 51], which comes with            1280
+       Beyond Memory Reclamation Our prototype can scale                      its own costs for tracking DMA buffers and invalidating
+1226                                                                                                                                            1281
+       a VM between its initial size and the currently allocated              IOTLBs. Still, HyperAlloc could be combined with IOMMU
+1227                                                                                                                                            1282
+       memory. While we share the later boundary with many recla-             virtualization to reduce the VFIO overhead further.
+1228                                                                                                                                            1283
+       mation techniques [23, 53, 55], virtio-mem [55] can grow the
+1229                                                                                                                                            1284
+       VM beyond the initial size. HyperAlloc could also support              Resource Orchestration Deciding how to manage these
+1230                                                                                                                                            1285
+       this, either by hotplugging integration or by starting with a          different deflation techniques at a large scale is a topic on
+1231                                                                                                                                            1286
+       large guest-physical memory but low hard limit.                        its own. Several policies and heuristics have been proposed
+1232                                                                                                                                            1287
+          HyperAlloc could also enable better swapping strategies             for VM monitoring [26, 53], resource distribution [19, 34,
+1233                                                                                                                                            1288
+       for VMs [10, 47] as the tree index entries contain the alloca-         39, 48, 52], and market-like pricing models [6, 36]. They
+1234                                                                                                                                            1289
+       tion type (see Sec. 4.2). Furthermore, with the six remaining          usually combine transparent and cooperative deflation and
+1235                                                                                                                                            1290
+       area-entry bits, the guest could expose even more useful               sometimes even interface with applications [14, 48]. With
+1236                                                                                                                                            1291
+       information about data-filled frames (e.g., hotness).                  HyperAlloc, these orchestration mechanisms could moni-
+1237                                                                                                                                            1292
+          If fine-grained memory pricing models are just over the             tor memory utilization more precisely and reclaim memory
+1238                                                                                                                                            1293
+       horizon, we have to develop efficient guest methods that               faster with less latency.
+1239                                                                                                                                            1294
+       actively react to memory-price pressure (i.e., executed via
+1240                                                                                                                                            1295
+       auctioning [6]). For example, with a price tag at each frame,          8   Conclusion
+1241                                                                                                                                            1296
+       we have an objective measure to decide if starting memory
+1242
+       compaction is actually worth it. Suddenly, actively shrinking          For the hypervisor, memory is, until now, a “viscous” re-         1297
+1243
+       the page cache instead of caching as much as possible could            source that is hard to add to the guest and even harder to        1298
+1244
+       make economic sense.                                                   reclaim. But with the emergence of CXL and disaggregated          1299
+1245                                                                          memory pools, both cloud provider and customer get a mon-         1300
+1246
+       7    Related Work                                                      etary incentive to de/inflate VMs faster and more frequently.     1301
+1247                                                                          However, existing techniques often fall short with device         1302
+1248   Dynamic paging has been a challenging topic for OS devel-              pass through or induce disruptive overheads and latency           1303
+1249   opers for a long time, especially regarding memory recla-              spikes. For example, virtio-mem results in a throughput dis-      1304
+1250   mation [17, 25, 27], TLB invalidation [7, 9, 30], and the frag-        ruption of up to −73 percent for the STREAM benchmark.            1305
+1251   mentation of huge pages [21, 40, 41, 50, 56]. These chal-                 With HyperAlloc, we propose a novel VM memory recla-           1306
+1252   lenges become even more relevant in combination with vir-              mation technique based on sharing the guest’s page-frame          1307
+1253   tual machines, where we have an additional interaction and             allocator with the hypervisor. Without a mode switch, we          1308
+1254   EPT/NPF walks are more expensive [4, 12, 28, 38, 54].                  can, thereby, mark frames as allocated or reclaimed within        1309
+1255   Memory Reclamation The problem of detecting idle                       the guest, allowing its allocator to prefer regions already       1310
+1256   memory and estimating working sets is more difficult for               backed by host-physical memory. Still, our bilateral state        1311
+1257   the OS [17, 18, 57] than detecting idle CPUs. This, again,             management is safe and secure as we build upon LLFree, an         1312
+1258   is even more complicated for a hypervisor with even less               existing lock-free page-frame allocator with good scalabil-       1313
+1259   information about the running workloads [26, 38, 53]. Con-             ity and huge-frame fragmentation properties. HyperAlloc           1314
+1260   sequently, transparent VM deflation techniques, like swap-             shrinks, without measurable disruption, the hard limit of a       1315
+1261   ping [10, 22, 42, 53] or content-based sharing [15, 53], face          virtual machine faster (362× virtio-balloon, 10× virtio-mem).     1316
+1262   challenges to determine what to reclaim. Cooperative de-               With its automatic reclamation, we reclaim 17 percent more        1317
+1263   flation techniques, like ballooning [24, 45, 53], hotplug-             memory than virtio-balloon’s free-page reporting for a real-      1318
+1264   ging [23, 44, 45], or transient memory [20, 33], try to solve          istic workload; resulting in a tighter resource assignment.       1319
+1265                                                                     12                                                                     1320
+       HyperAlloc: Efficient VM Memory De/Inflation via Hypervisor-Shared Page-Frame Allocators                    EUROSYS’25, March 30–April 3, 2025, Rotterdam
+
+
+1321   References                                                                         [15] Chao-Rui Chang, Jan-Jan Wu, and Pangfeng Liu. 2011. An Empirical            1376
+1322    [1] 2022. Intel® 64 and IA-32 Architectures Software Developer’s Manual,               Study on Memory Sharing of Virtual Machines for Server Consoli-             1377
+1323        Combined Volumes: 1, 2A, 2B, 2C, 2D, 3A, 3B, 3C, 3D and 4. https:                  dation. In 2011 IEEE Ninth International Symposium on Parallel and          1378
+            //cdrdv2.intel.com/v1/dl/getContent/671200                                         Distributed Processing with Applications. USENIX Association, USA,
+1324                                                                                                                                                                       1379
+        [2] 2024. AMD64 Architecture Programmer’s Manual Volume 2: System Pro-                 244–249. https://doi.org/10.1109/ISPA.2011.31
+1325                                                                                      [16] Compute Express Link Consortium, Inc. 2020. CXL Specification,              1380
+            gramming. https://www.amd.com/content/dam/amd/en/documents/
+1326
+            processor-tech-docs/programmer-references/24593.pdf                                Revision 2.0.                                                               1381
+1327    [3] 2024. Arm System Memory Management Unit Architecture Specification            [17] P.J. Denning. 1980. Working Sets Past and Present. IEEE Transactions        1382
+1328        - Version 3. https://developer.arm.com/documentation/ihi0070/latest                on Software Engineering SE-6, 1 (1980), 64–84. https://doi.org/10.1109/     1383
+        [4] Keith Adams and Ole Agesen. 2006. A comparison of software and                     TSE.1980.230464
+1329                                                                                                                                                                       1384
+            hardware techniques for x86 virtualization. In Proceedings of the 12th        [18] Peter J. Denning. 1967. The working set model for program behavior. In
+1330                                                                                           Proceedings of the First ACM Symposium on Operating System Principles       1385
+            International Conference on Architectural Support for Programming
+1331
+            Languages and Operating Systems (San Jose, California, USA) (ASPLOS                (SOSP ’67). Association for Computing Machinery, New York, NY, USA,         1386
+1332        XII). Association for Computing Machinery, New York, NY, USA, 2–13.                15.1–15.12. https://doi.org/10.1145/800001.811670                           1387
+1333        https://doi.org/10.1145/1168857.1168860                                       [19] Alexander Fuerst, Ahmed Ali-Eldin, Prashant Shenoy, and Prateek             1388
+        [5] Orna Agmon Ben-Yehuda, Muli Ben-Yehuda, Assaf Schuster, and Dan                    Sharma. 2020. Cloud-scale VM-deflation for Running Interactive Ap-
+1334                                                                                                                                                                       1389
+            Tsafrir. 2014. The rise of RaaS: the resource-as-a-service cloud. Com-             plications On Transient Servers. In Proceedings of the 29th International
+1335                                                                                           Symposium on High-Performance Parallel and Distributed Computing            1390
+            mun. ACM 57, 7 (jul 2014), 76–84. https://doi.org/10.1145/2627422
+1336
+        [6] Orna Agmon Ben-Yehuda, Eyal Posener, Muli Ben-Yehuda, Assaf                        (Stockholm, Sweden) (HPDC ’20). Association for Computing Machin-           1391
+1337        Schuster, and Ahuva Mu’alem. 2014. Ginseng: market-driven memory                   ery, New York, NY, USA, 53–64. https://doi.org/10.1145/3369583.             1392
+1338        allocation. In Proceedings of the 10th ACM SIGPLAN/SIGOPS Interna-                 3392675                                                                     1393
+            tional Conference on Virtual Execution Environments (Salt Lake City,          [20] Luis A. Garrido, Rajiv Nishtala, and Paul Carpenter. 2019. SmarTmem:
+1339                                                                                                                                                                       1394
+            Utah, USA) (VEE ’14). Association for Computing Machinery, New                     Intelligent Management of Transcendent Memory in a Virtualized
+1340                                                                                           Server. In 2019 IEEE International Parallel and Distributed Processing      1395
+            York, NY, USA, 41–52. https://doi.org/10.1145/2576195.2576197
+1341
+        [7] Nadav Amit. 2017. Optimizing the {TLB} Shootdown Algorithm with                    Symposium Workshops (IPDPSW). 911–920. https://doi.org/10.1109/             1396
+1342        Page Access Tracking. In 2017 USENIX Annual Technical Conference                   IPDPSW.2019.00151                                                           1397
+1343        (USENIX ATC ’17). 27–39.                                                      [21] Mel Gorman and Patrick Healy. 2008. Supporting superpage alloca-            1398
+        [8] Nadav Amit, Muli Ben-Yehuda, IBM Research, Dan Tsafrir, and Assaf                  tion without additional hardware support. In Proceedings of the 7th
+1344                                                                                                                                                                       1399
+            Schuster. 2011. vIOMMU: Efficient IOMMU Emulation. In 2011 USENIX                  international symposium on Memory management - ISMM ’08. ACM
+1345                                                                                           Press, Tucson, AZ, USA, 41. https://doi.org/10.1145/1375634.1375641         1400
+            Annual Technical Conference (USENIX ATC 11). USENIX Associa-
+1346
+            tion, Portland, OR. https://www.usenix.org/conference/usenixatc11/            [22] Kinshuk Govil, Dan Teodosiu, Yongqiang Huang, and Mendel Rosen-             1401
+1347        viommu-efficient-iommu-emulation                                                   blum. 1999. Cellular Disco: resource management using virtual clusters      1402
+1348    [9] Nadav Amit, Amy Tai, and Michael Wei. 2020. Don’t shoot down TLB                   on shared-memory multiprocessors. In Proceedings of the Seventeenth         1403
+            shootdowns!. In Proceedings of the Fifteenth European Conference on                ACM Symposium on Operating Systems Principles (Charleston, South
+1349                                                                                                                                                                       1404
+            Computer Systems (EuroSys’20). 1–14.                                               Carolina, USA) (SOSP ’99). Association for Computing Machinery,
+1350                                                                                           New York, NY, USA, 154–169. https://doi.org/10.1145/319151.319162           1405
+       [10] Nadav Amit, Dan Tsafrir, and Assaf Schuster. 2014. VSwapper: a
+1351
+            memory swapper for virtualized environments. In Proceedings of the            [23] David Hildenbrand and Martin Schulz. 2021. virtio-mem: paravir-             1406
+1352        19th International Conference on Architectural Support for Program-                tualized memory hot(un)plug. In Proceedings of the 17th ACM SIG-            1407
+1353        ming Languages and Operating Systems (Salt Lake City, Utah, USA)                   PLAN/SIGOPS International Conference on Virtual Execution Environ-          1408
+            (ASPLOS ’14). Association for Computing Machinery, New York, NY,                   ments (Virtual, USA) (VEE 2021). Association for Computing Ma-
+1354                                                                                                                                                                       1409
+            USA, 349–366. https://doi.org/10.1145/2541940.2541969                              chinery, New York, NY, USA, 1–14. https://doi.org/10.1145/3453933.
+1355                                                                                           3454010                                                                     1410
+       [11] Michael Armbrust, Armando Fox, Rean Griffith, Anthony D. Joseph,
+1356
+            Randy Katz, Andy Konwinski, Gunho Lee, David Patterson, Ariel                 [24] Jingyuan Hu, Xiaokuang Bai, Sai Sha, Yingwei Luo, Xiaolin Wang,             1411
+1357        Rabkin, Ion Stoica, and Matei Zaharia. 2010. A view of cloud comput-               and Zhenlin Wang. 2018. HUB: hugepage ballooning in kernel-                 1412
+1358        ing. Commun. ACM 53, 4 (apr 2010), 50–58. https://doi.org/10.1145/                 based virtual machines. In Proceedings of the International Sympo-          1413
+            1721654.1721672                                                                    sium on Memory Systems (Alexandria, Virginia, USA) (MEMSYS ’18).
+1359                                                                                                                                                                       1414
+       [12] Paul Barham, Boris Dragovic, Keir Fraser, Steven Hand, Tim Harris,                 Association for Computing Machinery, New York, NY, USA, 31–37.
+1360                                                                                           https://doi.org/10.1145/3240302.3240420                                     1415
+            Alex Ho, Rolf Neugebauer, Ian Pratt, and Andrew Warfield. 2003.
+1361
+            Xen and the Art of Virtualization. In Proceedings of the 19th ACM             [25] Song Jiang and Xiaodong Zhang. 2001.               Adaptive Page Re-        1416
+1362        Symposium on Operating Systems Principles (SOSP ’03) (ACM SIGOPS                   placement to Protect Thrashing in Linux. In 5th Annual Linux                1417
+1363        Operating Systems Review, Vol. 37, 5). ACM Press, New York, NY, USA,               Showcase & Conference (ALS 01). USENIX Association, Oakland,                1418
+            164–177. https://doi.org/10.1145/945445.945462                                     CA.       https://www.usenix.org/conference/als-01/adaptive-page-
+1364                                                                                                                                                                       1419
+       [13] Muli Ben-Yehuda, Jimi Xenidis, Michal Ostrowski, Karl Rister, Alexis               replacement-protect-thrashing-linux
+1365                                                                                      [26] Stephen T. Jones, Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-            1420
+            Bruemmer, and Leendert Van Doorn. 2007. The price of safety: Evalu-
+1366
+            ating IOMMU performance. In Proceedings of the Linux Symposium.                    Dusseau. 2006. Geiger: monitoring the buffer cache in a virtual ma-         1421
+1367        9–20.                                                                              chine environment. In Proceedings of the 12th International Confer-         1422
+1368   [14] Callum Cameron, Jeremy Singer, and David Vengerov. 2015. The                       ence on Architectural Support for Programming Languages and Op-             1423
+            judgment of forseti: economic utility for dynamic heap sizing of                   erating Systems (San Jose, California, USA) (ASPLOS XII). Associa-
+1369                                                                                                                                                                       1424
+            multiple runtimes. In Proceedings of the 2015 International Sympo-                 tion for Computing Machinery, New York, NY, USA, 14–24. https:
+1370                                                                                           //doi.org/10.1145/1168857.1168861                                           1425
+            sium on Memory Management (Portland, OR, USA) (ISMM ’15). As-
+1371
+            sociation for Computing Machinery, New York, NY, USA, 143–156.                [27] T. Kilburn, D.B.G. Edwards, M.J. Lanigan, and F.H. Sumner. 1962. One-       1426
+1372        https://doi.org/10.1145/2754169.2754180                                            Level Storage System. IRE Transactions on Electronic Computers EC-11,       1427
+1373                                                                                           2 (April 1962), 223–235. https://doi.org/10.1109/TEC.1962.5219356           1428
+1374                                                                                                                                                                       1429
+1375                                                                                 13                                                                                    1430
+       EUROSYS’25, March 30–April 3, 2025, Rotterdam                                                                                         Anon. Submission Id: 517
+
+
+1431   [28] Avi Kivity, Yaniv Kamay, Dor Laor, Uri Lublin, and Anthony Liguori.                 Conference on Architectural Support for Programming Languages and          1486
+1432        2007. kvm: the Linux virtual machine monitor. In Proceedings of the                 Operating Systems (Williamsburg, VA, USA) (ASPLOS ’18). Association        1487
+1433        Linux symposium, Vol. 1. Dttawa, Dntorio, Canada, 225–230.                          for Computing Machinery, New York, NY, USA, 679–692. https:                1488
+       [29] Lawrence Livermore National Laboratory. 2014. CORAL Benchmark                       //doi.org/10.1145/3173162.3173203
+1434                                                                                                                                                                       1489
+            Codes. https://asc.llnl.gov/coral-benchmarks, visited 2024-05-04.              [42] Jan S. Rellermeyer, Maher Amer, Richard Smutzer, and Karthick Raja-
+1435   [30] Viktor Leis, Adnan Alhomssi, Tobias Ziegler, Yannick Loeck, and Chris-              mani. 2018. Container Density Improvements with Dynamic Memory             1490
+1436        tian Dietrich. 2023. Virtual-Memory Assisted Buffer Management. In                  Extension using NAND Flash. In Proceedings of the 9th Asia-Pacific         1491
+1437        Proceedings of the ACM SIGMOD/PODS International Conference on                      Workshop on Systems (Jeju Island, Republic of Korea) (APSys ’18). As-      1492
+1438        Management of Data (Seattle, WA, USA). ACM, New York, NY, USA.                      sociation for Computing Machinery, New York, NY, USA, Article 10,          1493
+            https://doi.org/10.1145/3588687                                                     7 pages. https://doi.org/10.1145/3265723.3265740
+1439                                                                                                                                                                       1494
+       [31] Ilya Lesokhin, Haggai Eran, Shachar Raindel, Guy Shapiro, Sagi Grim-           [43] Rusty Russell. 2008. virtio: towards a de-facto standard for virtual
+1440        berg, Liran Liss, Muli Ben-Yehuda, Nadav Amit, and Dan Tsafrir. 2017.               I/O devices. SIGOPS Oper. Syst. Rev. 42, 5 (jul 2008), 95–103. https:      1495
+1441        Page Fault Support for Network Controllers. In Proceedings of the                   //doi.org/10.1145/1400097.1400108                                          1496
+1442        Twenty-Second International Conference on Architectural Support for            [44] Joel Schopp, Dave Hansen, Mike Kravetz, Hirokazu Takahashi, Toshi-         1497
+1443        Programming Languages and Operating Systems, ASPLOS 2017, Xi’an,                    hiro Iwamoto, Yasunori Goto, Hiroyuki Kamezawa, Matt Tolentino,            1498
+            China, April 8-12, 2017. 449–466. https://doi.org/10.1145/3037697.                  and Bob Picco. 2005. Hotplug memory redux. In Proceedings of the
+1444                                                                                                                                                                       1499
+            3037710                                                                             Linux Symposium. 151.
+1445   [32] Huaicheng Li, Daniel S. Berger, Lisa Hsu, Daniel Ernst, Pantea Zar-            [45] Joel H Schopp, Keir Fraser, and Martine J Silbermann. 2006. Resiz-         1500
+1446        doshti, Stanko Novakovic, Monish Shah, Samir Rajadnya, Scott Lee,                   ing memory with balloons and hotplug. In Proceedings of the Linux          1501
+1447        Ishwar Agarwal, Mark D. Hill, Marcus Fontoura, and Ricardo Bian-                    Symposium, Vol. 2. 313–319.                                                1502
+1448        chini. 2023. Pond: CXL-Based Memory Pooling Systems for Cloud                  [46] Mohammad Shahrad, Jonathan Balkind, and David Wentzlaff. 2019.             1503
+            Platforms. In Proceedings of the 28th ACM International Conference                  Architectural Implications of Function-as-a-Service Computing. In
+1449                                                                                                                                                                       1504
+            on Architectural Support for Programming Languages and Operat-                      Proceedings of the 52nd Annual IEEE/ACM International Symposium
+1450        ing Systems (ASPLOS ’23), Volume 2 (Vancouver, BC, Canada). As-                     on Microarchitecture (Columbus, OH, USA) (MICRO ’52). Association          1505
+1451        sociation for Computing Machinery, New York, NY, USA, 574–587.                      for Computing Machinery, New York, NY, USA, 1063–1075. https:              1506
+1452        https://doi.org/10.1145/3575693.3578835                                             //doi.org/10.1145/3352460.3358296                                          1507
+1453   [33] Dan Magenheimer, Chris Mason, Dave McCracken, and Kurt Hackel.                 [47] Prateek Sharma, Ahmed Ali-Eldin, and Prashant Shenoy. 2019. Re-            1508
+            2009. Transcendent memory and linux. In Proceedings of the Linux                    source Deflation: A New Approach For Transient Resource Reclama-
+1454                                                                                                                                                                       1509
+            Symposium. Citeseer, 191–200.                                                       tion. In Proceedings of the Fourteenth EuroSys Conference 2019 (Dresden,
+1455   [34] Sunilkumar S. Manvi and Gopal Krishna Shyam. 2014. Resource                         Germany) (EuroSys ’19). Association for Computing Machinery, New           1510
+1456        management for Infrastructure as a Service (IaaS) in cloud computing:               York, NY, USA, Article 33, 17 pages. https://doi.org/10.1145/3302424.      1511
+1457        A survey. Journal of Network and Computer Applications 41 (2014),                   3303945                                                                    1512
+1458        424–440. https://doi.org/10.1016/j.jnca.2013.10.004                            [48] Prateek Sharma, Ahmed Ali-Eldin, and Prashant Shenoy. 2019. Re-            1513
+       [35] Hasan Al Maruf, Hao Wang, Abhishek Dhanotia, Johannes Weiner,                       source Deflation: A New Approach For Transient Resource Reclama-
+1459                                                                                                                                                                       1514
+            Niket Agarwal, Pallab Bhattacharya, Chris Petersen, Mosharaf Chowd-                 tion. In Proceedings of the Fourteenth EuroSys Conference 2019 (Dresden,
+1460        hury, Shobhit Kanaujia, and Prakash Chauhan. 2023. TPP: Transparent                 Germany) (EuroSys ’19). Association for Computing Machinery, New           1515
+1461        Page Placement for CXL-Enabled Tiered-Memory. In Proceedings of                     York, NY, USA, Article 33, 17 pages. https://doi.org/10.1145/3302424.      1516
+1462        the 28th ACM International Conference on Architectural Support for Pro-             3303945                                                                    1517
+1463        gramming Languages and Operating Systems (ASPLOS ’23), Volume 3                [49] SPEC. 2022. SPEC CPU® 2017. https://www.spec.org/cpu2017/,                 1518
+            (Vancouver, BC, Canada). Association for Computing Machinery, New                   visited 2024-05-03.
+1464                                                                                                                                                                       1519
+            York, NY, USA, 742–755. https://doi.org/10.1145/3582016.3582063                [50] Matthias Springer and Hidehiko Masuhara. 2019. Massively parallel
+1465   [36] Hasan Al Maruf, Yuhong Zhong, Hongyi Wang, Mosharaf Chowdhury,                      GPU memory compaction. In Proceedings of the 2019 ACM SIGPLAN              1520
+1466        Asaf Cidon, and Carl Waldspurger. 2023. Memtrade: Marketplace for                   International Symposium on Memory Management. 14–26.                       1521
+1467        Disaggregated Memory Clouds. Proc. ACM Meas. Anal. Comput. Syst.               [51] Kun Tian, Yu Zhang, Luwei Kang, Yan Zhao, and Yaozu Dong. 2020.            1522
+1468        7, 2, Article 41 (may 2023), 27 pages. https://doi.org/10.1145/3589985              coIOMMU: A Virtual IOMMU with Cooperative DMA Buffer Tracking              1523
+       [37] John D. McCalpin. 1995. Memory Bandwidth and Machine Balance                        for Efficient Memory Management in Direct I/O. In 2020 USENIX
+1469                                                                                                                                                                       1524
+            in Current High Performance Computers. IEEE Computer Society                        Annual Technical Conference (USENIX ATC 20). USENIX Association,
+1470        Technical Committee on Computer Architecture (TCCA) Newsletter 2                    479–492. https://www.usenix.org/conference/atc20/presentation/tian         1525
+1471        (Dec. 1995), 19–25.                                                            [52] Manohar Vanga, Arpan Gujarati, and Björn B. Brandenburg. 2018.             1526
+1472   [38] Debadatta Mishra and Purushottam Kulkarni. 2018. A survey of                        Tableau: a high-throughput and predictable VM scheduler for high-          1527
+1473        memory management techniques in virtualized systems. Computer                       density workloads. In Proceedings of the Thirteenth EuroSys Conference     1528
+            Science Review 29 (2018), 56–73. https://doi.org/10.1016/j.cosrev.2018.             (Porto, Portugal) (EuroSys ’18). Association for Computing Machinery,
+1474                                                                                                                                                                       1529
+            06.002                                                                              New York, NY, USA, Article 28, 16 pages. https://doi.org/10.1145/
+1475   [39] Germán Moltó, Miguel Caballer, and Carlos de Alfonso. 2016. Au-                     3190508.3190557                                                            1530
+1476        tomatic memory-based vertical elasticity and oversubscription on               [53] Carl A. Waldspurger. 2003. Memory resource management in VMware            1531
+1477        cloud platforms. Future Generation Computer Systems 56 (2016), 1–10.                ESX server. SIGOPS Oper. Syst. Rev. 36, SI (dec 2003), 181–194. https:     1532
+1478        https://doi.org/10.1016/j.future.2015.10.002                                        //doi.org/10.1145/844128.844146                                            1533
+       [40] Ashish Panwar, Naman Patel, and K. Gopinath. 2016. A Case for                  [54] Xiaolin Wang, Jiarui Zang, Zhenlin Wang, Yingwei Luo, and Xiaom-
+1479                                                                                                                                                                       1534
+            Protecting Huge Pages from the Kernel. In Proceedings of the 7th ACM                ing Li. 2011. Selective hardware/software memory virtualization. In
+1480        SIGOPS Asia-Pacific Workshop on Systems (Hong Kong, Hong Kong)                      Proceedings of the 7th ACM SIGPLAN/SIGOPS International Conference         1535
+1481        (APSys ’16). Association for Computing Machinery, New York, NY,                     on Virtual Execution Environments (Newport Beach, California, USA)         1536
+1482        USA, Article 15, 8 pages. https://doi.org/10.1145/2967360.2967371                   (VEE ’11). Association for Computing Machinery, New York, NY, USA,         1537
+1483   [41] Ashish Panwar, Aravinda Prasad, and K. Gopinath. 2018. Making Huge                  217–226. https://doi.org/10.1145/1952682.1952710                           1538
+            Pages Actually Useful. In Proceedings of the Twenty-Third International
+1484                                                                                                                                                                       1539
+1485                                                                                  14                                                                                   1540
+       HyperAlloc: Efficient VM Memory De/Inflation via Hypervisor-Shared Page-Frame Allocators                EUROSYS’25, March 30–April 3, 2025, Rotterdam
+
+
+1541   [55] Yaohui Wang, Ben Luo, and Yibin Shen. 2023. Efficient Memory Over-               //www.usenix.org/conference/atc23/presentation/wrenger               1596
+1542        commitment for I/O Passthrough Enabled VMs via Fine-grained Page            [57] Pin Zhou, Vivek Pandey, Jagadeesan Sundaresan, Anand Raghuraman,     1597
+1543        Meta-data Management. In 2023 USENIX Annual Technical Conference                 Yuanyuan Zhou, and Sanjeev Kumar. 2004. Dynamic tracking of page     1598
+            (USENIX ATC 23). USENIX Association, Boston, MA, 769–783. https:                 miss ratio curve for memory management. In Proceedings of the 11th
+1544                                                                                                                                                              1599
+            //www.usenix.org/conference/atc23/presentation/wang-yaohui                       International Conference on Architectural Support for Programming
+1545   [56] Lars Wrenger, Florian Rommel, Alexander Halbuer, Christian Dietrich,             Languages and Operating Systems (Boston, MA, USA) (ASPLOS XI).       1600
+1546        and Daniel Lohmann. 2023. LLFree: Scalable and Optionally-Persistent             Association for Computing Machinery, New York, NY, USA, 177–188.     1601
+1547        Page-Frame Allocation. In 2023 USENIX Annual Technical Conference                https://doi.org/10.1145/1024393.1024415                              1602
+1548        (USENIX ’23). USENIX Association, Boston, MA, 897–914. https:                                                                                         1603
+1549                                                                                                                                                              1604
+1550                                                                                                                                                              1605
+1551                                                                                                                                                              1606
+1552                                                                                                                                                              1607
+1553                                                                                                                                                              1608
+1554                                                                                                                                                              1609
+1555                                                                                                                                                              1610
+1556                                                                                                                                                              1611
+1557                                                                                                                                                              1612
+1558                                                                                                                                                              1613
+1559                                                                                                                                                              1614
+1560                                                                                                                                                              1615
+1561                                                                                                                                                              1616
+1562                                                                                                                                                              1617
+1563                                                                                                                                                              1618
+1564                                                                                                                                                              1619
+1565                                                                                                                                                              1620
+1566                                                                                                                                                              1621
+1567                                                                                                                                                              1622
+1568                                                                                                                                                              1623
+1569                                                                                                                                                              1624
+1570                                                                                                                                                              1625
+1571                                                                                                                                                              1626
+1572                                                                                                                                                              1627
+1573                                                                                                                                                              1628
+1574                                                                                                                                                              1629
+1575                                                                                                                                                              1630
+1576                                                                                                                                                              1631
+1577                                                                                                                                                              1632
+1578                                                                                                                                                              1633
+1579                                                                                                                                                              1634
+1580                                                                                                                                                              1635
+1581                                                                                                                                                              1636
+1582                                                                                                                                                              1637
+1583                                                                                                                                                              1638
+1584                                                                                                                                                              1639
+1585                                                                                                                                                              1640
+1586                                                                                                                                                              1641
+1587                                                                                                                                                              1642
+1588                                                                                                                                                              1643
+1589                                                                                                                                                              1644
+1590                                                                                                                                                              1645
+1591                                                                                                                                                              1646
+1592                                                                                                                                                              1647
+1593                                                                                                                                                              1648
+1594                                                                                                                                                              1649
+1595                                                                               15                                                                             1650
+

@@ -1,0 +1,916 @@
+                                          Offering Microsecond-Scale Cross-VM Core Elasticity
+                                               on Colocated Lightweight Virtual Machines
+                                                                    Yibo Yan                                                         Seo Jin Park
+                                                        University of Southern California                                 University of Southern California
+                                                               Los Angeles, USA                                                  Los Angeles, USA
+
+                                         Abstract
+                                         Serverless platforms commonly colocate many diverse work-
+                                         loads, each in a fast-booting, memory-lean virtual machine
+                                         (VM), to improve deployment density. Overprovisioning each
+                                         VM for its peak protects tail latency during traffic bursts but
+                                         hurts density; maintaining high density while effectively pro-
+                                         tecting tail latency requires the infrastructure to be able to
+                                         shift physical cores, at a microsecond timescale, to whichever
+                                         latency-sensitive VM is bursting and reclaim them as the
+arXiv:2608.12633v1 [cs.DC] 12 Aug 2026
+
+
+
+
+                                         burst subsides. No VM substrate delivers this: conventional
+                                         VMs resize a guest’s cores only through a millisecond-scale
+                                         vCPU hot-plug path, Firecracker fixes a VM’s core count at            Figure 1. Moving a core between colocated VMs with conventional
+                                         boot, and the ultralight VMs that boot fastest drop multicore         vCPU hot-plug (remove from the donor and add to the recipient).
+                                         execution entirely.                                                   The full core movement (remove and add) in the conventional path
+                                            We present Hyperflux, a commodity-KVM ultralight VM                takes hundreds of milliseconds, while Hyperflux takes only 13 𝜇s.
+                                         substrate that makes a VM’s parallelism width (the number                However, raw density does not translate into high utiliza-
+                                         of physical cores backing it) elastic at runtime. We show             tion when bursty, latency-sensitive serverless workloads ex-
+                                         that Hyperflux can move a core across VMs in merely 13 𝜇s,            ist [56]. These workloads run across multiple cores with time-
+                                         even when forcibly reclaiming it from a busy donor, orders            varying parallelism, such as request-serving microservices,
+                                         of magnitude faster than vCPU hot-plug. A Hyperflux VM                web servers, media transcoding, and realtime data-parallel
+                                         incurs only a 3.2 MB memory footprint and can cold-boot               analytics; their core demand swings sharply under tight
+                                         in 1.37 ms, on par with the fastest-booting ultralight VMs,           Service-Level Objectives (SLOs), suddenly needing many
+                                         while uniquely supporting multicore parallelism. Under colo-          cores to absorb a burst of core demands, then falling idle
+                                         cation, it can reduce high-priority VMs’ tail latency by up           between bursts. This class is now mainstream in commer-
+                                         to 10x under high load compared to static core-sharing with           cial serverless analytics and AI, spanning serverless data
+                                         Firecracker and Cloud Hypervisor, and deliver a lower and             analytics and warehouses [7–9, 11, 21, 22], serverless ML
+                                         more stable tail latency compared to using cgroup and vCPU            inference and compute [12, 14, 19], and multi-core serverless
+                                         hot-plug under changing load bursts.                                  containers [15, 20]; cloud providers autoscale each workload
+                                                                                                               instance’s parallelism under load and downscale it to zero-
+                                         1   Introduction                                                      core when idle, so an instance both re-starts and re-scales
+                                         Serverless platforms now routinely run computations in mi-            frequently, exercising fast startup and elastic parallelism
+                                         croVMs, which pair the hardware-enforced isolation of a               over its lifetime. To protect the tail latency of these high-
+                                         virtual machine (VM) with the fast cold startup and small             priority bursty services from core contention with colocated
+                                         memory footprint [23]. This reflects a decade-long progres-           low-priority VMs, the provider often resorts to overprovi-
+                                         sion in virtualization in the context of the serverless comput-       sioning their VMs for peak demand, thereby stranding the
+                                         ing landscape: from conventional VMs (e.g., QEMU [25]), to            very capacity that density was meant to reclaim [28, 29, 36].
+                                         lightweight VMs (e.g., Cloud Hypervisor [10], Kata [17]), to             Many systems use core harvest either at coarse timescales
+                                         microVMs (e.g., Firecracker [23]) and unikernels [42, 45], and        or designed for conventional heavyweight VM substrates,
+                                         most recently to ultralight VMs such as Dandelion [41] and            shifting idle cores to high-priority VMs and reclaiming
+                                         Hyperlight [49] that can cold-start in milliseconds on com-           them as demand falls [24, 58, 60]. No VM substrate shifts
+                                         modity hardware. Each step traded functionality for agility,          cores promptly enough at the finer timescale bursts demand,
+                                         shedding devices, kernel surface, and OS services to boot             protecting these services’ tail latency requires reacting
+                                         faster and minimize memory footprint. The payoff is density:          in tens of microseconds [36], while preserving ultralight
+                                         providers can theoretically pack more such instances onto             VM properties that modern serverless computing requires.
+                                         one host [44], amortizing the hardware across more tenants.           Lightweight VMs [10, 17] resize cores through the ACPI
+                                                                                                           1
+CPU hot-add/remove path [4], but as Figure 1 shows, a                 • We identify elastic parallelism width, which requires host-
+single hot-add or hot-remove takes milliseconds, orders                 driven, cross-VM control of the cores backing a VM at
+of magnitude beyond that timescale. Firecracker fixes a                 runtime, as a missing axis in the VM design space (§3).
+VM’s vCPU count at boot, offering no core harvest at all,             • We present the design of Hyperflux, the first commodity-
+and the fastest-booting ultralight VMs (e.g., Dandelion [41],           KVM ultralight VM substrate to realize microsecond-level
+Hyperlight [49]) strip out threading and multicore entirely,            elastic parallelism width and cross-VM core movements,
+so a donated core would have no parallel work to run.                   and design rationales behind three co-designed compo-
+    We argue that one can design an ultralight VM substrate             nents: Fluxion (VMM), kFlux (a kernel module), and
+that delivers all three desired properties simultaneously:              FluxOS (guest OS) (§4).
+(i) millisecond-scale cold-start latency on commodity hard-           • We present an evaluation that showcases cross-VM core
+ware with small memory footprint; (ii) support for threading            handoff can be achieved in ∼13 𝜇s and such a mechanism
+and multicore so that VMs can harness local cores immedi-               can effectively protect tail latency compared to both static
+ately for parallelism on-demand; (iii) integrated core harvest          core-sharing and dynamic adjustment with cgroup and
+support in the substrate (in Virtual Machine Monitor, or                vCPU hot-plug. Meanwhile, Hyperflux retains the fast
+VMM) that can shift cores at microsecond scale among colo-              startup speed and low memory footprint that are on par
+cated VMs to protect high-priority latency-sensitive work-              with most modern ultralight VMs (§5).
+loads during bursts without squandering core resources on
+overprovisioning for the peak demand.                                 2     Background
+    We present Hyperflux, a commodity KVM-based ultra-
+                                                                      2.1   Library OS (LibOS)
+light VM substrate that makes a VM’s parallelism width (the
+number of physical cores backing it) elastic at runtime, en-          A library OS (LibOS) is an OS abstraction layer delivered
+abling microsecond-scale cross-VM core harvest and redistri-          as a library that an application links against, running the
+bution. To achieve this without sacrificing agility, Hyperflux        application and its OS services in a single address space with
+tightly co-designs three VM substrate components from the             no kernel/user boundary [31, 50]. Its service surface is a
+ground up: (i) Fluxion, a virtual machine monitor (VMM)               choice rather than fixed minimalism, from a near-complete
+that manages VMs and also serves as a host-side core arbiter          POSIX API down to a bare runtime [42]. Most modern ul-
+that decides when and where to move cores from live de-               tralight VMs take the LibOS approach but slim that sur-
+mand signals; (ii) kFlux, a kernel module that actuates core          face aggressively to boot faster with minimal memory foot-
+movements in microseconds; and (iii) FluxOS, a guest library          print [41, 45, 49]. Hyperflux is co-designed with a guest Li-
+OS (LibOS) that provides multicore execution with threading           bOS, FluxOS, that retains these ultralight advantages while
+and, on a reclaim request, preemptively parks the running             adding a lightweight userspace thread abstraction and sched-
+guest thread without relying on cooperative scheduling so             uler that can preempt a running thread and relinquish a core
+that the host can take cores promptly. Hyperflux keeps the            to the host in microseconds.
+ultralight VM virtues, preserving a fast startup speed, a small
+memory footprint, and hardware-enforced isolation, while              2.2   Virtual CPU (vCPU) Abstraction
+enabling cores to flux between colocated VMs as demand                Under KVM [40], each virtual CPU (vCPU) a guest VM sees is
+moves at 𝜇s-scale.                                                    backed by an ordinary host kernel thread that the host kernel
+    In our evaluation, Hyperflux moves a core between VMs             schedules onto a physical core; the guest vCPU advances only
+in about 13 𝜇s even when forcibly reclaiming it from a busy           while that thread is running on a core. A guest is typically
+donor (7.4 𝜇s to free the donor’s core and 5.6 𝜇s to install          assigned a fixed number of vCPUs at boot, but this number is
+it on the recipient), orders of magnitude faster than ACPI            merely its logical view of how many processors it has. How
+vCPU hot-plug (~100–200 ms). Under colocation, Hyperflux              many of those vCPU hosting kernel threads occupy physical
+promptly shifts cores to whichever high-priority VM is burst-         cores at any instant is a separate decision made entirely on
+ing and reclaims them as load subsides, holding high-priority         the host side. A guest’s active parallelism is thus bounded
+p99 latency more than an order of magnitude below static              by its vCPU count but determined, at different moments, by
+core-sharing with Firecracker and Cloud Hypervisor. Under             how many of its vCPU threads the host places on cores.
+continuously changing burst loads, Hyperflux maintains                The host controls vCPUs at VMExits. Each vCPU thread
+a lower and more stable tail latency for high-priority VMs            drives the guest through a tight loop: an ioctl(KVM_RUN)
+than oracle-driven cgroup and vCPU hot-plug under bursts,             enters guest mode and executes guest instructions directly
+while staying on par with modern ultralight VMs on memory             on the core until a VMExit, which can be triggered by I/O,
+footprint and cold-start latency.                                     an interrupt, a hypercall, or a signal delivered to the hosting
+    This paper makes the following contributions:                     kernel thread. Upon a VMExit, KVM returns vCPU control
+                                                                      to the host, which services the event and re-enters. As the
+                                                                      guest owns the core between VMExits, this control loop is
+                                                                  2
+                                                                                    ✓ Supported     ∼ Partial     ✗ Not Supported
+the host’s only lever on a running vCPU. Specifically, to act
+on one that is busy executing guest code, the host must first                                            Light        True          Cross    𝜇s
+                                                                      Substrate
+force it to exit.                                                                                        weight      Multicore       VM     scale
+
+                                                                      Firecracker [23]                     ✓            ✓            ✗       ✗
+3 The Missing Axis: Microsecond Cross-VM                              Cloud Hypervisor / Kata [10, 17]     ∼            ✓            ✗†      ✗†
+                                                                      Dandelion [41], Hyperlight [49]      ✓            ✗            ✗       ✗
+  Core Elasticity                                                     Nanvix [54]                          ✓            ✗            ✗       ✗
+3.1 Static Allocation with Uncontrolled Core Sharing                  Harvest VMs [24, 60]                 ✗            ✓            ✓       ✗
+    Creates Contention                                                Ditto [63]                           ∼∗           ✓            ∼∗      ✗∗
+The simplest way to raise utilization under colocation is             Hyperflux                            ✓            ✓            ✓       ✓
+to make several VMs share one set of physical cores un-                † Per-VM ACPI hot-plug only, not a native cross-VM core handoff.
+der the host (Linux) scheduler, but this fails for latency-            ∗ Confidential-VM runtime, heavier than a microVM; Cross-VM core
+sensitive workloads: under bursts the scheduler is oblivious             movement requires cooperative scheduling and a specific paradigm.
+to demand and, aiming for fair sharing, has no mechanism              Table 1. Where existing substrates fall on the requirements for
+to direct cores, inflating tail latency for high-priority ser-        microsecond cross-VM core elasticity (§3): a lightweight substrate,
+vices [28, 37, 62]. Statically partitioning cores for peak de-        true multicore execution, and core movement that is both cross-
+mand instead avoids core contention under bursts but strands          VM and at 𝜇s-scale. Each prior substrate misses at least one; only
+resources during idle periods [29, 36]. Escaping this dilemma         Hyperflux satisfies all.
+requires neither static partitioning nor uncontrolled sharing
+but controlled core movement: shifting a core to whichever            heavyweight VMs. It improves batch throughput, not the
+guest needs it and reclaiming it when the burst passes, at            tail-bounded utilization of colocated latency-critical guests.
+the timescale bursts demand.                                          Ultralight VMs do not have in-VM multi-core par-
+                                                                      allelism. Finally, the substrates that best satisfy the
+                                                                      lightweight axis defeat the multicore one: the VMs that
+3.2   No Existing Mechanism Moves Cores Promptly
+                                                                      boot fastest and pack densest, such as Dandelion [41]
+      Across VMs
+                                                                      and Hyperlight [49], commonly strip out threading and
+We walk through the mechanisms an operator could reach                multi-core support. Efforts to restore it underscore the gap:
+for. Each fails on at least one of Hyperflux’s three axes.            Nanvix [54] adds threading atop Hyperlight, but multiplexes
+vCPU hot-plug is millisecond-scale. Cloud Hypervi-                    those threads onto a single vCPU, supporting concurrency
+sor [10] can change a guest’s vCPU count, but only by                 without true parallelism. For all of these, prompt core
+driving the guest kernel’s ACPI CPU offline/online path [4]:          harvest is not meaningful: a guest that runs its work on a
+the guest VM must quiesce the target CPU, migrate its                 single vCPU gains nothing from a donated core.
+tasks away, and tear down per-CPU state before the host
+can repurpose the core. As we discussed earlier in §1, this           3.3   The Missing Axis and Hyperflux’s Position
+process takes hundreds of milliseconds to finish, rendering           These failures trace two coupled dimensions. Elastic par-
+such core harvest ineffective for bursty services.                    allelism width concerns a guest in isolation: it runs across
+Linux cgroup arbitrates shares, not allocation. As a                  multiple cores with true parallelism and its core demand
+vCPU is hosted by a regular host thread, Linux may use the            can change sharply at runtime. The existing ultralight and
+cgroup cpu subsystem [3] to control the resource usage. The           static substrates lack this property. Cross-VM core elastic-
+cgroup cpu subsystem can throttle a guest’s vCPU threads,             ity concerns colocated guests on a shared host: cores move
+but it regulates each thread’s time share rather than granting        promptly across the isolation boundary from one guest to an-
+a thread exclusive use of a reclaimed core. A recent study of         other, which hot-plug and Linux built-in resource controllers
+CPU harvesting in container systems also shares the same              cannot achieve effectively at microsecond scale. The two are
+insight: share-based controls leave significant residual inter-       inseparable on a fixed-size host server: a guest’s parallelism
+ference on latency-sensitive instances and also react slowly          width can only grow by harvesting a neighbor’s core, and a
+(order of milliseconds) to absorb the demand spike [36].              harvested core only helps a recipient that can absorb it.
+Production harvesting is coarse and asymmetric. Clus-                    Table 1 makes the gap concrete across the requirements
+ter harvesting does move cores across VMs: Azure’s resource-          these two dimensions imply. No prior substrate satisfies all
+harvesting VMs [24] and SmartHarvest [60] reclaim a pri-              of them: each is either too heavy, limited to a single core,
+mary VM’s idle cores for a colocated batch VM. But the                unable to move cores across the VM boundary, or too slow
+movement is asymmetric (it shields one latency-critical pri-          to do so at the timescale bursts demand. Hyperflux is the
+mary while feeding best-effort batch, rather than balanc-             first commodity-KVM substrate to satisfy all four, and the
+ing peer guests), takes only already-idle cores, and reacts           only one that does so without trading away the lightweight,
+far more slowly than a microsecond burst, on conventional             multicore execution the others sacrifice.
+                                                                  3
+                                                                      direct view into guest schedulers and run-queues, whereas
+                                                                      a single-domain scheduler like Caladan [33] directly reads
+                                                                      scheduler internals via memory mapping. Second, the host
+                                                                      can stop a vCPU but cannot rescue the work it was running,
+                                                                      which lives in guest state only the guest’s runtime can save
+                                                                      and migrate. Reclaiming a core therefore requires the guest
+                                                                      runtime itself to preempt and save the in-flight work so that
+                                                                      a surviving vCPU may pick it up to maximally avoid work
+                                                                      stranding. Third, we should preserve the ultralight property
+                                                                      (i.e., fast startup latency and minimal memory overhead), de-
+                                                                      spite additional mechanisms for dynamic parallelism width
+                                                                      and cross-VM core movement.
+                                                                      Architecture Overview. Figure 2 shows the resulting ar-
+                                                                      chitecture, in which Hyperflux co-designs three provider-
+                                                                      controlled components that form a closed loop. FluxOS, a
+    Figure 2. High-level architecture overview of Hyperflux.          guest LibOS, runs the workload across lightweight guest
+4    Hyperflux: Enabling Cross-VM Core                                threads (gThreads) and publishes each VM’s live core de-
+                                                                      mand; on a reclaim request it preemptively parks the run-
+     Elasticity at Microsecond-Scale
+                                                                      ning gThread so a sibling vCPU resumes it (§4.7). Fluxion,
+Core Enabler. Hyperflux makes a VM’s parallelism width,               a host user-space VMM, decides when and where to move
+the number of physical cores backing it, a quantity the host          a core, and kFlux, a host kernel module, actuates the move
+or Virtual Machine Monitor (VMM) adjusts at runtime. This             by pinning and unpinning vCPU threads in microseconds
+rests on how VMs run on commodity KVM: a guest’s vCPU                 without a system call or IPI on the fast path.
+count is only a logical view, since each vCPU is an ordinary          Confidential VM. The design extends to confidential
+host thread and the host alone decides how many of those              VMs [2, 16, 43] (CVM) without redesign: it needs no host
+threads occupy a physical core at any instant (§3). Hyperflux         access to guest memory beyond the existing KVM interface
+performs a fast runtime action guided by a core allocation            and a narrow shared-memory region, which a bounce buffer
+policy: it parks the thread behind one vCPU and unparks               can provide. The full CVM design is a potential future work.
+another to grow, shrink, and shift a VM’s width across colo-
+cated VMs at microsecond scale. Therefore, Hyperflux does
+not change the guest’s configured vCPU count at runtime,              4.1   Threat Model
+avoiding a guest-side ACPI CPU hot-plug-like control path.            Hyperflux’s host-side components, Fluxion and kFlux,
+As a result, the guest does not need to reconfigure its view of       are provider-controlled and trusted, exactly as the VMM
+core topology; instead, it only needs to be aware that a vCPU         and host kernel are in a conventional microVM deployment.
+is not progressing (parked). The provider allows tenants to           FluxOS is the provider-supplied guest substrate; it shares
+configure the maximum parallelism, in terms of core count,            the guest’s address space with the tenant workload and is
+that instances can scale up to; and the host VMM makes the            not hardware-isolated from it, so none of Hyperflux’s host-
+harvest and scaling decisions according to the core demand            side guarantees depend on FluxOS’s integrity, only on the
+and configured priority class. Because Hyperflux adjusts              host’s control of the vCPU thread and on hardware isolation.
+the physical backing of a fixed set of vCPU threads, elastic          The tenant workload linked against FluxOS is untrusted and
+parallelism width is a property of the host’s vCPU manage-            may be buggy or behave adversarially. Tenant isolation is
+ment, not the guest ABI: any runtime that publishes demand            hardware-enforced by KVM [40] and is unchanged from a
+signals and honors park/unpark can use it, and FluxOS is              stock microVM: Hyperflux adds a per-VM shared-memory
+one such runtime.                                                     control plane between each guest and the host but never
+Challenges. The core challenge is that Hyperflux must                 a channel between guests, so no tenant state crosses the
+perform core movements across the VM isolation boundary,              isolation boundary unless guests intentionally communicate
+among mutually untrusted guests that share neither an ad-             (e.g., via the network).
+dress space nor a scheduler with the host or with one another.           Two properties follow that the rest of the design depends
+Doing so raises three problems that core scheduling within            on. First, the host can always reclaim a core from a non-
+a single trusted domain [33, 48] never confronts. First, the          yielding workload: a vCPU is an ordinary host thread the
+host’s only schedulable handle is the vCPU thread, not the            host can force out of guest execution. Second, a guest can
+guest threads and run-queues inside it. The trust surface be-         influence only its own scheduling, never the host’s liveness
+tween host and guest should be narrow in that the host has no         or its neighbors’. A VM’s priority class and guaranteed core
+                                                                      floor are provider-set and live in host state the guest cannot
+                                                                  4
+                                                                             Figure 4. The lifecycle and state transitions of a vCPU.
+
+                                                                       spinning one to fire timers; the VMM-owned RT-Progress
+                                                                       block, where Fluxion signals I/O progress such as arrived
+                                                                       packets; and the Per-vCPU control blocks, the main Flux-
+                                                                       ion–FluxOS exchange for demand hints and park/unpark
+Figure 3. FluxOS and guest application memory layout in a single       commands, each a tight 64 B so it does not hurt density. The
+address space (a simplified view).                                     FluxOS kernel and guest binary are sized at load time during
+                                                                       ELF parsing, and the gThread stack pool and heap follow the
+reach. The core allocator never blocks on a guest and never            configured VM memory size.
+reclaims a neighbor below its guaranteed floor, so a slow or
+                                                                       Memory footprint. Hyperflux keeps memory footprint
+malicious guest can forfeit its own cores but cannot stall the
+                                                                       small in two ways. Memory is demand-allocated, so a VM
+allocator or push a neighbor below its guarantee.
+                                                                       commits only the pages it touches rather than its full config-
+   A malicious VM can retain more cores than it actually
+                                                                       ured size. The page tables are hybrid: Hyperflux maps the
+needs by generating phantom demands. Such a tenant gains
+                                                                       binary and heap with 2 MB huge pages and falls back to 4 KB
+nothing because the core usage is metered and billed, and a
+                                                                       pages only where it must, for the shared control plane and
+VM can never exceed its provider-configured maximum par-
+                                                                       for the gThread stacks, whose guard pages catch overflow.
+allelism width. Persistent core capacity contention created
+by such events should be handled one layer up, where the
+provider’s placement layer can relocate a VM that will not
+release cores onto an uncontended host.
+                                                                       4.3    The vCPU Lifecycle
+                                                                       Every core move in Hyperflux involves state transitions in
+4.2   FluxOS: an Ultralight Multicore LibOS
+                                                                       a per-vCPU state machine that the host drives and the guest
+Parallelism and threading. Unlike other existing ultralight            can only request or acknowledge, as illustrated in Figure 4.
+VMs, FluxOS provides true multicore execution. FluxOS runs             A vCPU is in one of six states at any moment of its lifetime.
+lightweight guest threads (gThreads) across all of the VM’s            In Activating, Active, Parking, and Yielded, a physical core is
+available vCPUs rather than multiplexing them onto one (§3).           committed to the vCPU or its backing host thread: exclusive
+True multicore is what makes an elastic width worth having,            to it and unavailable to other VMs. In Dormant and Parked,
+since a VM handed a second core must have runnable work                the vCPU holds no core and its backing host thread is put
+ready to put on it. A gThread, from the perspective of the             back in the queue to be scheduled.
+guest app, is essentially a user-level thread, similar to a Gor-          A vCPU acquires a core when Fluxion grants one, where
+outine or Fiber [5, 46]. Concretely, the gThread runs directly         the grant is staged in Activating and becomes live in Active
+in the guest’s userspace and is designed to be inexpensive to          once kFlux actuates the move (§4.6). A vCPU can release a
+create; the runtime cost of creating a gThread is equivalent           physical core in two situations that differ in who initiates
+to that of creating a user-level thread in the host environ-           them. The vCPU’s local FluxOS scheduler voluntarily yields
+ment, avoiding the conventional heavy guest kernel thread              a physical core when it exhausts its runnable work (with no
+abstraction. Every active vCPU runs an independent work-               stealable work either), ceding its core and entering Yielded
+stealing scheduler [26] over a local run-queue and balances            state, the common case for a bursty tenant between bursts. A
+load by stealing gThreads from its sibling vCPUs.                      running vCPU can also be forcibly reclaimed, which happens
+Memory layout. Figure 3 shows the guest’s physical mem-                when Fluxion decides the core needs to be shifted to an-
+ory layout. Beyond the usual paging structures, boot info,             other VM (§4.7). A Yielded vCPU can take the fast re-wake
+and IDT, three regions matter for elasticity: the guest-owned          path back to Active if it finds immediately available work to
+RT-Deadline block, where FluxOS publishes its next timer               do, e.g., a new network packet arrives; this is a performance
+deadline so the VM can downscale to zero vCPUs without                 optimization to avoid relinquishing cores when there are
+                                                                   5
+consecutive requests in short intervals. If there is no imme-          queueing delay, and takes the maximum across the VM’s
+diately available work, the Yielded vCPU transitions into              active vCPUs. We take the maximum rather than an aver-
+Parking state and eventually relinquishes the physical core.           age because an average dilutes a single thread stuck behind
+                                                                       a long-running neighbor with the idle time of the VM’s
+4.4 Crossing the Isolation Boundary                                    other vCPUs, masking exactly the tail that needs protection.
+Hyperflux bridges the guest-host boundary with a per-                  FluxOS also publishes run-queue depth and the depth of
+vCPU control block mapped into both the guest’s physical               runnable work stranded behind a vCPU that has already
+address space and the host. Therefore, Fluxion and FluxOS              parked or yielded, so a VM that is shedding cores still adver-
+communicate by plain reads and writes to this block: the               tises the work it cannot yet run.
+host writes a one-byte command (such as park or activate)              Bursty network I/Os and timers. An I/O-heavy bursty
+that the guest’s per-vCPU scheduler polls, and the guest               workload can be idle during bursts and should hold cores
+writes a one-byte status (such as park-acked). Each field has          only while it is serving requests. Yet a guest-resident network
+a single writer, so the block stays coherent under the natural         stack needs timers, and packets arrive when the VM may
+atomicity of aligned word accesses and needs no lock. On               hold no cores. Hyperflux makes both visible to Fluxion. A
+the common path this coordination costs neither a VMExit               gThread blocked on the network parks as external I/O and
+nor a system call on either side: the host polls and the guest         is excluded from the demand signals, so a momentarily idle
+reads the command on its scheduler loop.                               server still sheds cores instead of advertising phantom de-
+   When the guest reaches a quiesce point the host is waiting          mand. FluxOS also publishes the deadline of its next pending
+for, such as a completed park or a transition to idle, it must         timer in the RT-Deadline Block, so Fluxion wakes a zero-
+stop the host from spinning on that vCPU; a single doorbell            core VM exactly when a packet arrives or a timer comes due.
+instruction (a port write) forces one VMExit to notify the             A Hyperflux VM therefore never holds a core merely to
+host, and it is the only trapping primitive on the path.               wait, and never misses a wake-up for lack of one, effectively
+                                                                       allowing Hyperflux VMs to downscale to zero cores.
+4.5   Expressing Core Demand
+The design of how a Hyperflux VM can express its core                  4.6   Deciding and Actuating a Core Move
+demand is built around two goals: (1) Hyperflux should
+                                                                       Hyperflux’s policy for deciding and enacting a move follows
+be able to express and react to core demand change with-
+                                                                       established single-domain core schedulers [33, 48]. Fluxion
+out an explicit core demand indication from the guest app.
+                                                                       runs a busy-polling dataplane pinned to a dedicated core. Ev-
+(2) Hyperflux should not rely on the scheduler internals
+                                                                       ery iteration delivers pending wakes and control responses,
+of FluxOS, so that FluxOS may evolve its own schedul-
+                                                                       while a slow pass, gated to a 10 𝜇s interval, samples each
+ing policies without being heavily coupled with the entire
+                                                                       VM’s demand and runs the allocation policy, so policy cost
+infrastructure.
+                                                                       is amortized without delaying wake delivery. The policy is
+   Greatly inspired by Caladan [33], we use the per-vCPU
+                                                                       high-priority-first: Fluxion first hands out cores from a free
+oldest-ready time as the primary signal: the timestamp at
+                                                                       pool, which takes from no donor, and only then preempts
+which the thread now at the head of a vCPU’s run-queue be-
+                                                                       a core from a structural donor, a VM running more cores
+came runnable. The benefit of this type of signal is that it can
+                                                                       than its guaranteed floor. It scores candidate recipients by
+be directly derived from the FluxOS without any explicit hint
+                                                                       reservation affinity first, then high-priority over low-priority,
+from the guest app. To decouple from FluxOS’s scheduler
+                                                                       then the VM furthest below its guaranteed floor; it admits
+internals, FluxOS takes the responsibility to publish signals
+                                                                       guaranteed cores as reserved at VM-creation time and damps
+to a narrow communication plane with Fluxion. Thus, we
+                                                                       oscillation with a per-core minimum hold time of 100 𝜇s, a
+take several bytes in the per-vCPU control block, serving as
+                                                                       cooldown on each donor–recipient pair, and a congestion sig-
+the communication plane for core demand signals in a way
+                                                                       nal cleared as soon as pressure drops. Hyperflux arbitrates
+similar to communicating commands (§4.4). The main dif-
+                                                                       cores only and does not control shared-cache or SMT-sibling
+ference between Caladan and Hyperflux is that Hyperflux
+                                                                       interference. Actuation is equally lightweight. kFlux, a host
+requires FluxOS to continuously publish signals to a desig-
+                                                                       kernel module, facilitates the fast pinning and unpinning
+nated memory region, while Caladan’s control plane directly
+                                                                       of vCPU threads on physical cores. Fluxion pre-stages the
+memory-maps the scheduler and reads values from it without
+                                                                       recipient’s activation in shared memory before asking the
+explicit participation from the user application’s runtime.
+                                                                       donor to relinquish its core, so the hand-off completes in a
+   The contract is deliberately narrow: FluxOS can retune
+                                                                       single scheduling step once the donor parks.
+its scheduler as long as it keeps populating these fields, and
+Fluxion reads each as a hint, cheap to sample, safe to dis-
+card, never a value it must wait on. Fluxion translates the            4.7   Reclaiming a Core
+guest’s time-stamp counter to host time using a per-VM                 Reclaiming a core naïvely strands the guest’s work.
+offset captured at boot, converts the oldest-ready time to a           Taking a core back is, in principle, descheduling its vCPU
+                                                                   6
+thread from the physical core, but how the host does so
+decides whether the guest’s work might be stranded. If the
+host simply lets its scheduler preempt the thread, the core
+frees at once, yet any guest gThread caught mid-execution
+is frozen on that vCPU; no other vCPU can resume it, so
+the work is stranded until the same vCPU runs again even
+when there are other active vCPUs in that VM. Avoiding
+this requires coordinating with the guest beforehand, so that
+in-flight work can be handed to a surviving vCPU later. We
+call a gThread stranded when it is frozen in a parked vCPU’s
+saved state while the same VM still has an active vCPU that            Figure 5. Hyperflux VM cold-start latency with varying con-
+                                                                       figured vCPUs under a pure local startup policy and the default
+could run it: the work could make progress on a sibling
+                                                                       hybrid startup policy, which uses a helper thread after a threshold.
+core, yet cannot, because no other vCPU can reach into that
+vCPU’s register and stack state. This avoidable case is what           thread pre-pinned to the target VM-core mask, so threads
+Hyperflux targets, and it is distinct from a VM that has               inherit their placement at birth.
+relinquished all of its cores, whose work is not stranded but             The local spawn saves cross-thread communication over-
+suspended together with the VM until the allocator grants it           head for small-scale thread creation, but pays for a short
+a core again.                                                          period of core contention. For large-vCPU VMs, where the
+The preemptive-park core hand-off. On a forced preemp-                 core contention is significant, the helper thread approach
+tion, FluxOS saves the running gThread’s full register state,          can avoid the core contention but pays for a small amount
+re-enters its scheduler, marks the gThread as stealable, and           of cross-thread communication overhead. Figure 5 shows
+acknowledges the park. As long as the VM retains at least one          this cuts a 32-vCPU VM’s cold start from 3.64 ms to 3.23 ms
+active vCPU, a sibling vCPU’s work-stealing scheduler picks            (11.3%), with the residual dominated by in-kernel thread
+up the marked gThread, so the in-flight work migrates to               creation and the KVM setup any KVM VM pays.
+another of the VM’s cores instead of freezing on the parked
+one. Hyperflux therefore guarantees no avoidable strand-               4.9    The Warm VM Shell
+ing: whenever a reclaimed VM still holds a core, none of its           To mitigate residual startup latency, Hyperflux keeps a
+work is frozen for lack of a runnable vCPU. When a reclaim             pool of warm VM shells: scaffolds that retain their KVM
+takes a VM’s last core, the saved gThread stays queued and             virtual context (inspired by Virtines [61]), guest memory
+resumes the moment the VM is next granted a core; this is              mapping, and vCPU-backing host threads, so acquiring one
+the defined behavior of a zero-core VM, which the allocator            skips almost all of the cold path. Hyperflux pre-warms
+drives to zero only when it has no standing claim to a core            shells or reclaims them from terminated VMs (scrubbing
+(§4.6), not a stranding failure. To achieve this hand-off proto-       guest memory before reuse), and serves a request from the
+col, Fluxion first uses a signal to forcibly trigger a VMExit          smallest shell whose warm watermark, the memory it has
+of the targeted vCPU and return control to the backing host            already touched, covers the request; it rewrites the boot
+thread. The backing host thread then injects the interrupt             metadata, control plane, and network state and arms only
+into the vCPU and resumes the vCPU execution, triggering               the requested vCPUs, leaving the rest parked. We measured
+the vCPU’s preemption handler immediately upon resuming.               warm-shell startup at 100–370 𝜇s; this is not a full snapshot
+                                                                       restore, as the path still performs ELF parsing and initializes
+4.8   Cold Start with Multiple vCPUs                                   the guest app.
+Hyperflux’s multi-vCPU machinery adds boot work a
+single-vCPU ultralight VM does not pay, so keeping cold                4.10   Implementation and Limitations
+start fast is an explicit goal. One of the dominant costs is           Hyperflux is implemented in Rust and currently supports
+the core contention among the vCPU-backing host threads,               x86_64 guest applications compiled with Hyperflux-
+which Fluxion batch-creates under its own core affinity,               specified linking procedures. Hyperflux has been tested
+so a burst of creations piles onto one core and stalls each            on an x86_64 host server running the Linux kernel and
+thread by milliseconds.                                                currently only supports KVM. This restriction is a prototype
+   Hyperflux avoids this with a hybrid creation path: (i) It           scope rather than a fundamental one: the core mechanism,
+spawns threads locally (inherits Fluxion’s core affinity) for          parking and unparking vCPU-backing threads with signal-
+small-vCPU VMs (<8 vCPUs) initially, and then sets the host            driven VMExit and interrupt injection, has direct equivalents
+threads’ core affinity to the VM’s core set before loading and         on other KVM-supported architectures such as ARM. Table 2
+booting up the full VM. (ii) For large-vCPU VMs, Fluxion               summarizes the lines of code for all Hyperflux components
+delegates the thread creation work to a dedicated helper               and guest applications ported to Hyperflux for evaluations.
+                                                                   7
+Hyperflux Component         LoC     Ported Application   LoC            These questions evaluate the mechanism that makes
+kFlux                       1,145   Memcached            2,026       dense colocation safe, namely tail protection and demand-
+Fluxion                    13,636   Webserver              801       driven core redistribution, rather than an end-to-end
+FluxOS                     16,851   x264                 1,200       packing-density or utilization figure, which depends on
+                                    TPC-H                1,147       the colocated tenant mix and provisioning policy and is a
+Table 2. Lines of code of Hyperflux components and ported            deployment-level question.
+applications for the purpose of evaluations.                         Testbed setup: We use a single-socket x86 server run-
+                                                                     ning Ubuntu 24.04 with KVM, EPT, and VPID enabled.
+FluxOS currently does not support any standard Linux                 The server has one Intel® Xeon® Gold 6530 processor
+syscalls; instead, it supports 24 scheduling/thread primitives       (32 cores/64 threads at 2.1 GHz base), exposed as two NUMA
+and 11 TCP network primitives, offering a sufficiently               nodes via sub-NUMA clustering, and 256 GiB of DDR5
+large surface for guest apps to communicate over the                 memory in total. We dedicate one NUMA partition to the
+network and to express the workload parallelism. Beyond              experiment, isolating its cores with isolcpus, nohz_full,
+networking, FluxOS exposes a read-only host-directory                and rcu_nocbs for Fluxion and VM vCPUs, while the other
+interface for input and reference data: the provider attaches        partition runs the host OS, background services, and load
+directories at VM creation, and the host resolves each guest         generators. We avoid placing competing active vCPUs on
+request only against them under a strict path grammar that           SMT siblings for all experiments. The host is configured for
+never follows symlinks or names a host path, keeping it              stable microsecond-scale timing: deep c-states are disabled,
+within the trust model of §4.1. The programming language             the clocksource is TSC, and the kernel is booted with
+choice for guest applications is currently limited to Rust,          tsc=reliable. The CPU governor is set to performance,
+as FluxOS only exposes Rust APIs. In the serverless                  and Intel turbo boost and swap are disabled.
+model Hyperflux targets, the provider, not the tenant,               Evaluated VM substrates and workloads: To compare
+selects the guest runtime, so linking against FluxOS is a            the memory overhead and startup latency, we evaluated
+provider substrate choice rather than a per-tenant porting           Kata [17] on QEMU and its built-in Dragonball, Unikraft [42]
+tax; constrained provider runtimes are already deployed              on Firecracker, QEMU, and KVM, native Firecracker, Cloud
+commercially, for instance Cloudflare Workers requires               Hypervisor [10], Nanvix [49, 54], Dandelion [41] on KVM,
+workloads to target its V8 runtime and AWS Lambda                    and Hyperlight [1]. For experiments that involve colocation,
+ships provider-managed language runtimes. Supporting                 we used four workloads: Memcached [18], x264 [13], custom-
+unmodified Linux binaries is a known engineering path                built HTTP web server (webserver), and multi-worker TPC-
+rather than an open problem: Junction [32] already runs              H Q1 query processing with SF-0.1 (TPC-H). We used native
+unmodified binaries on a Caladan-based runtime, and                  Firecracker (FC) and Cloud Hypervisor (CH) as the baseline
+FluxOS’s scheduler and network stack already follow the              VM substrates for colocation experiments. Firecracker uses
+same Caladan design, so reaching it requires a fuller ELF            the standard virtio-net-over-TAP path and Cloud Hypervisor
+loader and a system-call shim that maps the Linux surface            is evaluated with both TAP (CH TAP) and vhost-user-net
+onto FluxOS primitives and host services.                            (CH vhost) configurations. For most colocation experiments,
+                                                                     we allocated 8 cores for workload VMs. In the four-app-
+                                                                     colocation experiment, we allocated 16 cores for workload
+                                                                     VMs in total, where each VM is capped at 8 max vCPUs.
+5   Evaluation                                                       Workload VMs can be considered as high-priority (HP) or
+We evaluate Hyperflux by answering the following ques-               low-priority (LP): HP VMs are the ones whose tail latency
+tions:                                                               we want to protect under bursts; LP VMs are the ones whose
+1. Is the Hyperflux VM lightweight enough compared to                cores should ideally be harvested during HP bursts, but that
+   existing VM substrates in terms of memory overhead and            can also harvest cores from HP VMs when HP workloads’
+   startup latency, and how fast is its core movement? (§5.1)        core demand is low. Each workload runs in the form its
+2. How much does Hyperflux help the tail latency of high-            substrate supports: linked against FluxOS on Hyperflux,
+   priority applications during colocation compared to stati-        and as an application in a standard Linux guest on Fire-
+   cally sharing cores with existing VM substrates? (§5.2)           cracker and Cloud Hypervisor. Cross-substrate results are
+                                                                     therefore system-level comparisons rather than the same
+3. Can Hyperflux effectively redistribute cores to simulta-
+                                                                     binary on both; we isolate the core-movement mechanism
+   neously protect the high-priority app’s tail latency and
+                                                                     itself through the within-Hyperflux comparison (§5.3) and
+   utilize remaining cores for the low-priority app? (§5.3)
+                                                                     the controlled core-movement microbenchmark (§5.1).
+4. How does Hyperflux perform under continuously chang-
+                                                                     Hyperflux setup: Hyperflux has two configurations: Hy-
+   ing bursty loads compared to using cgroup to adjust core
+                                                                     perflux (auto yield) automatically relinquishes cores when
+   share and hot-plug to adjust core allocation? (§5.4)
+                                                                 8
+      Runtime                   RSS (MB)   vs. Hyperflux
+
+      Unikraft (+Firecracker)        2.5            0.8×
+      Hyperflux                      3.2            1.0×
+      Hyperlight                     3.6            1.1×
+      Dandelion (+KVM)               6.0            1.9×
+      Nanvix                        20.8            6.5×
+      Unikraft (+QEMU)              37.1           11.5×
+      Unikraft (+KVM)               38.4           11.9×
+      Firecracker                   50.5           15.7×
+      Cloud Hypervisor              52.9           16.5×
+      Kata (+Dragonball)           170.3             53×
+      Kata (+QEMU)                 337.7            105×
+
+Table 3. Host memory footprint (resident set size, RSS) of each
+runtime while hosting a guest configured with 128 MB of memory.
+The last column reports each footprint relative to Hyperflux.
+
+the scheduler finds no runnable work, and Hyperflux (spin)
+keeps cores until the host forcibly reclaims them, which rep-
+resents the lowest possible latency case by avoiding the over-        Figure 6. Startup latency comparison. Note: Hyperflux currently
+                                                                      does not support a full instance snapshot, so Hyperflux warm
+head of yielding and re-waking. Note that Hyperflux cannot
+                                                                      start only uses a pre-warmed VM shell. Hyperflux still needs to
+preempt HP VMs’ cores for LP VMs; therefore, when colo-               perform ELF parsing, load the guest binary, and initialize the guest
+cating only one HP VM with another LP VM, the spin mode               app.
+effectively makes the HP VM exclusively use the allocated
+cores, rendering it incapable of sharing cores with LP VMs.           Operation                                p50    p99   max     mean
+                                                                      Remove (reclaim core from busy donor)     7.4 9.0      10.3      7.4
+5.1   Ultralight Hyperflux VM                                         Add (install core on recipient)           4.4 25.8     33.4      5.6
+
+To compare the memory overhead and startup latency, we                Table 4. Hyperflux forced cross-VM core-movement latency (𝜇s,
+used a simple “Hello World” application ported to each sub-           𝑛=1000): a busy donor vCPU is forcibly preempted, timed from
+                                                                      the preemption signal until its core is released (Remove) and re-
+strate so that we can focus on the substrate itself.
+                                                                      installed on a recipient (Add).
+Memory overhead. Table 3 shows that the memory over-
+head of Hyperflux (3.2 MB) is comparable to existing ul-              spinning, non-yielding donor vCPU: Hyperflux signals it
+tralight VM substrates such as Hyperlight, Dandelion, and             out of guest execution and injects the preemption interrupt,
+Nanvix, and, as expected, significantly lower than that of            FluxOS saves the running gThread and acknowledges the
+microVM-league substrates, such as Cloud Hypervisor and               park, and we time from the preemption signal until the host
+Firecracker. Unikraft on Firecracker has the lowest memory            core is released and reassignable to another VM. Across 1000
+overhead and wins over Hyperflux by just 0.7 MB.                      forced moves, reclaiming a core from a busy donor takes
+Startup latency. Figure 6 shows both cold-start latency and           7.4 𝜇s on average (p99 9.0 𝜇s) and installing it on a recipi-
+warm-start latency (if supported) among all evaluated sub-            ent takes 5.6 𝜇s on average (median 4.4 𝜇s, p99 25.8 𝜇s), so
+strates. Hyperflux’s cold-start latency (1.37 ms with 1 vCPU          a full cross-VM harvest averages ∼13 𝜇s, orders of magni-
+and 1.85 ms with 8 vCPUs) is on par with the fastest existing         tude faster than the ACPI vCPU hot-plug path in QEMU and
+ultralight VM substrates. However, the Hyperflux VM sup-              Cloud Hypervisor (~100–200 ms). The reclaim path is tightly
+ports multi-core parallelism with threading while the other           bounded because the host drives it with a preemption signal,
+ultralight VM substrates do not. Hyperflux’s warm start               whereas the wider tail on the install path comes from waking
+with a warm VM shell has a higher latency than Hyperlight             the parked vCPU thread and re-entering the guest on the
+(0.38 ms vs. 0.11 ms); however, we note that Hyperflux’s              host side, not from guest cooperation, and even its p99 stays
+number is not fully comparable to Hyperlight’s as Hyper-              well below the millisecond-scale hot-plug path. These figures
+flux currently does not support a full instance snapshot, and         are the actuation cost of the move itself; reacting to a burst
+Hyperflux still needs to perform ELF parsing and initialize           additionally incurs Fluxion’s demand sampling and policy
+guest app memory during the warm-start measurement.                   pass (§4.6). The measurement excludes the benchmark’s ex-
+Core movement latency. Table 4 reports the latency of a               ternal control-socket round trip, since in deployment a move
+forced cross-VM core movement, measured with fenced host-             is triggered by Fluxion’s own dataplane loop rather than an
+TSC reads on an otherwise idle host. To exercise the worst            external call.
+case rather than a cooperative yield, we forcibly preempt a
+                                                                  9
+                                                                            core movement then preserves that lead under contention,
+                                                                            an effect isolated by the within-Hyperflux comparison in
+                                                                            §5.3. Dashed lines plot the LP workloads’ throughput and
+                                                                            show that static colocations have mostly flat throughput
+                                                                            lines while Hyperflux gracefully degrades LP workload
+                                                                            throughput under high load of Memcached’s traffic.
+
+                                                                            5.3   Core Distribution among Colocated Workloads
+                                                                            Colocation with two workload VMs. To understand how
+                                                                            Hyperflux distributes cores among colocated workload
+                                                                            VMs, we evaluate three HP-LP pairings: Memcached-TPC-H,
+                                                                            Webserver-TPC-H, and TPC-H-x264. Figure 8 (top) shows
+                                                                            that under Hyperflux the HP VM’s colocated tail latency
+                                                                            stays close to its alone latency across all three pairings.
+                                                                            Because both runs use the same Hyperflux runtime, this
+Figure 7. Hyperflux shows a lower latency compared to Fire-                 within-Hyperflux comparison controls for the substrate’s
+cracker (FC) and Cloud Hypervisor with different network backends           runtime advantage: the small alone-to-colocated gap
+(CH vhost/TAP) in both isolation (top) and colocation (bottom). La-         reflects what elastic core movement buys under colocation,
+bel static means there are no dynamic core-share changes between            not a head start from the lightweight runtime. In the
+colocated applications. Missing data points indicate the correspond-        Memcached-TPC-H pairing, the colocated Memcached tail
+ing setting is overloaded under its offered load.                           is higher than in the alone case with spinning, as expected,
+5.2   Colocation with Static Core Allocation                                because spin mode occupies all cores with busy polling for
+                                                                            the next packet.
+We further evaluate Hyperflux’s effectiveness in protecting
+                                                                               As shown in Figure 8 (bottom), in both Webserver-TPC-H
+the tail latency of the HP workload VM by comparing it
+                                                                            and TPC-H-x264 pairings, Hyperflux demonstrates
+with statically sharing cores with Firecracker and Cloud
+                                                                            effective core distribution in two ways: it allocates more
+Hypervisor respectively.
+                                                                            cores to the LP VM when the HP VM’s load is low and it
+   We first measured the p99 RTT latency of Memcached
+                                                                            has free cores to share; it also harvests more cores from the
+under different offered loads when it is running alone to
+                                                                            LP VM when the HP VM’s load is high and it needs more
+establish the baseline. Figure 7 (top) shows that Hyperflux
+                                                                            cores. That the colocated HP tail stays near its alone-case
+(auto yield) delivers consistently lower latency than Fire-
+                                                                            (top) is the visible result of these cores following demand
+cracker and Cloud Hypervisor, regardless of the network
+                                                                            to the HP VM, while the LP VM still receives cores between
+backend (CH TAP/vhost). All configurations have a similar
+                                                                            bursts, not of the LP VM simply failing to interfere. The
+p99 latency at low load (10K), but the gap widens as the
+                                                                            Memcached-TPC-H pairing shows the HP VM does not gain
+load increases. Hyperflux performs better even when the
+                                                                            substantially more cores under higher loads. This pattern
+workload runs alone because Hyperflux can wake up tar-
+                                                                            arises because Memcached’s server-side service time is
+geted vCPUs to immediately handle the pending network
+                                                                            only tens of microseconds, so demand fluctuates faster
+packet. Figure 7 (top) also reveals that Hyperflux (spin) has
+                                                                            than Hyperflux reacts, and its parallelism is not aggressive
+even lower latency compared to Hyperflux (auto yield) as it
+                                                                            enough to exploit the extra cores Hyperflux can offer.
+keeps spinning on idle cores rather than relinquishing them,
+waiting for the next ready packet to process. Therefore, Hy-                Colocation with many workload VMs. To further un-
+perflux (spin) avoids the virtual machine context switch                    derstand Hyperflux’s core distribution behavior in a more
+cost. Here, with no competing HP VM, Hyperflux (spin)                       complex scenario, we evaluate Hyperflux with a four-app-
+effectively gives the HP VM exclusive use of its cores, which               colocation scenario, where two HP VMs (Memcached and
+the colocated LP VM cannot harvest.                                         Webserver) are colocated with two LP VMs (TPC-H and x264).
+   Figure 7 (bottom) shows the latency under static coloca-                 Figure 9 shows the HP workloads’ p99 latencies, LP work-
+tion, where both VMs share the same eight cores and the host                loads’ throughputs, offered HP loads, and core distribution
+OS scheduler multiplexes their vCPU threads. In this case,                  over a ∼120 s timespan. During both Memcached and Web-
+Hyperflux holds a substantial p99 latency advantage over                    server bursts, Hyperflux harvests cores from both LP VMs
+both Firecracker and Cloud Hypervisor under static coloca-                  and shifts them to the HP VMs, which effectively keeps the
+tion (up to 10.5x lower at 65K load). This gap reflects two com-            HP VMs’ latency low and stable. When the HP VMs are not
+pounding effects: Hyperflux’s runtime already leads when                    under bursty load, Hyperflux also gives more cores to the
+the HP VM runs alone (Figure 7, top), and demand-aware                      LP VMs so that they can achieve higher throughput. The rise
+                                                                            of p99 latency during the Memcached burst is expected due
+                                                                       10
+Figure 8. Hyperflux colocation shows a close latency measurement compared to running the high-priority (HP) application alone with
+automatic core yielding (Alone (Auto Yield)). Memcached and TPC-H pairing shows that automatic core yielding has runtime overhead
+compared to the spinning case (Alone (Spin)), where the Memcached VM spins on cores without releasing them during idle intervals.
+
+                                                                        5.4 Effectiveness of Hyperflux under Continuously
+                                                                              Changing Bursty Loads
+                                                                        Next, we evaluate whether Hyperflux can move cores
+                                                                        promptly and effectively under continuously changing
+                                                                        loads, comparing it with two existing approaches: using
+                                                                        cgroup to adjust the core share and using vCPU hot-plug to
+                                                                        adjust the core allocation among colocated workload VMs.
+                                                                        We colocate Memcached (HP) and x264 (LP) together and
+                                                                        change the offered load to Memcached every 5 seconds in a
+                                                                        three-phase pattern (10K, 30K, and 50K).
+                                                                           As a baseline, Figure 10a shows that static colocation (§5.2)
+                                                                        with both Firecracker and Cloud Hypervisor serves all three
+                                                                        steady loads at >99.5% goodput (achieved/offered). Then, we
+                                                                        proceed to experiment with Firecracker and Cloud Hypervi-
+                                                                        sor using cgroup and hot-plug, and Hyperflux, under the
+                                                                        three-phase load. We use cgroup to adjust the time quota,
+                                                                        which gives a 2:6 share to the Memcached VM and the x264
+                                                                        VM under the 10K load, a 4:4 share under the 30K load, and
+                                                                        a 6:2 share under the 50K load. We use hot-plug to adjust
+                                                                        the core allocation between the Memcached VM and the
+                                                                        x264 VM, offering 2 and 6 cores to the two VMs under the
+                                                                        10K load, 4 and 4 cores under the 30K load, and 6 and 2
+                                                                        cores under the 50K load. Both actuators are oracle-based:
+Figure 9. A four-app-colocation scenario, where Hyperflux can           they cannot detect load changes but react exactly when the
+actively and promptly shift cores from low-priority (LP) apps to        load shifts, using the phase schedule as prior knowledge.
+high-priority (HP) apps when HP apps are under bursty loads.            This represents the best possible scenario for cgroup and
+                                                                        hot-plug. In contrast, Hyperflux reacts based on the actual
+to the increased queueing delay in the host network stack.
+                                                                        runtime demand and performs core movement dynamically,
+During the idle period when the offered Webserver load is
+                                                                        thus incurring reaction overhead.
+zero (right after the burst), Hyperflux also gracefully parks
+                                                                           Figure 10b depicts the result. As shown in the HP p99
+all of the Webserver VM’s cores, giving up core resources so
+                                                                        latency (top), Hyperflux consistently maintains a lower and
+that other VMs can harvest.
+                                                                        more stable tail latency while other systems fluctuate signifi-
+                                                                        cantly. The achieved rate (bottom) shows two main insights:
+                                                                        (1) Based on the CH vhost result, the cgroup approach is ef-
+                                                                        fective at shifting cores under load changes but is insufficient
+                                                                        at the high load (50K), where it fails to deliver the full 50K
+                                                                   11
+                                                                                      6   Related Work
+                                                                                      Microsecond-scale core scheduling. Caladan, Shenango,
+                                                                                      and Arachne reallocate cores among single-trust-domain
+                                                                                      applications in microseconds, and Shinjuku, ZygOS, and Nu
+                                                                                      schedule requests and resources just as fast [33, 38, 48, 51–
+                                                                                      53], showing the timescale is achievable on commodity hard-
+                                                                                      ware. Hyperflux’s core arbiter and kernel actuation path
+(a) Colocation by statically sharing 8 cores under three steady loads. Good-          adapt the substrate they pioneered [33, 48]; what is new is
+put ratio (right) suggests both FC and CH vhost can sufficiently handle the
+                                                                                      carrying it across a VM isolation boundary without sacrific-
+offered load (>99.5% of the offered load) under a steady traffic flow.
+                                                                                      ing ultralight-VM startup speed and footprint. Hyperflux
+                                                                                      is to colocated VMs what these schedulers are to colocated
+                                                                                      application processes.
+                                                                                      Cross-VM core harvesting. Azure’s resource-harvesting
+                                                                                      VMs, SmartHarvest, and memory-harvesting VMs reclaim a
+                                                                                      primary VM’s spare capacity for batch tenants, but only
+                                                                                      asymmetrically and when idle [24, 34, 60]; HardHarvest
+                                                                                      reaches microseconds only with new hardware [58]; and
+                                                                                      Ditto assumes a strict parallelism paradigm [63]. Each thus
+                                                                                      leaves one of Hyperflux’s axes uncovered (§3, Table 1).
+                                                                                      vCPU scheduling and resizing. vScale and FlexCore scale
+                                                                                      an SMP guest’s active vCPUs via ballooning [27, 47], and
+                                                                                      other work coordinates guest and host scheduling to avoid
+                                                                                      lock-holder preemption and double scheduling [39, 59]. All
+                                                                                      act within one guest’s allotment through its kernel; none
+                                                                                      hand a physical core to a different VM. Hyperflux instead
+                                                                                      makes the physical core, not the vCPU count, the unit of
+                                                                                      allocation and moves cores across VMs in microseconds.
+(b) Colocation under a three-phase bursty traffic pattern (10K, 30K, and 50K),
+where Firecracker uses cgroup to adjust the core share dynamically and CH             Lightweight virtualization and software isolation. Hy-
+vhost additionally uses hot-plug to adjust the core allocation. Hyperflux can         perflux inherits the lightweight-VM lineage that trades
+promptly shift cores during Memcached bursts by showing an immediate                  functionality for agility [10, 17, 23, 41, 42, 45, 49, 61], in-
+change in the achieved rate (bottom) with a lower and more stable p99
+                                                                                      cluding cold-start work like Catalyzer and RunD [30, 44],
+latency (top). Hot-plug shows a delayed response and cgroup shows an
+ineffective core share under the 50K load.                                            preserving their fast boot speed and low memory footprint,
+                                                                                      while also keeping hardware-based isolation and supporting
+      Figure 10. Memcached (HP) and x264 (LP) colocation.
+                                                                                      elastic parallelism width. The densest forgo the in-VM mul-
+traffic load. This reveals the fundamental limitation of the                          ticore execution; Nanvix restores threading atop Hyperlight,
+time-share mechanism. Under such a high load, exclusive ac-                           but on a single vCPU [54]. Others instead weaken or relo-
+cess to a core is more crucial to protect the tail latency. (2) The                   cate the isolation boundary for density with software isola-
+CH vhost hotplug shows that the vCPU hot-plug approach                                tion or container-based approaches, e.g., WebAssembly [35],
+is too slow to react to drastic load changes. For instance, at                        Faasm [57], GRANNY [55], gVisor [6], and Junction [32].
+the 5s and 10s time-points, Cloud Hypervisor with vCPU
+hot-plug takes about 2 s to reach the intended rate. This far
+exceeds a single ACPI hot-plug core movement (~100–200 ms)                            7   Conclusion
+for two compounding reasons: each phase onlines several                               Serving bursty, latency-sensitive serverless tenants at high
+guest CPUs in sequence, and while those cores are still be-                           density demands three properties at once: a small footprint
+ing added the under-provisioned VM accumulates a request                              and fast cold start, in-VM multicore execution, and microsec-
+backlog that it must drain before its achieved rate catches up                        ond movement of physical cores across the VM isolation
+to the offered load. In summary, Hyperflux can effectively                            boundary. No prior substrate offered all three; Hyperflux
+deliver the offered load immediately after the load change                            is the first to do so on commodity KVM. By parking and re-
+and consistently satisfy offered loads across three phases.                           backing vCPU threads instead of reconfiguring the guest’s
+                                                                                      CPU topology, it moves a core between colocated VMs in
+                                                                                      microseconds, orders of magnitude faster than the ACPI
+                                                                                      hot-plug path it supplants. That speed turns cross-VM core
+                                                                                      movement into a viable tail-latency mechanism rather than
+                                                                                 12
+a coarse provisioning tool: Hyperflux steers cores to high-         References
+priority tenants under load and returns them between bursts          [1] HyperLight. Microsoft. https://github.com/hyperlight-dev/
+while staying on par with the densest ultralight VMs, making             hyperlight
+elastic parallelism width, a previously missing axis in the          [2] AMD Secure Encrypted Virtualization (SEV). https://www.amd.com/
+                                                                         en/developer/sev.html Accessed: 2025-05-06.
+VM design space, attainable on commodity KVM.
+                                                                     [3] Control Group v2 — The Linux Kernel Documentation. https:
+                                                                         //docs.kernel.org/admin-guide/cgroup-v2.html#cpuset Ac-
+                                                                         cessed: 2025-05-12.
+                                                                     [4] CPU Hotplug in the Kernel — The Linux Kernel Documenta-
+                                                                         tion.    https://docs.kernel.org/core-api/cpu_hotplug.html
+                                                                         Accessed: 2025-05-12.
+                                                                     [5] The Go Programming Language. https://go.dev/ Accessed: 2025-
+                                                                         05-08.
+                                                                     [6] gVisor. https://gvisor.dev/ Accessed: 2025-05-12.
+                                                                     [7] Amazon Athena. https://aws.amazon.com/athena/features/
+                                                                         Accessed: 2026-06-08.
+                                                                     [8] Architecting a High-Concurrency, Low-Latency Data Warehouse
+                                                                         on Databricks That Scales.         https://www.databricks.com/
+                                                                         blog/architecting-high-concurrency-low-latency-data-
+                                                                         warehouse-databricks-scales Accessed: 2026-06-08.
+                                                                     [9] Autoscale Workload Resource_allocation_properties | Managed Ser-
+                                                                         vice for Apache Spark. https://docs.cloud.google.com/managed-
+                                                                         spark/docs/concepts/autoscaling-serverless Accessed: 2026-
+                                                                         06-08.
+                                                                    [10] Cloud Hypervisor. https://www.cloudhypervisor.org/ Accessed:
+                                                                         2026-05-07.
+                                                                    [11] Compute Capacity for Amazon Redshift Serverless.            https:
+                                                                         //docs.aws.amazon.com/redshift/latest/mgmt/serverless-
+                                                                         capacity.html Accessed: 2026-06-08.
+                                                                    [12] Configure Replica Scaling for Anyscale Services | Anyscale Docs.
+                                                                         https://docs.anyscale.com/services/scale Accessed: 2026-06-
+                                                                         08.
+                                                                    [13] Corecodec/X264.       CoreCodec, Inc.       https://github.com/
+                                                                         corecodec/x264
+                                                                    [14] Deploy Models with Amazon SageMaker Serverless Inference - Ama-
+                                                                         zon SageMaker AI. https://docs.aws.amazon.com/sagemaker/
+                                                                         latest/dg/serverless-endpoints.html Accessed: 2026-06-08.
+                                                                    [15] Instance Autoscaling in Cloud Run Services. https://docs.cloud.
+                                                                         google.com/run/docs/about-instance-autoscaling Accessed:
+                                                                         2026-06-08.
+                                                                    [16] Intel® TEE TDX.        https://docs.trustauthority.intel.com/
+                                                                         main/articles/articles/ita/tee-tdx.html Accessed: 2026-05-
+                                                                         31.
+                                                                    [17] Kata Containers. https://katacontainers.io/ Accessed: 2026-05-
+                                                                         06.
+                                                                    [18] Memcached/Memcached. memcached community. https://github.
+                                                                         com/memcached/memcached
+                                                                    [19] Modal: Scaling Out. https://modal.com/docs/guide/scale Ac-
+                                                                         cessed: 2026-06-08.
+                                                                    [20] Serverless Compute - AWS Fargate - AWS. https://aws.amazon.
+                                                                         com/fargate/ Accessed: 2026-05-06.
+                                                                    [21] Snowflake: Multi-cluster Warehouses. https://docs.snowflake.
+                                                                         com/en/user-guide/warehouses-multicluster Accessed: 2026-
+                                                                         06-08.
+                                                                    [22] SQL Warehouse Types | Databricks on AWS.            https://docs.
+                                                                         databricks.com/aws/en/compute/sql-warehouse/warehouse-
+                                                                         types Accessed: 2026-06-08.
+                                                                    [23] Alexandru Agache, Marc Brooker, Alexandra Iordache, Anthony
+                                                                         Liguori, Rolf Neugebauer, Phil Piwonka, and Diana-Maria Popa. Fire-
+                                                                         cracker: Lightweight Virtualization for Serverless Applications. In
+                                                                         17th USENIX Symposium on Networked Systems Design and Implemen-
+                                                                         tation (NSDI 20). 419–434. https://www.usenix.org/conference/
+                                                                         nsdi20/presentation/agache
+
+
+                                                               13
+[24] Pradeep Ambati, Íñigo Goiri, Felipe Frujeri, Alper Gun, Ke Wang,                    3062363
+     Brian Dolan, Brian Corell, Sekhar Pasupuleti, Thomas Moscibroda,               [36] Adam Hall, Anirudh Sarma, Esha Choukse, Umakishore Ramachan-
+     Sameh Elnikety, Marcus Fontoura, and Ricardo Bianchini. Provid-                     dran, and Sameh Elnikety. Harvesting Spare CPU Resources in Con-
+     ing SLOs for Resource-Harvesting VMs in Cloud Platforms. In 14th                    tainer Systems. In 23rd USENIX Symposium on Networked Systems De-
+     USENIX Symposium on Operating Systems Design and Implementa-                        sign and Implementation (NSDI 26). 2323–2337. https://www.usenix.
+     tion (OSDI 20). 735–751. https://www.usenix.org/conference/                         org/conference/nsdi26/presentation/hall
+     osdi20/presentation/ambati                                                     [37] Călin Iorgulescu, Reza Azimi, Youngjin Kwon, Sameh Elnikety, Manoj
+[25] Fabrice Bellard. QEMU, a Fast and Portable Dynamic Translator.                      Syamala, Vivek Narasayya, Herodotos Herodotou, Paulo Tomita, Alex
+     In 2005 USENIX Annual Technical Conference (USENIX ATC 05).                         Chen, Jack Zhang, and Junhua Wang. PerfIso: Performance Isola-
+     https://www.usenix.org/conference/2005-usenix-annual-                               tion for Commercial Latency-Sensitive Services. In 2018 USENIX An-
+     technical-conference/qemu-fast-and-portable-dynamic-                                nual Technical Conference (USENIX ATC 18). 519–532. https://www.
+     translator                                                                          usenix.org/conference/atc18/presentation/iorgulescu
+[26] Robert D. Blumofe and Charles E. Leiserson. Scheduling Multithreaded           [38] Kostis Kaffes, Timothy Chong, Jack Tigar Humphries, Adam Be-
+     Computations by Work Stealing. J. ACM 46, 5 (Sept. 1999), 720–748.                  lay, David Mazières, and Christos Kozyrakis. Shinjuku: Preemp-
+     doi:10.1145/324133.324234                                                           tive Scheduling for 𝜇second-Scale Tail Latency. In 16th USENIX
+[27] Luwei Cheng, Jia Rao, and Francis C. M. Lau. vScale: Automatic and                  Symposium on Networked Systems Design and Implementation (NSDI
+     Efficient Processor Scaling for SMP Virtual Machines. In Proceedings                19). 345–360.       https://www.usenix.org/conference/nsdi19/
+     of the Eleventh European Conference on Computer Systems (EuroSys                    presentation/kaffes
+     ’16). Association for Computing Machinery, New York, NY, USA, 1–14.            [39] Hwanju Kim, Sangwook Kim, Jinkyu Jeong, Joonwon Lee, and Se-
+     doi:10.1145/2901318.2901321                                                         ungryoul Maeng. Demand-Based Coordinated Scheduling for SMP
+[28] Jeffrey Dean and Luiz André Barroso. The Tail at Scale. Commun.                     VMs. In Proceedings of the Eighteenth International Conference on Ar-
+     ACM 56, 2 (Feb. 2013), 74–80. doi:10.1145/2408776.2408794                           chitectural Support for Programming Languages and Operating Systems
+[29] Henri Maxime Demoulin, Joshua Fried, Isaac Pedisich, Marios Ko-                     (ASPLOS ’13). Association for Computing Machinery, New York, NY,
+     gias, Boon Thau Loo, Linh Thi Xuan Phan, and Irene Zhang. When                      USA, 369–380. doi:10.1145/2451116.2451156
+     Idling Is Ideal: Optimizing Tail-Latency for Heavy-Tailed Datacen-             [40] Avi Kivity, Yaniv Kamay, and Dor Laor. Kvm: The Linux Virtual
+     ter Workloads with Perséphone. In Proceedings of the ACM SIGOPS                     Machine Monitor. (2007).
+     28th Symposium on Operating Systems Principles (SOSP ’21). Asso-               [41] Tom Kuchler, Pinghe Li, Yazhuo Zhang, Lazar Cvetković, Boris Gora-
+     ciation for Computing Machinery, New York, NY, USA, 621–637.                        nov, Tobias Stocker, Leon Thomm, Simone Kalbermatter, Tim Not-
+     doi:10.1145/3477132.3483571                                                         ter, Andrea Lattuada, and Ana Klimovic. Unlocking True Elasticity
+[30] Dong Du, Tianyi Yu, Yubin Xia, Binyu Zang, Guanglu Yan, Chenggang                   for the Cloud-Native Era with Dandelion. In Proceedings of the ACM
+     Qin, Qixuan Wu, and Haibo Chen. Catalyzer: Sub-millisecond Startup                  SIGOPS 31st Symposium on Operating Systems Principles (SOSP ’25).
+     for Serverless Computing with Initialization-less Booting. In Proceed-              Association for Computing Machinery, New York, NY, USA, 944–961.
+     ings of the Twenty-Fifth International Conference on Architectural Sup-             doi:10.1145/3731569.3764803
+     port for Programming Languages and Operating Systems (ASPLOS ’20).             [42] Simon Kuenzer, Vlad-Andrei Bădoiu, Hugo Lefeuvre, Sharan San-
+     Association for Computing Machinery, New York, NY, USA, 467–481.                    thanam, Alexander Jung, Gaulthier Gain, Cyril Soldani, Costin Lupu,
+     doi:10.1145/3373376.3378512                                                         Ştefan Teodorescu, Costi Răducanu, Cristian Banu, Laurent Mathy,
+[31] D. R. Engler, M. F. Kaashoek, and J. O’Toole. Exokernel: An Operating               Răzvan Deaconescu, Costin Raiciu, and Felipe Huici. Unikraft:
+     System Architecture for Application-Level Resource Management.                      Fast, Specialized Unikernels the Easy Way. In Proceedings of the Six-
+     ACM SIGOPS Operating Systems Review 29, 5 (Dec. 1995), 251–266.                     teenth European Conference on Computer Systems (EuroSys ’21). As-
+     doi:10.1145/224057.224076                                                           sociation for Computing Machinery, New York, NY, USA, 376–394.
+[32] Joshua Fried, Gohar Irfan Chaudhry, Enrique Saurez, Esha Choukse,                   doi:10.1145/3447786.3456248
+     Inigo Goiri, Sameh Elnikety, Rodrigo Fonseca, and Adam Belay. Mak-             [43] Dmitrii Kuvaiskii, Dimitrios Stavrakakis, Kailun Qin, Cedric Xing,
+     ing Kernel Bypass Practical for the Cloud with Junction. In Proceedings             Pramod Bhatotia, and Mona Vij. Gramine-TDX: A Lightweight OS
+     of the 21st USENIX Symposium on Networked Systems Design and Imple-                 Kernel for Confidential VMs. In Proceedings of the 2024 on ACM SIGSAC
+     mentation. USENIX Association, 55–73. https://www.usenix.org/                       Conference on Computer and Communications Security (CCS ’24). As-
+     conference/nsdi24/presentation/fried                                                sociation for Computing Machinery, New York, NY, USA, 4598–4612.
+[33] Joshua Fried, Zhenyuan Ruan, Amy Ousterhout, and Adam Belay.                        doi:10.1145/3658644.3690323
+     Caladan: Mitigating Interference at Microsecond Timescales. In Pro-            [44] Zijun Li, Zizheng Bian, Yi Tao, Bin Zha, Qiang Wang, Weidong Han,
+     ceedings of the 14th USENIX Conference on Operating Systems Design                  and Minyi Guo. RunD: A Lightweight Secure Container Runtime for
+     and Implementation (OSDI’20). USENIX Association, USA, 281–297.                     High-density Deployment and High-concurrency Startup in Serverless
+     doi:10.5555/3488766.3488782                                                         Computing. In 2022 USENIX Annual Technical Conference (USENIX
+[34] Alexander Fuerst, Stanko Novaković, Íñigo Goiri, Gohar Irfan                        ATC 22). 53–68. https://www.usenix.org/conference/atc22/
+     Chaudhry, Prateek Sharma, Kapil Arya, Kevin Broas, Eugene Bak,                      presentation/li-zijun-rund
+     Mehmet Iyigun, and Ricardo Bianchini. Memory-Harvesting VMs in                 [45] Anil Madhavapeddy and David J. Scott. Unikernels: Rise of the Virtual
+     Cloud Platforms. In Proceedings of the 27th ACM International Confer-               Library Operating System: What If All the Software Layers in a Virtual
+     ence on Architectural Support for Programming Languages and Oper-                   Appliance Were Compiled within the Same Safe, High-Level Language
+     ating Systems (ASPLOS ’22). Association for Computing Machinery,                    Framework? Queue 11, 11 (Nov. 2013), 30–44. doi:10.1145/2557963.
+     New York, NY, USA, 583–594. doi:10.1145/3503222.3507725                             2566628
+[35] Andreas Haas, Andreas Rossberg, Derek L. Schuff, Ben L. Titzer,                [46] Inc. Meta. Folly Fiber. https://github.com/facebook/folly/
+     Michael Holman, Dan Gohman, Luke Wagner, Alon Zakai, and JF                         blob/main/folly/fibers/README.md Accessed: 2026-03-10.
+     Bastien. Bringing the Web up to Speed with WebAssembly. In Pro-                [47] Tianxiang Miao and Haibo Chen. FlexCore: Dynamic Virtual Machine
+     ceedings of the 38th ACM SIGPLAN Conference on Programming Lan-                     Scheduling Using VCPU Ballooning. Tsinghua Science and Technology
+     guage Design and Implementation (PLDI 2017). Association for Comput-                20, 1 (Feb. 2015), 7–16. doi:10.1109/TST.2015.7040515
+     ing Machinery, New York, NY, USA, 185–200. doi:10.1145/3062341.
+
+                                                                               14
+[48] Amy Ousterhout, Joshua Fried, Jonathan Behrens, Adam Belay, and                   Association for Computing Machinery, New York, NY, USA, 1–16.
+     Hari Balakrishnan. Shenango: Achieving High CPU Efficiency for                    doi:10.1145/3447786.3456225
+     Latency-Sensitive Datacenter Workloads. In 16th USENIX Symposium             [61] Nicholas C. Wanninger, Joshua J. Bowden, Kirtankumar Shetty, Ayush
+     on Networked Systems Design and Implementation (NSDI 19). 361–378.                Garg, and Kyle C. Hale. Isolating Functions at the Hardware Limit
+     doi:10.5555/3323234.3323265                                                       with Virtines. In Proceedings of the Seventeenth European Conference on
+[49] Danilo Chiarlone Penna, Pedro Henrique.              Hyperlight Nan-              Computer Systems (EuroSys ’22). Association for Computing Machinery,
+     vix: POSIX Support for Hyperlight Micro-VMs.                   https:             New York, NY, USA, 644–662. doi:10.1145/3492321.3519553
+     //opensource.microsoft.com/blog/2026/01/28/hyperlight-                       [62] Xiao Zhang, Eric Tune, Robert Hagmann, Rohit Jnagal, Vrigo Gokhale,
+     nanvix-posix-support-for-hyperlight-micro-vms/                                    and John Wilkes. CPI2 : CPU Performance Isolation for Shared
+[50] Donald E. Porter, Silas Boyd-Wickizer, Jon Howell, Reuben Olinsky,                Compute Clusters. In Proceedings of the 8th ACM European Confer-
+     and Galen C. Hunt. Rethinking the Library OS from the Top Down.                   ence on Computer Systems. ACM, Prague Czech Republic, 379–391.
+     ACM SIGPLAN Notices 46, 3 (March 2011), 291–304. doi:10.1145/                     doi:10.1145/2465351.2465388
+     1961296.1950399                                                              [63] Shixuan Zhao, Mengyuan Li, Mengjia Yan, and Zhiqiang Lin. Ditto:
+[51] George Prekas, Marios Kogias, and Edouard Bugnion. ZygOS: Achiev-                 Elastic Confidential VMs with Secure and Dynamic CPU Scaling.
+     ing Low Tail Latency for Microsecond-scale Networked Tasks. In                    doi:10.48550/arXiv.2409.15542 arXiv:2409.15542
+     Proceedings of the 26th Symposium on Operating Systems Principles
+     (SOSP ’17). Association for Computing Machinery, New York, NY, USA,
+     325–341. doi:10.1145/3132747.3132780
+[52] Henry Qin, Qian Li, Jacqueline Speiser, Peter Kraft, and John
+     Ousterhout. Arachne: Core-Aware Thread Management. In 13th
+     USENIX Symposium on Operating Systems Design and Implementa-
+     tion (OSDI 18). 145–160. https://www.usenix.org/conference/
+     osdi18/presentation/qin
+[53] Zhenyuan Ruan, Seo Jin Park, Marcos K. Aguilera, Adam Belay, and
+     Malte Schwarzkopf. Nu: Achieving Microsecond-Scale Resource Fungi-
+     bility with Logical Processes. In 20th USENIX Symposium on Networked
+     Systems Design and Implementation (NSDI 23). 1409–1427. https:
+     //www.usenix.org/conference/nsdi23/presentation/ruan
+[54] Carlos Segarra, Pedro Henrique Penna, Enrique Saurez, Íñigo Goiri,
+     Peter Pietzuch, Shan Lu, and Rodrigo Fonseca. Nanvix: A Multikernel
+     OS Design for High-Density Serverless Deployments. doi:10.48550/
+     arXiv.2604.11669 arXiv:2604.11669 [cs.OS]
+[55] Carlos Segarra, Simon Shillaker, Guo Li, Eleftheria Mappoura, Rodrigo
+     Bruno, Lluís Vilanova, and Peter Pietzuch. GRANNY: Granular Man-
+     agement of Compute-Intensive Applications in the Cloud. In 22nd
+     USENIX Symposium on Networked Systems Design and Implementa-
+     tion (NSDI 25). 205–218. https://www.usenix.org/conference/
+     nsdi25/presentation/segarra
+[56] Mohammad Shahrad, Rodrigo Fonseca, Íñigo Goiri, Gohar Chaudhry,
+     Paul Batum, Jason Cooke, Eduardo Laureano, Colby Tresness, Mark
+     Russinovich, and Ricardo Bianchini. Serverless in the Wild: Charac-
+     terizing and Optimizing the Serverless Workload at a Large Cloud
+     Provider. In 2020 USENIX Annual Technical Conference (USENIX
+     ATC 20). 205–218. https://www.usenix.org/conference/atc20/
+     presentation/shahrad
+[57] Simon Shillaker and Peter Pietzuch. Faasm: Lightweight Isolation for
+     Efficient Stateful Serverless Computing. In 2020 USENIX Annual Tech-
+     nical Conference (USENIX ATC 20). 419–433. https://www.usenix.
+     org/conference/atc20/presentation/shillaker
+[58] Jovan Stojkovic, Chunao Liu, Muhammad Shahbaz, and Josep Torrellas.
+     HardHarvest: Hardware-Supported Core Harvesting for Microservices.
+     In Proceedings of the 52nd Annual International Symposium on Computer
+     Architecture (ISCA ’25). Association for Computing Machinery, New
+     York, NY, USA, 708–722. doi:10.1145/3695053.3731071
+[59] Volkmar Uhlig, Joshua LeVasseur, Espen Skoglund, and Uwe Dan-
+     nowski.       Towards Scalable Multiprocessor Virtual Machines.
+     In 3rd Virtual Machine Research & Technology Symposium (VM
+     04).       https://www.usenix.org/conference/vm-04/towards-
+     scalable-multiprocessor-virtual-machines
+[60] Yawen Wang, Kapil Arya, Marios Kogias, Manohar Vanga, Aditya
+     Bhandari, Neeraja J. Yadwadkar, Siddhartha Sen, Sameh Elnikety,
+     Christos Kozyrakis, and Ricardo Bianchini. SmartHarvest: Harvest-
+     ing Idle CPUs Safely and Efficiently in the Cloud. In Proceedings of
+     the Sixteenth European Conference on Computer Systems (EuroSys ’21).
+
+                                                                             15
+

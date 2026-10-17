@@ -1,0 +1,1441 @@
+     Direct Memory Translation for Virtualized Clouds
+                  Jiyuan Zhang                                              Weiwei Jia                                Siyuan Chai
+             University of Illinois                                University of Rhode Island                    University of Illinois
+          Urbana-Champaign, IL, USA                                    Kingston, RI, USA                      Urbana-Champaign, IL, USA
+
+                     Peizhe Liu                                            Jongyul Kim                                 Tianyin Xu
+             University of Illinois                                  University of Illinois                      University of Illinois
+          Urbana-Champaign, IL, USA                               Urbana-Champaign, IL, USA                   Urbana-Champaign, IL, USA
+
+Abstract                                                                             ACM Reference Format:
+Virtual memory translation has become a key performance                              Jiyuan Zhang, Weiwei Jia, Siyuan Chai, Peizhe Liu, Jongyul Kim,
+                                                                                     and Tianyin Xu. 2024. Direct Memory Translation for Virtualized
+bottleneck of memory-intensive workloads in virtualized
+                                                                                     Clouds. In 29th ACM International Conference on Architectural Sup-
+cloud environments. On the x86 architecture, a nested trans-
+                                                                                     port for Programming Languages and Operating Systems, Volume 2
+lation needs to sequentially fetch up to 24 page table en-                           (ASPLOS ’24), April 27-May 1, 2024, La Jolla, CA, USA. ACM, New
+tries (PTEs). This paper presents Direct Memory Translation                          York, NY, USA, 18 pages. https://doi.org/10.1145/3620665.3640358
+(DMT), a hardware-software extension for x86-based virtual
+memory that minimizes translation overhead while main-
+taining backward compatibility with x86. In DMT, the OS                              1    Introduction
+manages last-level PTEs in a contiguous physical memory
+region, termed Translation Entry Areas (TEAs). DMT estab-                            Virtual memory translation has become a major performance
+lishes a direct mapping from each virtual page in a Virtual                          bottleneck of memory-intensive workloads, especially in vir-
+Memory Area (VMA) to the corresponding PTE in a TEA.                                 tualized cloud environments. Upon a TLB miss, a nested
+Since processes manage memory with a handful of major                                address translation on the x86 architecture needs to perform
+VMAs, the mapping can be maintained per VMA and ef-                                  a two-dimensional page table walk, which requires up to 24
+fectively stored in a few dedicated registers. DMT further                           sequential memory accesses. It is reported that nested transla-
+optimizes virtualized memory translation via guest-host co-                          tion can take more than 50% of the execution time of memory-
+operation by directly allocating guest TEAs in physical mem-                         intensive workloads in virtualized environments [5, 20, 45].
+ory, bypassing intermediate virtualization layers. DMT is                            With the rapid growth of memory capacity and irregular
+inherently scalable—it takes one, two, and three memory                              memory access patterns of emerging workloads, TLB misses
+references in native, virtualized, and nested virtualized se-                        are becoming more frequent, with increased overhead.
+tups. Its scalability enables hardware-assisted translation for                         Recent support for five-level page tables in new proces-
+nested virtualization. Our evaluation shows that DMT signif-                         sors [30, 81] may further slow down memory translation—a
+icantly speeds up page walks by an average of 1.58x (1.65x                           nested translation would require up to 35 sequential mem-
+with THP) in a virtualized setup, resulting in 1.20x (1.14x                          ory accesses. In addition, new cloud deployment modes
+with THP) speedup of application execution on average.                               for multi-level virtualization require higher dimensional
+                                                                                     page table walks. For example, nested virtualization [11, 28]
+CCS Concepts: • Software and its engineering → Oper-                                 runs hypervisors inside virtual machines (VMs). Currently,
+ating systems; Virtual memory; • Computer systems                                    nested virtualization is supported by shadow paging on top
+organization → Architectures.                                                        of nested translation, bearing the known cost of frequent VM
+                                                                                     exits [1, 11]. However, extending hardware-assisted transla-
+Keywords: Cloud Computing, Virtualization, Virtual Mem-
+                                                                                     tion to three (or more) dimensions of page tables is untenable.
+ory, Address Translation
+                                                                                        To address the pressing overhead of memory translation,
+Permission to make digital or hard copies of all or part of this work for            advanced software and hardware designs are proposed [3,
+personal or classroom use is granted without fee provided that copies                4, 6, 10, 15, 17, 19, 20, 25, 26, 29, 37–40, 43–47, 55, 56, 58–
+are not made or distributed for profit or commercial advantage and that
+copies bear this notice and the full citation on the first page. Copyrights          61, 63, 64, 80, 84]. However, translation overhead remains
+for components of this work owned by others than the author(s) must                  substantial in virtualized environments. Existing designs that
+be honored. Abstracting with credit is permitted. To copy otherwise, or              reduce page table walks (e.g., using huge pages [35, 40, 55,
+republish, to post on servers or to redistribute to lists, requires prior specific   56]) cannot eliminate sequential memory accesses. Transla-
+permission and/or a fee. Request permissions from permissions@acm.org.               tion caching and prefetching [9, 39, 44–46, 63, 84] can save
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+                                                                                     (or hide) memory access overhead; however, even with per-
+© 2024 Copyright held by the owner/author(s). Publication rights licensed
+to ACM.                                                                              fect caching, the translation still needs to sequentially fetch
+ACM ISBN 979-8-4007-0385-0/24/04                                                     tens of Page Table Entries (PTEs) from the cache hierarchy,
+https://doi.org/10.1145/3620665.3640358                                              which takes orders of magnitude more cycles than a TLB hit.
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA            Jiyuan Zhang, Weiwei Jia, Siyuan Chai, Peizhe Liu, Jongyul Kim, and Tianyin Xu
+
+
+   This paper presents Direct Memory Translation (DMT), a            number of sequential steps from 1, 3, and 7 to 1, 2, and 3
+hardware-software extension for x86-based virtual memory             in native, virtualized, and nested virtualized setups, respec-
+that minimizes address translation overhead while maintain-          tively. To ensure isolation and prevent side channels, pvDMT
+ing backward compatibility with x86. DMT co-designs the              restricts that a guest can only map its virtual pages to its
+translation hardware together with OS memory manage-                 own TEAs (instead of arbitrary physical addresses), with a
+ment to reduce translation overhead to what is absolutely            mechanism similar to Intel EPTP switching [32]. As DMT
+necessary—directly fetching the translation that maps a vir-         scales linearly with the levels of virtualization, it enables
+tual page to the corresponding physical page frame (in x86,          hardware-assisted translation for nested virtualization.
+the translation is stored in the last-level PTEs of radix page           We prototype DMT based on the x86 architecture and
+tables). DMT achieves only one, two, and three memory ref-           Linux/KVM. DMT requires simple hardware support that
+erences in native, virtualized, and nested virtualized setups.       equips each processor core with 16 registers and simple PTE
+   The high-level idea of DMT is to establish a direct map-          fetch logic. The hardware support is similar to ASAP PTE
+ping from each virtual page to the corresponding last-level          prefetcher [45], which is backward compatible with x86 and
+PTE that stores the translation. The mapping can be effec-           thus considered practical. DMT supports all existing virtual
+tively maintained at the granularity of Virtual Memory Areas         memory features, such as huge pages and page sharing, and
+(VMAs). VMAs are contiguous virtual memory regions in                is transparent to x86 binaries. We evaluate DMT with a range
+process address space; they are mostly allocated at the ini-         of data-intensive workloads and compare DMT with four
+tialization time and are infrequently changed at runtime.            other advanced designs, including FPT [59], ECPT [64, 66],
+DMT manages the mapping from each VMA to a contiguous                Agile Paging [20], and ASAP [45]. Our results show that
+physical memory region (termed TEA, or Translation Entry             pvDMT can effectively speed up page table walks by 1.58x
+Area) that stores last-level PTEs of pages in the VMA in or-         (1.65x with THP) in a virtualized environment, resulting in
+der. Similar to VMAs, TEAs are managed by the OS. Since              1.20x (1.14x with THP) speedup of workload execution on
+processes manage memory with a handful of major VMAs                 average; it substantially outperforms other advanced designs
+(§2.3), the VMA-to-TEA mapping can be effectively stored in          like ECPT [66] by 1.16x–1.31x (1.25x–1.51x with THP) in
+a few dedicated registers (16 in our implementation). In case        a virtualized environment. DMT’s performance gains on
+that processes have more than 16 VMAs, DMT merges adja-              nested virtualization are more substantial.
+cent VMAs and/or maps the largest VMAs in the available                  In summary, the paper makes the following contributions:
+registers. With the mapping in place, DMT directly locates
+                                                                           • Direct memory translation (DMT), a practical hardware-
+the last-level PTE in a TEA for a given page in a VMA.
+                                                                             software extension for x86-based virtual memory to
+   DMT is inherently more scalable than existing x86 radix-
+                                                                             minimize address translation overhead. DMT co-designs
+tree based translation design, as it directly fetches last-level
+                                                                             the translation hardware and OS memory management
+PTEs, without sequential page table work or resorting to
+                                                                             so that sequential page table walks are replaced by di-
+page walk caches. Note that such property also exists in
+                                                                             rectly fetching last-level PTEs.
+hash-based translation [64–66, 69, 80]. DMT has a few ad-
+                                                                           • An optimization of DMT in virtualized setups using
+vantages over hash-based designs: (1) DMT uses fixed-size
+                                                                             paravirtualization that further reduces translation over-
+TEAs instead of hash tables, which greatly simplifies the
+                                                                             head to two memory references for virtualization and
+design. The rationale is that VMAs usually remain static
+                                                                             three for nested virtualization.
+after creation; enlarging and shrinking VMAs that require
+                                                                           • An implementation of DMT on x86 and Linux/KVM.
+costly TEA modifications are rare. Hash-based designs, on
+                                                                             The DMT prototype and other artifacts are available
+the other hand, cannot know the number of PTEs apriori
+                                                                             at: https://github.com/xlab-uiuc/dmt.
+and thus need to resize the hash tables as PTEs are added
+or removed; (2) DMT avoids hash collisions [80] and/or re-
+duces parallel lookups [64, 66]; and (3) Although both TEAs          2     Background
+and hash tables need contiguous physical memory, DMT is              2.1    Address Translation in Virtualized Clouds
+more flexible because it can split its tables when contiguous        In this section, we provide a brief overview of the existing
+memory is unavailable or fall back to the baseline design.           page table structure, the architectural support for virtualized
+   We further optimize DMT for virtualized environments.             memory, and the design for nested virtualization.
+Specifically, DMT employs guest-host cooperation (aka par-
+avirtualization) to directly allocate guest TEAs in physical         2.1.1 Radix Page Tables. Radix page table is the de facto
+memory—guest TEAs always reside in a contiguous physical             design of most current architectures, which organizes the
+memory region of the host. We refer to the optimized de-             page table entries (PTEs) in a multi-level radix tree. Cur-
+sign as pvDMT, which bypasses intermediate virtualization            rently, the x86-64 architecture implements a 4-level tree. To
+layers and thus accelerates multi-dimensional page walks.            translate a memory address upon a TLB miss, the memory
+Compared to hashed page tables [80], pvDMT reduces the               management unit (MMU) walks over each level of the tree
+Direct Memory Translation for Virtualized Clouds                                                                        ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+ VA                                                                                                   the hPA of gL𝑖 by referring to the hPT, from hL4 to hL1 . The
+       VA[47:39]           VA[38:30]   VA[29:21]         VA[20:12]    VA[11:0]
+                                                                                                      above process corresponds to Steps 1–20 in Figure 2. Second,
+      CR3       +          L4      +   L3      +         L2      +   L1          +           PA       to obtain the hPA from the gPA, the hardware needs to fur-
+                                                                                                      ther walk over the hPT (Steps 21–24 in Figure 2). For 4-level
+Figure 1. Address translation in a native environment.                                                radix page tables, the 2D page table walk requires up to 24
+DMT directly fetches the last-level entry (highlighted).                                              memory references, as shown in Figure 2. With 5 levels, it
+                                                                                                      takes up to 35 memory references.
+sequentially, as shown in Figure 1. Therefore, in the worst                                              Even when MMU caches and huge pages are used, the 2D
+case, a page table walk requires four sequential memory ac-                                           page table walks remain expensive and can take more than
+cesses. x86-64 supports huge pages of 2MB and 1GB. For                                                50% of the execution time of memory-intensive workloads [5,
+huge pages, the translation is shortened by one or two levels.                                        20, 45].
+   To accommodate emerging terabyte-scale memory capac-                                                  An alternative to hardware-assisted translation is shadow
+ity, Intel extends the radix page table to five levels [30, 81],                                      paging [20, 74], where the hypervisor builds a shadow page
+which further increases the page-table walk cost.                                                     table (sPT) by combining gPT and hPT. While a guest OS
+2.1.2 Virtualized Memory Translation. Virtualization                                                  manages gPT, the hypervisor maintains the sPT to map gVA
+significantly enlarges memory translation overhead. A guest                                           to hPA, and the translation takes a native page walk (§2.1.1).
+OS manages its page table independently from the host (the                                            However, any update of the gPT must be synchronized with
+hypervisor) and runs on virtualized physical memory. There-                                           the sPT, causing frequent VM exits [1, 2]. It is known that
+fore, a guest virtual address (gVA) needs to first be translated                                      shadow paging incurs substantial overhead, e.g., it is reported
+into a guest physical address (gPA) which is further translated                                       that hardware-assisted translation speeds up applications up
+into a host physical address (hPA).                                                                   to 48% over shadow paging [72].
+
+ gVA          gCR3 nCR3
+                                                                                                      2.1.3 Nested Virtualization. Nested virtualization [11]
+    gVA             gL          hL4     hL3        hL2         hL1    gL4
+    [47:39]    + gPA4            1       2          3           4      5
+                                                                                                      runs hypervisors inside virtual machines (VMs), creating
+                                                                                                      multiple levels of virtualization. It is widely offered by cloud
+                                                                                                      vendors [7, 14, 82] and enables many use cases [11, 28, 42,
+                                                                                     Walks to guest
+                                                                                     last-level PTE
+
+
+
+
+    gVA
+    [38:30]
+               + gL3
+                 gPA
+                                hL4
+                                 6
+                                        hL3
+                                         7
+                                                   hL2
+                                                    8
+                                                               hL1
+                                                                9
+                                                                      gL3
+                                                                      10
+                                                                                                      83]. For example, Windows 10/11 runs a type-1 hypervi-
+    gVA             gL
+                                                                                                      sor (Hyper-V) for kernel integrity [50] and Linux interop-
+                                hL4     hL3        hL2         hL1    gL2
+    [29:21]    + gPA2           11      12         13          14     15                              erability [49]; therefore, nested virtualization needs to be
+                                                                                                      supported for Windows 10/11 on a VM [50, 73].
+    gVA
+    [20:12]    + gL1
+                 gPA
+                                hL4
+                                16
+                                        hL3
+                                        17
+                                                   hL2
+                                                   18
+                                                               hL1
+                                                               19
+                                                                      gL1
+                                                                      20
+                                                                                                         Currently, no architectural support is available for mem-
+                                                                                                      ory translation of nested virtualization. One main reason is
+                                                                                                      that, with the current x86 design, nested virtualized mem-
+    gVA             Data        hL4     hL3        hL2         hL1
+                    gPA         21      22         23          24
+                                                                      +              hPA              ory translation would require a three-dimensional (3D) page
+    [11:0]
+                                                                                                      table walk, which has an untenable overhead.
+                                Walks to host last-level PTE                                             Now, nested virtualiza-
+                                                                                                                                                  𝕃2 Virtual Addr.
+                                                                                                      tion is implemented by                                        𝕃2PT
+Figure 2. Two-dimensional (2D) address translation in                                                 mapping the three levels                    𝕃2 Physical Addr.
+a virtualized environment. DMT aims to fetch only two                                                 of page tables onto the               𝕃1PT
+translation entries (highlighted).                                                                    two levels of nested pag-                   𝕃1 Physical Addr. sPT
+   Modern architectures support hardware-assisted virtu-                                              ing (§2.1.2), where the page          𝕃0PT
+alized memory translation, aka nested paging (e.g., Intel                                             tables of the two hypervi-                  𝕃0 Physical Addr.
+EPT [32] and AMD NPT [16]). Nested paging uses two layers                                             sors are compressed into
+of page tables: each guest OS maintains a guest page table                                            one sPT, as shown in Fig-
+                                                                                                                                          Figure 3. Address space
+(gPT) that maps gVAs to gPAs, and the hypervisor manages                                              ure 3. The L0 hypervisor
+                                                                                                                                          and page tables in nested
+a host page table (hPT) per guest that maps gPAs to hPAs.                                             maintains an sPT that maps
+                                                                                                                                          virtualization.
+To translate a gVA to hPA upon a TLB miss, the hardware                                               L2 PA to L0 PA, combined
+issues a two-dimensional (2D) page table walk, as illustrated                                         from L1 PT and L0 PT. To translate an L2 VA into L0 PA needs
+in Figure 2. We use circular boxes to denote levels of the                                            a 2D page table walk across L2 PT and sPT, so that the L2 VA
+host page table (hL𝑖 ) and square boxes to denote levels of                                           is translated to L2 PA, then to L0 PA. The implementation
+the guest page table (gL𝑖 ). First, to obtain the gPA from gVA,                                       uses a combination of nested paging and shadow paging to
+the hardware needs to walk over each level of the gPT, from                                           accommodate three page tables. Hence, it suffers from the
+gL4 to gL1 . To access each gL𝑖 , the hardware needs to know                                          overheads caused by both.
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                                        Jiyuan Zhang, Weiwei Jia, Siyuan Chai, Peizhe Liu, Jongyul Kim, and Tianyin Xu
+
+
+                       Native All           Virt nPT All     Virt sPT All     Nested All         Table 1. VMA characteristics of various workloads: “To-
+                       Native PW            Virt nPT PW      Virt sPT PW      Nested PW          tal” number of VMAs, the number of VMAs that cover 99% of
+Execution Time
+
+
+
+                                     13.9
+ Normalized
+
+
+
+
+                 5.0                                                                             Total (“99% Cov.”), and the number of VMA “Clusters” with
+                 4.0
+                 3.0                                                                             small bubbles of less than 2% in total to cover 99% of Total
+                 2.0
+                 1.0                                                                             (Memcached’s 778 VMAs can be covered by two clusters).
+                 0.0
+                        Red
+                            is          ed PS
+                                    cach GU          BTr
+                                                        ee     neal SBench aph500 . Mean
+                                                           Can            Gr    Geo
+                                 Mem                               X                                             Workload (WL)                     Total   99% Cov.              Clusters
+                                                                                                                 BTree                              109       2                     2
+Figure 4. Execution time of seven benchmarks under                                                               Canneal                            116       2                     2
+(1) native, (2) virtualized (with nested paging), (3) virtu-                                                     Graph500                           105       1                     1
+alized (with shadow paging), and (4) nested virtualized                                                          GUPS                               103       1                     1
+environments. The numbers are normalized to the execu-                                                           Redis                              182       6                     6
+                                                                                                                 XSBench                            111       1                     1
+tion time of the native environment. The page-table walk
+                                                                                                                 Memcached                         1,065     778                    2
+overhead is highlighted.                                                                                         SPEC CPU 2006 (30 WLs)            18–39    1–14                   1–8
+                                                                                                                 SPEC CPU 2017 (47 WLs)            24–70    1–21                  1–12
+
+2.2               Translation Overhead in Virtualized Clouds
+                                                                                                                         SPEC CPU 2006                                     SPEC CPU 2017
+Figure 4 shows the address translation overhead of native,                                                 100                              100                            100
+virtualization (including both nested paging and shadow
+
+
+
+                                                                                                 CDF (%)
+
+
+
+
+                                                                                                                                  CDF (%)
+
+
+
+
+                                                                                                                                                                 CDF (%)
+paging), and nested virtualization on an x86 server machine,
+respectively, under various workloads. The measurement                                                      50                              50                              50
+methodology and the machine configuration are detailed in
+§5. Compared with the native environment, virtualization
+                                                                                                            0                                0                               0
+increases the execution time by 1.46x on average, due to                                                         20     40 60                 0     5 10 15 20                    2 4 6 8 10 12
+the overhead of a two-dimensional (2D) page table walk                                                                (a) Total                   (b) 99% Cov.                     (c) Clusters
+(§2.1.2). Nested virtualization further increases execution                                      Figure 5. CDFs of the three VMA characteristics in
+time by 4.13x on average. Specifically, on average, the page                                     Table 1 of SPEC CPU 2006 and 2017 benchmarks. (con-
+table walk overhead of native, virtualization, and nested                                        taining 30 and 47 workloads, respectively).
+virtualization are 21%, 43%, and 48%. Nested virtualization
+incurs an additional overhead of sPT (§2.1.3).
+   To quantify the sPT overhead, we compare the execution                                        show the measured VMA characteristics. Our results validate
+time in the virtualized environment, using hardware-assisted                                     the reported observation in most workloads. In all workloads
+nested paging and shadow paging, respectively. On average,                                       except Memcached and two workloads in the SPEC CPU
+shadow paging increases the total execution time by 1.39x                                        2017 benchmark (548.exchange2_r and 648.exchange2_s), 16
+compared to nested paging, even though the page table walk                                       VMAs cover 99% of the working set. We observe that the
+is simplified (28% page table walk overhead).                                                    heap VMA covers most of the working set. The two SPEC
+   In short, address translation overhead in virtualized en-                                     CPU 2017 workloads have 20 and 21 VMAs respectively,
+vironments, including both single-level and nested virtual-                                      while Memcached has 778 VMAs. Despite the large number
+ization, is excessive for memory-intensive workloads. The                                        of VMAs, we observe that those VMAs are close to each other
+overhead is expected to be higher with 5-level page tables.                                      in the virtual address space, with small bubbles in between
+                                                                                                 (e.g., less than 16KB in Memcached). If we cluster adjacent
+2.3               Virtual Memory Area                                                            VMAs with an allowance of 2% of bubbles in total, 99% of
+VMA is an OS abstraction of contiguous regions in the virtual                                    the working set can be covered by less than 12 VMA clusters
+address space of a process. Each VMA contains a set of virtual                                   in all the workloads. Hence, DMT works at the granularity
+pages with the same protection, representing a local data                                        of VMAs or VMA clusters.
+section (e.g., code, data, heap, stack, or a memory-mapped
+file) [22]. It has a base virtual address and size of the mapped                                 3           Direct Memory Translation
+region, along with other metadata. Collectively, VMAs of a                                       Direct Memory Translation (DMT) is a hardware-software
+process constitute the application’s working set [25].                                           extension for x86-based virtual memory to minimize address
+   There are typically a few hundred VMAs in a modern                                            translation overhead while retaining backward compatibility
+process. On the other hand, it is reported that only a hand-                                     with the x86 architecture. DMT reduces translation overhead
+ful of them are of significant size and are frequently ac-                                       to what is necessary—directly fetching the last-level PTEs of
+cessed [25, 45]. To validate this observation, we measure                                        the x86 radix page tables without sequentially walking the
+VMA characteristics of different applications as well as the                                     page tables or resorting to page walk caches. The last-level
+SPEC CPU 2006 and 2017 benchmarks. Table 1 and Figure 5                                          PTE contains the translation that maps a virtual page to the
+Direct Memory Translation for Virtualized Clouds                                     ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+               Virtual Memory            Physical Memory                      VA          VPN             Page offset
+
+
+                   Page 1                                                          Base         VMA            Base
+                                                                                            1            2
+                                                                                   addr         offset         addr
+
+
+
+
+                                                                                                                                   TEA
+       VMA 1
+
+
+
+                                                   PTE 1
+
+
+
+
+                                                           TEA 1
+
+
+
+
+                                                                    VMA
+                   Page 2                          PTE 2
+                                                                            Page
+
+
+
+
+                                                    …
+                     …
+
+
+                                                   PTE N
+                                                                                                  PTE
+                  Page N
+       VMA 2
+
+
+
+
+                                                           TEA 2
+                                                                                    PA           PFN             Page offset
+
+
+Figure 6. Basic idea of direct memory translation. Each            Figure 7. Direct memory translation procedure. DMT
+VMA has a corresponding TEA (managed by the OS) which              directly fetches the last-level PTE of the virtual page based
+contains last-level PTEs of pages in VMAs in the same order.       on the VMA-to-TEA mapping.
+
+physical page frame. DMT can achieve one, two, and three           with x86 and thus avoids disruptive changes to MMUs, page
+memory accesses in native, virtualized, and nested virtual-        tables, and virtual memory abstractions. The design makes
+ized setups (with paravirtualization-based optimizations).         the right tradeoffs: (1) VMAs mostly remain static after cre-
+   The high-level idea is to establish a direct mapping from       ation; enlarging and shrinking VMAs that require OS in-
+each virtual page to the corresponding last-level PTE in phys-     volvement for TEA modifications are rare; (2) the OS is in
+ical memory. DMT maintains the mapping based on the VMA            the right position to dynamically merge or split TEAs, based
+abstraction (§2.3), because (1) processes manage memory            on memory contiguity or other policies.
+with a handful of VMAs (§2.3) and (2) VMAs are mostly allo-           Conceptually, DMT resembles the translation using a lin-
+cated at the initialization time and are infrequently changed      ear page table [41] which stores all PTEs in a single array
+at runtime. Since each VMA is a contiguous virtual memory          indexed by the VPN, where each TEA is analogous to a linear
+region consisting of multiple virtual pages, DMT maps the          page table of the VMA. Managing TEAs at the granularity of
+VMA to a contiguous physical memory region containing              VMAs solves the space inefficiency of traditional linear page
+the last-level PTEs of the virtual pages in the VMA. We term       tables that map to the entire process address space. Com-
+the contiguous physical region Translation Entry Area (TEA).       pared to hash-based translation, the DMT design greatly sim-
+The size of a TEA is orders of magnitude smaller than its          plifies the translation hardware; for example, DMT avoids
+corresponding VMA, in the same scale as how a PTE size             hash collisions [80] and parallel lookups [64]. Moreover, it is
+compares to page sizes; hence, the contiguity requirement of       compatible with the current x86 architecture and can always
+TEA is viable (discussed in §7). Figure 6 illustrates the direct   fall back to the default translation mechanism.
+VMA-to-TEA mappings established by DMT.                               Note that DMT does not create additional copies of PTEs.
+   The VMA-to-TEA mapping can be efficiently stored in a           Hence, PTE access and dirty bits work in the same way as
+few dedicated hardware registers (§4.1). These registers are       the existing system, with no race condition. For the same
+a part of the task state—during a context switch, registers        reason, it does not incur TLB shootdown due to TEA invali-
+of the new process are reloaded. Our implementation uses           dations. DMT does not prefetch PTEs either. Prefetching is
+16 registers, which is sufficient for most applications (§2.3).    less effective in virtualized environments. A large number
+In case processes have more than 16 VMAs, DMT either               of PTEs may cause cache contention. More importantly, the
+maps the largest VMAs in the available registers or clusters       translation still needs to fetch many PTEs from the cache
+adjacent VMAs with bubbles in the TEA (§4.2).                      hierarchy sequentially with substantial overhead (§6.2.2).
+   With the VMA-to-TEA mapping in place, DMT directly
+locates the last-level PTE for a given virtual address (VA).       3.1    DMT for Virtualization
+Figure 7 illustrates the translation procedure: 1 with the         DMT can be directly applied to virtualized environments, as
+VMA base address, DMT calculates the virtual page number           shown in Figure 8. DMT would take three memory references
+(VPN) offset of the VA inside the VMA; 2 with the TEA              to translate a guest virtual address (gVA) to the host physical
+base address, DMT indexes the target PTE using the VPN             address (hPA). The translation procedure is as follows (we
+offset. As such, in the native case, DMT always takes only         use prefixes “g” and “h” to refer to the guest and the host,
+one memory reference to fetch the last-level PTE.                  respectively): (1) DMT calculates the guest physical address
+   A conscious design principle of DMT is to simplify hard-        (gPA) of the last-level guest PTE (gPTE) based on the gVMA-
+ware translation by co-designing OS memory management              to-gTEA mapping; it then translates the gPA to the hPA
+for TEAs. This principle makes DMT backward-compatible             of the gPTE using the hVMA-to-hTEA mapping based on
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                   Jiyuan Zhang, Weiwei Jia, Siyuan Chai, Peizhe Liu, Jongyul Kim, and Tianyin Xu
+
+
+                            Guest Physical                                                         𝕃2 Physical       𝕃1 Physical
+    Guest Virtual                                     Host Physical               𝕃2 Virtual        (𝕃1VMA)           (𝕃0VMA)          𝕃0 Physical
+                              (hVMA)
+
+
+                                                                                                                                         𝕃0TEA
+                                                         hTEA                                                          𝕃1TEA
+
+                                                                                  𝕃2VMA              𝕃2TEA                               𝕃1TEA
+       gVMA                     gTEA
+                                                                                                                       𝕃2TEA
+                                                         gTEA                                                                            𝕃2TEA
+
+
+
+                                                                            Figure 9. DMT for nested virtualization (solid line: VMA-
+Figure 8. DMT for virtualized environments (solid line:
+                                                                            to-TEA mapping; dashed line: VM address mapping). With
+VMA-to-TEA mapping; dashed line: VM address mapping).
+                                                                            pvDMT, L1 TEAs and L2 TEAs are contiguous in L0 physical
+With pvDMT, gTEAs are contiguous in the host physical
+                                                                            memory space and do not need to be contiguous in the L1
+memory space and do not need to be contiguous in the guest
+                                                                            and L2 physical memory space.
+physical memory space.
+
+
+                                                                            3.2     DMT for Nested Virtualization
+the host PTE (hPTE); (2) DMT fetches the gPTE in physical                   The idea of DMT (including pvDMT) can further be applied
+memory and obtains the gPA of the target data page; and                     to nested virtualization, as shown in Figure 9. In the case of
+(3) DMT finds the hPA of the target data page using the                     pvDMT, in nested virtualization, the TEAs at L2 , L1 , and L0
+corresponding hPTE via the hVMA-to-hTEA mapping.                            are all allocated in contiguous host physical memory regions.
+   The above procedure achieves the best-case scenario as                   As a result, pvDMT takes at most three memory references
+hash-based designs [66, 80] without hash collisions and paral-              to translate an L2 VA to L0 PA, with the following procedure:
+lel lookups, e.g., Nested ECPT [66] also take three sequential              (1) DMT fetches the L2 PTE based on the L2 VMA-to-L2 TEA
+accesses but multiple (up to 81) parallel ones.                             mapping and then translates L2 VA to L2 PA; (2) DMT fetches
+                                                                            the L1 PTE based on the L1 VMA-to-L1 TEA mapping and
+   Paravirtualization. We further optimize DMT for vir-
+                                                                            then translates L2 PA to L1 PA; and (3) DMT obtains L0 PA.
+tualized environments to only two memory references with
+                                                                               Since pvDMT scales linearly with the levels of virtual-
+guest-host cooperation (aka paravirtualization). The opti-
+                                                                            ization, it can enable hardware-assisted address translation
+mized DMT, named pvDMT, allocates gTEAs directly in the
+                                                                            for nested virtualization. The hardware-assisted translation
+host physical memory—gTEAs always reside in contiguous
+                                                                            could eliminate the major overhead of nested virtualization
+host physical memory regions managed by the hypervisor.
+                                                                            caused by shadow paging for synchronizing the L1 and L0
+With pvDMT, the gVMA-to-gTEA mappings are built directly
+                                                                            page tables (§2.1.3). Note that hardware-assisted translation
+from gVA to hPA, bypassing the indirection in the guest
+                                                                            for nested virtualization is untenable in traditional radix-tree
+physical address space; the host maintains hVMA-to-hTEA
+                                                                            based design or the recent ECPT design, both of which takes
+mappings in the same way as in the native case (Figure 6).
+                                                                            an excessive number of memory accesses for single-level vir-
+An hVMA is the hypervisor’s VMA corresponding to the
+                                                                            tualization already (24 sequential accesses with radix page
+guest physical address space of a virtual machine. Note that
+                                                                            tables and 81 parallel accesses with Nested ECPT).
+pvDMT does not require gTEA to be placed in contiguous
+guest physical memory space.
+   Essentially, pvDMT fetches only two PTEs: (1) the last-                  4     Design and Implementation
+level gPTE that maps gVA to the gPA via the gVMA-to-gTEA                    DMT can be practically supported on modern architectures
+mapping, and (2) the last-level hPTE that maps the gPA                      and operating systems with simple hardware extensions.
+to the hPA via the hVMA-to-hTEA mapping. These two                          The hardware extension includes a set of registers for main-
+PTEs are the ones highlighted in Figure 2. pvDMT brings                     taining VMA-to-TEA mappings and simple translation logic
+substantial performance advantages over the state of the art                in MMU for fetching last-level PTEs (§4.1). The hardware
+in virtualized environments, where PTEs are harder to cache                 extension is similar to the one in the ASAP prefetcher [45].
+compared with the native environment.                                          The main effort of enabling DMT is to design and im-
+   Note that pvDMT needs to be carefully designed to ensure                 plement the OS support for (1) dynamically managing the
+isolation. Our design restricts that a guest can only map its               VMA-to-TEA mappings (§4.2), (2) effectively managing TEAs
+virtual pages to its own TEAs using a mechanism similar to                  (§4.3), (3) supporting modern virtual memory features such
+Intel EPTP switching, eliminating side channels (see §4.5.2).               as huge pages (§4.4), and (4) virtualization support and the
+Direct Memory Translation for Virtualized Clouds                                                    ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+                                               DMT          Nested registers          Virtual         Physical             Virtual
+                      TLB                      Fetcher    Guest registers             Memory          Memory               Memory
+                        TLB miss                         Host registers
+                                                            Register 1
+        x86 Page             DMT                                                                                                               TEA
+
+
+
+
+                                                                …
+         Walker             Fetcher                                                    VMA                                                      1
+                                                           Register 16                  1
+                                                                                                       TEA
+                        PTE       Last-level                                                                                VMA
+          PWC                                                   Filter                 VMA
+                        content   PTE access
+ PWC miss       hit                                                                     2                                                      TEA
+                                               VA         Matched Mapping
+                Memory                                                                                                                          2
+                Hierarchy                                   Direct Mapping
+                                                                    PTE PA
+                                                                                        (a) Mapping Merging                   (b) Mapping Splitting
+Figure 10. Overview of the DMT hardware extension.
+                                                                                Figure 11. The VMA-to-TEA mapping can be dynami-
+                                                                                cally merged (§4.2.1) and splitting (§4.2.2).
+paravirtualization-based optimization (pvDMT) for both single-
+level and nested virtualization (§4.5). We prototype the OS
+support for DMT on top of the Linux kernel v5.15.0, referred                    4.2     VMA-to-TEA Mapping Management
+to as DMT-Linux (§4.6). Our experience shows that DMT-
+                                                                                The OS (i.e., DMT-Linux) manages the VMA-to-TEA map-
+Linux can be practically implemented.
+                                                                                pings and stores them in the DMT registers (§4.1). For each
+4.1    Hardware Extension                                                       process, DMT-Linux sorts the VMAs in descending order
+                                                                                based on their sizes and stores mappings that cover the
+Figure 10 depicts the hardware extension required by DMT,                       largest VMAs in the registers. DMT-Linux prioritizes storing
+named DMT Fetcher. A DMT fetcher includes a set of ded-                         large VMAs in registers rather than hot VMAs. Large VMAs
+icated registers and fast translation logic. It co-exists with                  are typically for heap and memory-mapped regions that are
+the current x86 page table walker. The DMT fetcher is com-                      the primary causes of page table walks. Small but hot VMAs
+patible with the x86 architecture and works with existing                       mostly represent dynamically linked libraries and the stack,
+architecture structures. The TLB, x86 page table walker, and                    which are frequently accessed and rarely cause TLB misses
+MMU caches (e.g., page walk caches) are untouched.                              due to high temporal locality [45].
+   The DMT fetcher maintains a number of registers (16 in                          Managing VMA-to-TEA mappings needs to address the
+our implementation, §5). Each register stores a VMA-to-TEA                      following challenges: (1) there can be many more VMAs (e.g.,
+mapping. These registers are available for each hardware                        Memcached in Table 1) than the number of DMT registers, so
+thread and are exposed to the OS as part of the task state.                     per-VMA mapping may not reach a high coverage; (2) given
+The registers are updated by the OS on events like context                      that TEA requires contiguous memory space, it could be
+switches and interrupts in virtual machines.1                                   difficult to allocate a large TEA in highly fragmented mem-
+   Upon a TLB miss, a page table walk request is handled by                     ory; and (3) mapping management needs to accommodate
+the DMT fetcher or falls back to the x86 page table walker,                     potential changes of VMAs.
+depending on whether the requested address is covered by
+the mappings in the registers. If the corresponding VMA-                        4.2.1 Merging VMA-to-TEA Mappings. DMT-Linux may
+to-TEA mapping is present in a register, the DMT fetcher                        merge mappings of closely located VMAs to increase the
+directly locates the last-level PTE (§3). We expect that 99+%                   memory coverage of the registers, as shown in Figure 11(a).
+of the page table walk requests are served by the DMT fetcher                   Upon creating a new mapping, DMT-Linux checks whether
+because a handful of VMAs or VM clusters typically cover                        the target VMA can be clustered with the adjacent VMAs.
+99% of the memory footprint of data-intensive workloads                         DMT-Linux uses a configurable threshold 𝑡 to make the de-
+(see §2.3). DMT dynamically clusters adjacent VMAs for                          cision based on the ratio of the bubbles (𝑡 is set to 2% by
+workloads that have large numbers of VMAs (§4.2).                               default). If the bubble ratio resulting from the merging is
+   Different from ASAP [45] that prefetches the last two levels                 calculated to be below 𝑡, DMT-Linux clusters the two VMAs
+of PTEs into the cache hierarchy, DMT locates only the last-                    and merges their mappings. This process is performed itera-
+level PTEs. It does not bring upper-level PTEs into CPU                         tively until the ratio is larger than 𝑡. The merging involves
+caches and thus consumes less memory bandwidth.                                 TEA expansion (§4.3) that first tries to expand a TEA in place.
+   The hardware support for virtualization (and nested vir-                     If successful, the other TEA is migrated to the expanded TEA.
+tualization) shares the same principles (described in §4.5).                    If the in-place expansion fails, it allocates a new TEA and
+                                                                                migrates the original TEAs to it.
+1When KVM handles external interrupts, VM exits may be triggered to
+
+switch from the guest to the host. The registers need to be reloaded [32]. On   4.2.2 Splitting VMA-to-TEA Mapping. The size of a
+a multi-core system, IPIs are required to update registers on remote cores.     TEA is orders of magnitude smaller than the size of the
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA         Jiyuan Zhang, Weiwei Jia, Siyuan Chai, Peizhe Liu, Jongyul Kim, and Tianyin Xu
+
+
+corresponding VMA (a 4KB page of TEA covers 2MB VMA).                         Virtual Memory                 Physical Memory
+However, an allocation of TEA for a large VMA or VMA clus-
+ter can fail due to highly fragmented memory. If the memory
+
+
+
+
+                                                                                                                                 TEA-L1 TEA-L2
+allocator fails to allocate a TEA, DMT-Linux splits the TEA                       Page 1                           4KB-PTE 1
+                                                                                                                   4KB-PTE 2
+using multiple mappings to cover the VMA, as shown in
+
+
+
+
+                                                                                                                       …
+                                                                        VMA
+Figure 11(b). Specifically, it uses two mappings, each corre-                     Page 2                          4KB-PTE N
+
+
+
+
+                                                                                    …
+sponding to half of the original VMA. The splitting iterates                                                      2MB-PTE 1
+
+
+
+
+                                                                                                                       …
+until the TEA allocation succeeds. Note that after splitting,
+the VMA can be removed from the hardware register and be                         Page N                           2MB-PTE N
+
+replaced by a larger VMA.
+
+4.2.3 Accommodating VMA Changes. A VMA can grow
+                                                                               Figure 12. Huge page support in DMT.
+or shrink during the process execution. For example, mmap
+can grow an existing VMA and munmap can shrink it. When
+a VMA grows, DMT-Linux expands the size of the mapped             TEA will be loaded into the register so the expanded VMA
+TEA accordingly (§4.3). The TEA expansion is triggered on         can be indexed properly, while PTEs are asynchronously
+VMA changes. If a VMA is shrunk, DMT-Linux reduces the            moved by a background thread. During the TEA migration,
+size of the corresponding TEA. As the size of a VMA gets          translations with PTEs that are not yet migrated will be
+smaller, its mapping in a register can be replaced by the         handled by the original x86 page table walker.
+mapping of a larger VMA.
+   Note that VMA operations are typically infrequent. In          4.4    Huge Page Support
+our evaluation, the workloads rarely change VMAs after the        DMT supports huge pages like 2MB and 1GB pages in the
+initialization. In principle, DMT trades the overhead of in-      x86 architecture. With huge pages, last-level PTEs are at L2
+frequent VMA-to-TEA mapping management for optimizing             and L3 , not L1 (Figure 1). If a VMA contains pages of multiple
+frequent virtual address translations.                            sizes, DMT maps the VMA to multiple different TEAs, each
+                                                                  containing last-level PTEs of different sizes of pages, as de-
+4.3   TEA Management                                              picted in Figure 12. For example, if a VMA contains pages of
+TEAs are managed by the OS (DMT-Linux). To support TEAs,          all three sizes, there will be three VMA-to-TEA mappings for
+we modify the page table allocator in Linux. Currently, in        4KB, 2MB, and 1GB pages, respectively. To translate a VA in
+Linux, PTEs are maintained in pages allocated by the buddy        such a VMA, the DMT fetcher issues three memory requests
+allocator [22] and last-level PTEs are randomly scattered in      in parallel to all TEAs. Since only one of the three TEAs
+the physical memory. DMT-Linux incorporates a specialized         contains the last-level PTEs, only one PTE will be fetched.
+page table allocator that allocates TEAs in physical memory       The page size is encoded in the SZ field of the register when
+based on the VMA-to-TEA mappings. It allocates PTEs in            storing the VMA-to-TEA mapping (Figure 13). The DMT
+specific locations inside the TEAs to enable DMT.                 fetcher calculates the location of the target PTEs inside a
+   DMT-Linux supports TEA creation, deletion, and expan-          TEA based on the page size.
+sion. A TEA is created upon a VMA-to-TEA mapping cre-                When a huge page is promoted or demoted (e.g., by Linux’s
+ation. A TEA is allocated using Linux’s contiguous physical       Transparent HugePage Support, or THP), the corresponding
+page allocator (alloc_contig_pages) which requests con-           VMA-to-TEA mapping does not need to be changed. Only
+tiguous pages from the buddy allocator. The request could         the PTEs in the TEA will be updated. PTEs of different sizes
+fail if no contiguous region could be allocated, which trig-      of pages are allocated in different TEAs.
+gers a split of the VMA-to-TEA mapping. DMT-Linux also
+instructs the memory allocator to defragment the memory           4.5    Virtualization Support and pvDMT
+to resolve moveable fragmentations. A TEA is deleted by           DMT for virtualized memory can be supported naturally:
+simply freeing it upon VMA deletion.                              the OS (DMT-Linux) support in §4.2–§4.4 works seamlessly
+   TEA expansion is triggered either by the merging events of     on both the guest and the host OSes. The hardware support
+VMA-to-TEA mappings (§4.2.1) or by organic VMA growth             includes a new set of registers that map the gVA of guest
+(§4.2.3). If a TEA is expandable in place in physical mem-        VMAs to the gPA of the corresponding guest TEA (gTEAs).
+ory, DMT-Linux allocates PTEs into the corresponding TEA.         As discussed in §3, without paravirtualization (i.e., pvDMT),
+Since the PTEs are allocated in the page granularity by the       the DMT fetcher finishes the translation with three memory
+Linux buddy allocator, DMT-Linux manages TEAs also in the         references: (1) it calculates the gPA of the target gPTE using
+page granularity. If a TEA cannot be expanded in place, DMT-      the gVMA-to-gTEA mapping in the guest DMT registers
+Linux creates a new TEA and copies the original TEA to the        and then translates the gPA to the hPA of the gPTE via the
+new one. DMT-Linux implements gradual migration: the new          hPTE using the hVMA-to-hTEA mapping in the host DMT
+Direct Memory Translation for Virtualized Clouds                                     ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+registers; (2) it fetches the gPTE and obtains the gPA of the         63                                 12 11              321 0
+target data page; and (3) it finds the hPA of the target data                   VMA Base VPN                     Reserved      SZ P
+page via the hPTE using the hVMA-to-hTEA mapping in                              TEA Base PFN                      gTEA ID
+the host DMT registers. In practice, the hypervisor typically
+                                                                                              VMA Size
+creates one VMA to represent the guest physical memory.
+                                                                                             gTEA Table
+4.5.1 Paravirtualization. To support the paravirtualization-
+based optimization (pvDMT), we need to ensure gTEAs to              Figure 13. Organization of a DMT register. SZ stands for
+be contiguous in the host physical memory (§3.1). In pvDMT,         “page size” and P stands for “present”. gTEA ID and gTEA
+the host allocates gTEAs for the guest and maps the allo-           Table are used by pvDMT specifically.
+cated gTEAs into the guest so that the guest can update PTEs
+without exiting the VM. Guest TEA (gTEA) operations, such
+as merging and splitting VMA-to-TEA mappings, thus need
+                                                                    only map its virtual pages to its own TEAs. The restriction is
+to be forwarded to the host. In this way, only one VM exit
+                                                                    realized by the gTEA table using a mechanism similar to Intel
+would occur when a TEA is created or updated.
+                                                                    EPTP Switching [32]. Basically, the host creates a gTEA table
+   DMT-Linux adds a new hypercall KVM_HC_ALLOC_TEA in
+                                                                    for each guest, which tracks the physical memory regions
+the guest OS to pass VMA-to-TEA mapping information to
+                                                                    of the gTEAs that belong to the guest VM. The gTEA table
+the host. The host prepares contiguous physical memory re-
+                                                                    is read-only to the guest; any gTEA modification must go
+gions for gTEAs and, if needed, merges or splits the mapping.
+                                                                    through the KVM_HC_ALLOC_TEA hypercall. The gTEA table
+It then maps the materialized mapping to the guest. The use
+                                                                    maintains the base address in the host physical memory and
+of a hypercall not only enables the guest to request the host
+                                                                    the size of every active gTEA for the currently running guest
+to allocate gTEAs but also allows the host to merge or split
+                                                                    VM. Each gTEA is assigned a unique ID stored in the guest
+gTEAs when the requested allocation cannot or should not
+                                                                    registers, as shown in Figure 13. The base address of the
+be satisfied as is. The hypercall takes an array of requested
+                                                                    gTEA table is also stored in the guest registers. Note that
+gTEAs as input parameters and returns an array of allocated
+                                                                    this design also prevents the host physical address of TEAs
+gTEAs, in the form of a pointer to a gTEA Table that lists
+                                                                    from being exposed to the guest.
+the base addresses and sizes of gTEAs. It returns an empty
+                                                                       During the translation, the DMT fetcher finds the corre-
+array if no TEA can be allocated.
+                                                                    sponding gTEA based on the gTEA table and the gTEA ID
+   The gTEA table is maintained by the host, as part of the
+                                                                    from the guest DMT register. If a given gTEA ID is invalid
+register state (Figure 13). It lists the base address and size of
+                                                                    or an out-of-bound physical memory access is requested, a
+each gTEA in the host physical address space. The table is
+                                                                    page fault will be triggered in the host.
+needed for the DMT fetcher to directly fetch the gPTE.
+   With pvDMT, the DMT fetcher takes two memory refer-              4.5.3 Nested Virtualization. DMT and pvDMT enable
+ences: (1) it fetches the gPTE to obtain the gPA of the target      efficient hardware-assisted address translation for nested
+page in the gTEA using the gVMA-to-gTEA mapping in the              virtualization, which is untenable with existing translation
+guest DMT register, where the base address of gTEA in the           designs (§2.1.3). In the case of pvDMT, to support memory
+host physical address space can be found in the gTEA Table,         translation for nested virtualization, we need a set of L2
+and (2) it fetches the hPTE to obtain the physical address          VMA-to-TEA registers that map the L2 VA to the host physi-
+based on the gPA in the hTEA using the hVMA-to-hTEA                 cal address of the corresponding L2 TEA. The DMT fetcher
+mapping in the host register.                                       needs to support the three-step translation described in §3.2.
+4.5.2 Isolation. A key principle of pvDMT is to ensure                 DMT-Linux makes the L1 hypervisor be able to identify
+isolation between the guest and the host. The challenge is          the destination of control messages and forward them be-
+that paravirtualization exposes the host physical memory            tween L0 and L2 if needed. For example, after L1 DMT-Linux
+to the guest. Without any regulation, a malicious guest can         received the TEA allocation request from L2 , it will create
+create a timing-based side channel by manipulating the guest        and map TEAs for L2 on L1 physical memory, split the map-
+DMT register to point to an arbitrary host physical address.        ping if needed, and forward the updated VMA-to-TEA map-
+Since the MMU will read the content at the physical addresses       pings to L0 for final allocation. The allocated mappings are
+and consume it as a PTE, the guest can observe the timing           returned from L0 to L1 and then to L2 .
+of the translation fault and infer the shape of the content
+in the physical memory address. On the other hand, VM               4.6    Implementation
+exits need to be minimized—regulation cannot require every          4.6.1 DMT Hardware. Figure 13 shows the layout of a
+gTEA change or context switch to trap into the host.                DMT register (§4.1). We have three sets of 16 registers to
+   We address the challenge by restricting the physical mem-        support native, virtualization, and nested virtualization, re-
+ory region exposed to the guest and ensuring that a guest can       spectively. Each register maintains a VMA-to-TEA mapping
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA          Jiyuan Zhang, Weiwei Jia, Siyuan Chai, Peizhe Liu, Jongyul Kim, and Tianyin Xu
+
+
+using the first 192 bits. The registers can only be accessed       Table 2. Hardware configuration of the measurement
+by the corresponding native or virtualization levels.              platform (a server machine with the x86 architecture).
+   The P (Present) bit notifies the DMT fetcher if the VMA-            Parameter      Configuration
+to-TEA mapping stored in the register is valid. If the P-bit
+                                                                       Processor      Intel® Xeon® Gold 6138 @ 2.00GHz (4 CPU sockets)
+is not set, the original x86 page table walker is invoked. For         Memory         64GB DDR4 2666 MT/s per socket (256GB total)
+example, during the asynchronous TEA migration (§4.3), the             Host Kernel    Linux 5.15.0
+P-bit is not set till the migration is done.                           Guest Kernel   Linux 5.15.0
+   The gTEA ID and gTEA Table fields are specific to pvDMT             Hypervisor     QEMU/KVM
+and are only used in virtualized environments. The gTEA ID             VM Memory      240 GB
+is used by the guest to point to the gTEA in the gTEA table;
+the gTEA table is prepared by the host. The fields may be          Table 3. Configuration of the simulated architecture.
+changed during context switches, without VM exits.                 We set the same hardware configuration as the measurement
+   Following the current MMU design, a core can have mul-          machine in Table 2, i.e., Intel Xeon Gold 6138 [76].
+tiple DMT fetchers corresponding to the original x86 page              Parameter          Configuration
+table walkers. If a requested virtual memory address is not            Cores/Threads      20 cores; 20 threads
+covered by the mappings, the translation falls back to the             L1I TLB            128 entries, 8-way associative
+x86 page table walker. For virtualized memory, the DMT                 L1D TLB            64 entries, 4-way associative
+fetcher performs the multi-step translation described in §4.5,         L2 STLB            1536 entries, 12-way associative
+following a state machine to access the right registers.               L1I Cache          32KB per core, 8-way associative, 4 cycles RT
+                                                                       L1D Cache          32KB per core, 8-way associative, 4 cycles RT
+                                                                       L2 Cache           1MB per core, 16-way associative, 14 cycles RT
+                                                                       Last-Level Cache   22MB, 11-way associative, 54 cycles RT
+4.6.2 DMT-Linux. We prototype DMT-Linux on top of                      Main Memory        200 cycles RT
+the Linux kernel v5.15. We implemented VMA-to-TEA man-                 Page Walk Cache    3 levels, 2-4-32 entries per level, 1 cycle RT
+agement, TEA management, and virtualization support with               Nested PWC         3 levels, 2-4-32 entries per level, 1 cycle RT
+about 800 lines of C code.
+   To manage VMA-to-TEA mappings (§4.2), we hook our
+                                                                   5      Methodology
+management procedures into code that changes VMAs (e.g.,
+mmap_region, __vma_adjust and __split_vma). The map-               We evaluate the performance of DMT and the compared
+pings are maintained in a red-black tree with pointers in          systems, following the methodology of prior work [5, 45].
+task_struct, similar to how VMAs are maintained.                   We model application execution time using a combination
+   TEAs are allocated using Linux contiguous page allocator,       of real performance measurements and simulated memory
+alloc_contig_pages, implemented in the buddy allocator             traces. The execution time on a target system is modeled as:
+with GFP_PGTABLE_USER (DMT is not enabled for the kernel                                                 𝑠𝑖𝑚𝑢𝑙𝑎𝑡𝑒
+                                                                                                        𝑂𝑡𝑎𝑟𝑔𝑒𝑡
+page table). The allocator automatically defragments mem-                      𝑇 𝑡𝑎𝑟𝑔𝑒𝑡 = 𝑂 𝑚𝑒𝑎𝑠𝑢𝑟𝑒
+                                                                                            𝑣𝑎𝑛𝑖𝑙𝑙𝑎 ×
+                                                                                                                         𝑚𝑒𝑎𝑠𝑢𝑟𝑒
+                                                                                                                     + 𝑇𝑖𝑑𝑒𝑎𝑙
+                                                                                                        𝑂 𝑠𝑖𝑚𝑢𝑙𝑎𝑡𝑒
+ory on demand. DMT-Linux invokes __alloc_contig_pages                                                     𝑣𝑎𝑛𝑖𝑙𝑙𝑎
+and free_contig_range to expand and shrink TEAs. To mi-            where 𝑂 denotes address translation overhead. 𝑇𝑖𝑑𝑒𝑎𝑙 denotes
+grate a TEA, a background worker iterates through the page         the ideal execution time assuming a perfect TLB. 𝑂 𝑠𝑖𝑚𝑢𝑙𝑎𝑡𝑒
+                                                                                                                            𝑣𝑎𝑛𝑖𝑙𝑙𝑎
+                                                                          𝑠𝑖𝑚𝑢𝑙𝑎𝑡𝑒 denote the translation overhead of vanilla
+table using apply_to_existing_page_range, locking the              and 𝑂𝑡𝑎𝑟𝑔𝑒𝑡
+affected PTEs, and revising the page table to ensure the orig-     Linux and the target system in a simulator, respectively. The
+inal page walker works correctly after migration.                  formula breaks down application execution time into an
+   To support DMT for virtualization (§4.5), DMT-Linux adds        ideal execution time and the page table walk overhead. As
+the hypercall KVM_HC_ALLOC_TEA in KVM. Upon receiving              suggested by [5], it is more accurate than directly adding
+the hypercall, the hypervisor finds guest physical memory          simulated translation overhead on measured execution time,
+in the host virtual address using kvm_vcpu_gfn_to_hva and          by taking into account subtle interactions between the trans-
+find_vma. It allocates TEAs on behalf of the guest and maps        lation hardware, CPU cores, and the OS.
+the allocated host physical memory to the guest physical              We use the Linux Perf tool [52] to measure 𝑂 𝑚𝑒𝑎𝑠𝑢𝑟𝑒
+                                                                                                                       𝑣𝑎𝑛𝑖𝑙𝑙𝑎
+                                                                                                                                and
+memory using vm_insert_pages. After the mapping is done,           workload execution time of a real server machine, with the
+                                                                                                       𝑚𝑒𝑎𝑠𝑢𝑟𝑒 is obtained by sub-
+                                                                   configuration listed in Table 2. 𝑇𝑖𝑑𝑒𝑎𝑙
+DMT-Linux updates the gTEA table and the gTEA ID (Fig-
+ure 13) and returns the allocated mappings to the caller. In       tracting translation overhead from total execution time. To
+nested virtualization, it cascades the hypercall and requests      measure 𝑂 𝑠𝑖𝑚𝑢𝑙𝑎𝑡𝑒
+                                                                               𝑣𝑎𝑛𝑖𝑙𝑙𝑎
+                                                                                             𝑠𝑖𝑚𝑢𝑙𝑎𝑡𝑒 , we use DynamoRIO [18]
+                                                                                       and 𝑂𝑡𝑎𝑟𝑔𝑒𝑡
+the L0 hypervisor for the same operations.                         to simulate the memory hierarchy. Table 3 lists the config-
+   Hardware extension (§4.1), if available, can be supported       uration of the simulated system. We implement different
+by using mm_struct to store per-process mappings and pro-          translation designs including DMT and the related systems
+cedures like switch_mm to load mappings to registers.              on the simulator. The simulator runs the application memory
+Direct Memory Translation for Virtualized Clouds                                                         ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+        Table 4. Benchmarks used in the evaluation.                                                 Vanilla Linux             ECPT                DMT
+                                                                                                    FPT                       ASAP
+    Name             Description                                                        2.0
+
+
+
+
+                                                                          Page Walk
+                     In-memory key-value store (working-set: 155 GB)                    1.5
+
+
+
+
+                                                                           Speedup
+    Redis [62]
+                     512M 256B records, 30M operations, 100% reads                      1.0
+                     In-memory key-value store (working-set: 95 GB)
+    Memcached [48]                                                                      0.5
+                     100M 1KB records, 10M operations, 100% reads
+                                                                                        0.0
+                                                                                                 is        ed PS      ee       al ch   00     an
+                                                                                              Red                 BTr Canne XSBen raph5 eo. Me
+                     Random memory accesses (working-set: 128 GB)
+    GUPS [27]                                                                                          cach GU
+                     128 GB dataset, 1B operations, 100% updates
+                                                                                        1.2        Mem                             G    G
+                     Data structure evaluator (working-set: 125 GB)                                             Page walk speedup
+                                                                                        1.0
+
+
+
+
+                                                                          Application
+    BTree [51]
+
+
+
+
+                                                                           Speedup
+                     1.5B keys, 70M operations, 100% lookups                            0.8
+                     Chip design optimizer (working-set: 62 GB)                         0.6
+    Canneal [13]
+                     100M elements, 150K swaps/step, 2K start temp.                     0.4
+                                                                                        0.2
+                     Monte Carlo simulator (working-set: 84 GB)                         0.0
+                                                                                                 is                            al
+    XSBench [71]
+                                                                                              Red          ed PS     ee            ch 00     an
+                     170K gridpoints per nuclide, 4M particle histories
+                                                                                                       cach GU   BTr Canne XSBen raph5 eo. Me
+                     Graph analysis benchmark (working-set: 123 GB)                                Mem                              G  G
+    Graph500 [24]
+                     27 scale, 32 edge factor, 4 iterations                                                    Application speedup
+                                                                                                                       (a) 4KB
+                                                                                        3.0
+                                                                                        2.5
+
+
+
+
+                                                                          Page Walk
+                                                                           Speedup
+                                                                                        2.0
+traces (≥ 2 billion instruction level trace) and measures the                           1.5
+simulated overheads. The simulator also reports the average                             1.0
+                                                                                        0.5
+page table walk latency of the target systems.                                          0.0
+                                                                                                 is        ed PS      ee       al ch   00     an
+                                                                                              Red      cach GU    BTr Canne XSBen raph5 eo. Me
+                                                                                                   Mem
+   For nested virtualization, since DMT eliminates the need                                                                        G    G
+for shadow paging, we need to remove the shadow paging                                  1.2                     Page walk speedup
+                                                                                        1.0
+                                                                          Application
+                                                                           Speedup
+             𝑛𝑒𝑠𝑡𝑒𝑑 ) from 𝑇
+overhead (𝑂𝑠ℎ𝑎𝑑𝑜𝑤             𝑡𝑜𝑡𝑎𝑙 . However, it is hard to pre-                       0.8
+                  𝑛𝑒𝑠𝑡𝑒𝑑 . Inspired by [20], we run the bench-                          0.6
+cisely measure 𝑂𝑠ℎ𝑎𝑑𝑜𝑤                                                                  0.4
+marks with hardware-assisted translation and with shadow                                0.2
+                                                       𝑚𝑒𝑎𝑠𝑢𝑟𝑒 re-                      0.0
+paging on single-level virtualization and measure𝑇𝑡𝑜𝑡𝑎𝑙                                          is        ed PS     ee        al  ch 00     an
+                                                                                              Red      cach GU   BTr Canne XSBen raph5 eo. Me
+spectively. The difference of the measured𝑇𝑡𝑜𝑡𝑎𝑙 tells the over-                                   Mem                              G  G
+                                                                                                               Application speedup
+head of shadow paging over hardware-assisted translation.
+                                                                                                                       (b) THP
+Since shadow paging overhead is mainly caused by VM exits,
+we estimate the overhead in nested virtualization by scaling              Figure 14. Speedup of page table walk and application
+the overhead measured in single-level virtualization based                execution in (a) 4KB and (b) THP of DMT and other
+                                     𝑛𝑒𝑠𝑡𝑒𝑑 = 𝑂 𝑠𝑖𝑛𝑔𝑙𝑒 × 𝑁 𝑛𝑒𝑠𝑡𝑒𝑑 .
+on the ratio of VM exits, i.e., 𝑂𝑠ℎ𝑎𝑑𝑜𝑤         𝑠ℎ𝑎𝑑𝑜𝑤    𝑁 𝑠𝑖𝑛𝑔𝑙𝑒
+                                                                          advanced translation designs over baseline (Linux on
+Note that this is an underestimation because VM exits are                 x86) in a native environment.
+known to be more expensive in nested virtualization [11].
+
+  Benchmarks. Our evaluation uses a diverse set of appli-
+                                                                          6.1            DMT Performance over Baseline
+cation benchmarks (Table 4). These benchmarks have differ-
+ent characteristics of memory access patterns and page table              DMT significantly outperforms the baseline in native (§6.1.1),
+walks (Figure 4), allowing us to comprehensively analyze                  single-level virtualization (§6.1.2), and nested virtualization
+the performance of DMT and related translation designs.                   (§6.1.3) environments. The DMT registers cover 99+% trans-
+                                                                          lation requests in all three environments. We discuss how
+                                                                          DMT compares to other advanced designs in §6.2.
+6      Evaluation
+In the evaluation, we measure the performance of DMT (in-                 6.1.1 Native. Figure 14 shows the speedups of page table
+cluding pvDMT), in terms of (1) page table walk latency and               walk and application execution time across the benchmarks
+(2) application execution time. The measurement is done                   in the evaluated systems in the native environment. On av-
+both with and without enabling Linux’s Transparent Huge                   erage, DMT offers a speedup of 1.28x in page table walk and
+Page (THP). We use the vanilla Linux/KVM on the x86-64                    1.05x in application execution time over the baseline, if only
+architecture as our baseline system (§2) to understand the                4KB pages are used (Figure 14a). With THP, DMT offers an
+speedup DMT brings. We compare DMT and pvDMT with                         average speedup of 1.46x in page table walk and 1.05x in
+four recent translation designs as our references: ECPT [64],             application execution time (Figure 14b).
+FPT [59], Agile Paging [20], and ASAP [45].                                  The performance improvement is attributed to DMT’s sav-
+   We also measure the overhead of DMT incurred by OS                     ing of sequential fetching multiple higher-level PTEs. THP
+work for managing VMA-to-TEA mapping, TEAs, as well as                    further enlarges the benefits of DMT, because it reduces the
+extra memory due to the eager allocation of TEAs (§6.3).                  ratios of fetching the last-level PTEs from main memory
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                       Jiyuan Zhang, Weiwei Jia, Siyuan Chai, Peizhe Liu, Jongyul Kim, and Tianyin Xu
+
+
+                          Vanilla KVM      Agile Paging      DMT                  0.01   0.01     0.56    2.10   2.11    0.00    0.00    0.61          2.41
+                                                                                  0.0%   0.0%     0.1%    0.5%   0.5%    0.0%    0.0%    0.8%          3.0%
+                          FPT              ASAP              pvDMT
+                          ECPT                                                    0.03   0.03     0.62    2.18   3.97    0.00    0.01    0.63          4.43
+              2.5
+                                                                                  0.0%   0.0%     0.2%    0.6%   1.0%    0.0%    0.0%    0.8%          5.5%
+Page Walk
+
+
+
+
+              2.0
+ Speedup
+
+
+
+
+                                                                                  1.31   1.85     4.97    9.09   28.1    0.65    1.00    4.22          28.5
+              1.5                                                                 0.3%   0.5%     1.3%    2.3%   7.1%    0.8%    1.2%    5.2%          35%
+              1.0
+              0.5                                                                 1.76   2.47     7.11    32.4   129
+
+              0.0
+                                                                                  0.4%   0.6%     1.8%    8.2%   33%
+                       is        ed PS      ee       al ch   00      an
+                    Red      cach GU    BTr Canne XSBen raph5 eo. Me
+                         Mem                             G    G                   4.00   4.68    28.0     129            4.00   5.24     29.6
+                                                                                  1.0%   1.2%    7.1%     33%            4.9%   6.5%     36%
+              1.4                     Page walk speedup
+Application
+
+
+
+
+              1.2
+ Speedup
+
+
+
+
+              1.0
+                                                                                  Page walk breakdown for base pages    Page walk breakdown for 2M huge pages
+              0.8                                                                               (a) 4KB                                 (b) THP
+              0.6
+              0.4
+              0.2                                                               Figure 16. Breakdown of nested page table walks. The
+              0.0
+                        is        ed PS     ee        al  ch 00      an
+                    Red                 BTr Canne XSBen raph5 eo. Me
+                                                                                top number is the average cycles of accessing a PTE. The bot-
+                              cach GU
+                          Mem                              G  G                 tom number is the proportion of time spent on each PTE with
+                                      Application speedup
+                                        (a) 4KB
+                                                                                regard to average page table walk latency. pvDMT fetches
+              3.5                                                               only two PTEs (highlighted).
+              3.0
+Page Walk
+
+
+
+
+              2.5
+ Speedup
+
+
+
+
+              2.0                                                                  Figure 16 breaks down the page table walk overhead of
+              1.5
+              1.0                                                               pvDMT in Redis (Table 4). For 4KB pages (Figure 16a), last-
+              0.5
+              0.0                                                               level PTEs are less cached. By directly fetching the last-level
+                       is        ed PS      ee       al ch   00      an
+                    Red      cach GU    BTr Canne XSBen raph5 eo. Me
+                         Mem                             G    G                 PTEs, pvDMT reduces the average page table walk latency
+              1.4
+              1.2                     Page walk speedup                         to 66% (33% + 33%) of the baseline. With THP, last-level PTEs
+Application
+
+
+
+
+              1.0
+ Speedup
+
+
+
+
+              0.8
+                                                                                are better cached, hence lower cost to fetch (Figure 16b). As
+              0.6                                                               a result, pvDMT reduces the page table walk latency to 71%
+              0.4
+              0.2                                                               (35% + 36%) of the baseline. Other workloads show similar
+              0.0
+                       is        ed PS     ee        al  ch 00      an          characteristics. For example, in Canneal, pvDMT reduces
+                    Red      cach GU   BTr Canne XSBen raph5 eo. Me
+                         Mem                              G  G                  the page table walk latency to 76% (38% + 38%) and 69%
+                                     Application speedup                        (37% + 32%) of the baseline for 4KB pages and THP respec-
+                                        (b) THP
+                                                                                tively. Compared to Redis, in Canneal, 2MB PTEs are more
+Figure 15. Speedup of page table walk and applica-                              effectively cached (and thus cheaper to access); therefore,
+tion execution in (a) 4KB and (b) THP of DMT and                                with THP, pvDMT’s reduction of page table walk latency
+pvDMT and the other advanced designs over baseline                              over the baseline is larger than 4KB pages. In summary, even
+(Linux/KVM on x86) in a virtualized environment.                                in the cases where last-level PTEs are cached, DMT/pvDMT
+                                                                                still brings substantial benefits.
+                                                                                   Different workloads differ in memory access patterns. De-
+                                                                                spite for most workloads, last-level PTEs are rarely cached
+and amplifies the effect of skipping page table walk. We will
+                                                                                during page table walks, the caching patterns of higher-level
+observe this behavior even more in the virtualized environ-
+                                                                                PTEs are different. Since DMT eliminates the cost of fetching
+ments in §6.1.2 and §6.1.3.
+                                                                                higher-level PTEs, the effect of the removal is different. This
+                                                                                leads to the difference in speedups of page table walk latency.
+6.1.2 Virtualization. DMT, especially pvDMT, leads to
+                                                                                For workloads with access patterns that enable effective PTE
+more substantial performance improvements in virtualized
+                                                                                caching (e.g., Graph500), DMT mostly saves accesses to the
+environments. Figure 15a shows that DMT exhibits a speedup
+                                                                                caches. Since the last-level PTEs are better cached, accesses
+of 1.41x in page table walk and 1.15x in application execution
+                                                                                to them cause low latency and lead to a higher speedup in
+time if only 4KB pages are used; with pvDMT, the speedup
+                                                                                page table walk latency for DMT. For workloads with ac-
+of page table walk is 1.58x and the speedup of application
+                                                                                cess patterns that are hard to cache (e.g., Redis with a large
+execution time is 1.20x. With THP, DMT speeds up page
+                                                                                working set), DMT saves accesses to main memory as well
+table walk by 1.55x and application execution time by 1.12x
+                                                                                as CPU caches. In this case, though the speedup is lower for
+(Figure 15b). With pvDMT, the speedup of page table walk is
+                                                                                these workloads, the absolute saving is higher.
+1.65x and the speedup of application execution time is 1.14x.
+   Note that DMT/pvDMT with THP has larger speedups of                          6.1.3 Nested Virtualization. DMT/pvDMT is the first
+a page table walk latency but lower in application execution                    hardware-assisted translation design for nested virtualiza-
+time than without THP, because with THP page table walk                         tion. We measure performance improvements of pvDMT
+overhead is much reduced in the baseline.                                       over the baseline, Nested KVM.
+Direct Memory Translation for Virtualized Clouds                                                                                         ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+                                      Vanilla Nested KVM                                            pvDMT             Table 5. DMT/pvDMT’s speedups of a page table walk
+Page Walk Speedup
+
+
+
+
+                                                           Page Walk Speedup
+                                                                                                                      over other advanced designs (§6.2). pvDMT is used for
+                      1.5
+                      1.2                                                        2.0                                  comparisons in Virtualized (4K/THP). The values are the
+                      1.0                                                        1.5
+                      0.8                                                        1.0
+                                                                                                                      geometric means.
+                      0.5
+                      0.2                                                        0.5                                     Environment           FPT     ECPT     Agile Paging       ASAP
+                      0.0                                                        0.0
+                                             l                                                          l
+                            dis hed PS ree ea nch 00 ean                               dis hed PS ree ea nch 00 ean
+                                                                                                                         Native (4KB)          1.04x   1.03x          N/A          1.06x
+                         Re cac GU BT ann Be aph5 . M                               Re cac GU BT ann Be aph5 . M         Native (THP)          1.18x   1.17x          N/A          1.23x
+                          em           C XS Gr eo                                    em           C XS Gr eo
+                       M                        G                                 M                        G             Virtualized (4KB)     1.22x   1.16x          1.21x        1.31x
+                                 Page walk speedup                                          Page walk speedup
+Application Speedup
+
+
+
+
+                                                           Application Speedup
+                                                                                                                         Virtualized (THP)     1.49x   1.25x          1.34x        1.51x
+                      2.5                                                        2.0
+                      2.0                                                        1.5
+                      1.5                                                        1.0                                  Table 6. The number of sequential memory accesses of
+                      1.0
+                      0.5                                                        0.5                                  other translation designs in different environments.
+                      0.0                                                        0.0                                    Design               Native      Virtualization       Nested Virt.
+                                             l                                                          l
+                            dis hed PS ree ea nch 00 ean                               dis hed PS ree ea nch 00 ean
+                         Re cac GU BT ann Be aph5 . M                               Re cac GU BT ann Be aph5 . M        pvDMT                  1                2                  3
+                                           S
+                                       C X Gr eo                                                      S
+                                                                                                  C X Gr eo
+                          em                    G                                    em                    G
+                       M                                                          M                                     ECPT                   1                 3                N/A
+                                 Application speedup                                        Application speedup         FPT                    2                 8                N/A
+                                    (a) 4KB                                                     (b) THP                 Agile Paging          N/A              4–24               N/A
+                                                                                                                        ASAP                   4                24                N/A
+Figure 17. Speedup of page table walk and application
+execution in (a) 4KB and (b) THP of pvDMT over the
+baseline (Nested KVM).                                                                                                performance with x86 compatibility. Interestingly, our eval-
+                                                                                                                      uation shows that DMT, even without pvDMT, brings non-
+   Figure 17a shows that pvDMT speeds up application exe-                                                             trivial improvements over ECPT in both native and virtual-
+cution of the baseline by 1.48x on average if only 4KB pages                                                          ized environments. The reasons are: (1) compared with ECPT,
+are used. pvDMT’s page table walk is only slightly faster                                                             DMT does not spend cycles on hash calculations and cuckoo
+(1.02x on average) than the baseline because the baseline                                                             walk cache lookup, and (2) DMT issues much fewer parallel
+uses shadow paging to avoid three-dimensional page table                                                              lookups compared with ECPT. pvDMT further reduces the
+walks. As last-level PTEs are harder to cache, pvDMT takes                                                            number of sequential memory references from three to two.
+three sequential memory accesses in most of the cases. Mean-                                                          On average, pvDMT outperforms Nested ECPT [66] in terms
+while, since pvDMT eliminates the shadow paging overhead                                                              of page table walk latency by 1.16x (1.25x with THP).
+caused by VM exits (§2.1.3), it significantly improves end-to-                                                           FPT [59] flattens page tables by merging adjacent page
+end performance.                                                                                                      table levels. Specifically, it merges L4 with L3 and L2 with L1 ,
+   With THP, pvDMT greatly outperforms the baseline even                                                              reducing memory references from four to two in a native en-
+in terms of page table walk overhead, despite its need to                                                             vironment. In a virtualized environment, FPT requires eight
+translate one more level than shadow paging, because the                                                              sequential memory references for each two-dimensional
+PTEs are effectively cached. As shown in Figure 17b, with                                                             page table walk. pvDMT outperforms FPT in terms of page
+THP, pvDMT speeds up page table walk by 1.11x and appli-                                                              table walk latency by 1.22x (1.49x with THP) on average.
+cation execution by 1.34x on average.                                                                                    Agile Paging [20] combines nested paging and shadow
+                                                                                                                      paging to accelerate translation in virtualized systems. It
+6.2 Comparison with Other Advanced Designs                                                                            starts with the shadow page table for the higher levels of the
+Figures 14 and 15 show detailed comparisons of DMT/pvDMT                                                              radix page table and switches to nested paging for the lower
+with the other advanced designs (ECPT [64], FPT [59], Agile                                                           levels of the page table. Compared to pvDMT, Agile Paging
+Paging [20], and ASAP [45]) in the native and virtualized                                                             requires many more memory references for a translation.
+environments. Table 5 summarizes the results, showing that                                                            On average, pvDMT outperforms Agile Paging in terms of
+DMT/pvDMT outperforms the state of the arts.                                                                          page table walk latency by 1.21x (1.34x with THP).
+6.2.1 Translation Designs. Table 6 lists the number of                                                                6.2.2 PTE Prefetching. DMT corroborates ASAP [45] in
+sequential memory references of these different designs. We                                                           terms of the hardware extension and PTE management by
+comparatively discuss each design with DMT/pvDMT, with                                                                the OS. DMT shows that optimizing the translation leads
+a focus on virtualized environments.                                                                                  to significant benefits even when PTEs are prefetched into
+   ECPT [64, 66] also directly fetches PTEs using cuckoo                                                              the caches, because sequentially fetching them one by one
+hashing. We did not expect DMT (without pvDMT) to out-                                                                is still expensive, especially in virtualized environments.
+perform ECPT in native or virtualized environments, because                                                              In a virtualized environment, pvDMT outperforms ASAP
+they take the same number of sequential memory accesses.                                                              by 1.31x (1.51x with THP) in terms of page table walk latency
+Instead, DMT can be viewed as a design to achieve ECPT                                                                on average. Despite L1 and L2 entries being prefetched in
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                Jiyuan Zhang, Weiwei Jia, Siyuan Chai, Peizhe Liu, Jongyul Kim, and Tianyin Xu
+
+
+ASAP, a translation still takes a two-dimensional walk to                7     Discussion and Limitations
+sequentially fetch all the 24 PTEs. Moreover, the nature of                 Assumptions. DMT assumes that a handful of VMAs or
+nested page table walk inevitably creates a dependency chain             VMA clusters with small bubbles can effectively cover the
+of PTEs that cannot be prefetched in parallel (e.g., a host page         working set of data-intensive applications. We validate this
+table walk is required to resolve the hPA of a gPTE). Hence,             assumption in §2.3 using various applications and bench-
+if both host and guest PTEs are not cached, ASAP needs to                marks. New memory allocators like TCMalloc [21] would
+fetch PTEs sequentially, taking hundreds of cycles. Lastly,              further bring down the number of VMAs by coalescing. How-
+ASAP may also pollute CPU caches.                                        ever, applications with highly fragmented VMAs may not
+                                                                         benefit greatly from DMT, if a few registers cannot encode
+                                                                         the working set effectively. In such cases, more translations
+6.3 DMT Overhead
+                                                                         will fall back to the original x86 page table walks. DMT
+DMT’s runtime overhead mainly comes from OS work for                     also assumes that VMAs are updated infrequently after cre-
+managing VMA-to-TEA mappings (§4.2) and TEAs (§4.3).                     ation. DMT targets data-intensive workloads. Such work-
+The management operations are mostly triggered by VMA                    loads do not have frequent VMA updates—they typically
+creation and updates. In evaluated workloads, dynamic VMA                allocate memory at the initialization time [10, 25, 45]. Cer-
+changes are rare and VMA creation is mostly done at appli-               tainly, it is possible that specific workloads change VMAs
+cation initialization time. DMT makes the right tradeoff to              frequently; such workloads may not benefit from DMT.
+optimize frequent memory address translation with infre-
+quent overheads of VMA operations.                                          Paravirtualization. The use of paravirtualization (i.e.,
+   To quantify DMT’s runtime overhead on real machines,                  pvDMT) effectively optimizes DMT for virtualized environ-
+we run DMT-Linux without hardware support. Specifically,                 ments. However, it has several known shortcomings. Besides
+we create a highly fragmented memory (using a fragmen-                   the hypercalls overhead, paravirtualization requires both the
+tation tool in [40] with a free memory fragmentation index               guest and the host to support DMT-Linux; otherwise, DMT
+of 0.99). Fragmentation increases DMT overhead. We record                falls back to the original x86 radix-based translation. If the
+the execution time of all the management procedures during               hardware extension is adopted and available, we hope that
+workload execution. Redis shows the largest overhead and it              DMT-Linux can be upstreamed to Linux/KVM.
+only adds on average 12ms, 120ms, and 598ms to application
+execution time in native, virtualized, and nested virtualized               Contiguity requirement of TEA. TEAs need contigu-
+environments. Such overheads are negligible with regard to               ous physical memory space. Despite TEAs being orders of
+the application execution time (thousands of seconds).                   magnitude smaller than VMAs (e.g., a 200MB TEA is needed
+   We also measure hypercall overhead in pvDMT, using a                  for 100GB data with 4KB pages), memory contiguity could be
+microbenchmark that requests different sizes of TEAs. The                scarce in long-running servers [79]. Recent work [85] shows
+TEA allocation time is 13.27 ms, 23.73 ms, and 48.07 ms                  that by isolating unmovable regions, 1GB contiguity can be
+in a virtualized environment and 15.67 ms, 24.55 ms, and                 commonly allocated. Also, new contiguity-aware allocation
+54.87 ms in nested virtualization, for 50 MB, 100 MB and 200             and de-fragmentation mechanisms are developed [77]. We
+MB TEAs, respectively. The hypercall overhead (excluding                 expect the megabyte-level contiguity of TEA to be acceptable.
+memory allocation) is 1.88 𝜇s in a virtualized environment               DMT splits TEAs when contiguity cannot be found.
+and 10.75 𝜇s in nested virtualization, incurred by the context
+                                                                            Eager TEA allocation. DMT eagerly allocates physical
+switch (VM exit) and running KVM hypercall handling code.
+                                                                         memory for TEAs and might waste space compared to the
+   DMT consumes extra memory space as it eagerly allo-
+                                                                         lazy allocation of x86. Our evaluation shows that the ex-
+cates memory space for TEAs. But, the extra memory space
+                                                                         tra memory space is negligible (§6.3). However, there exist
+is negligible (<2.5% of the baseline). Specifically, in our ex-
+                                                                         workloads where eager allocation can be more wasteful, e.g.,
+periments, DMT and Linux/KVM consume 247.2 MB and
+                                                                         mmapping a 1TB file to memory but accessing a small por-
+241.3 MB of space to store page tables on average, respec-
+                                                                         tion of it. For such workloads, more advanced TEA allocation
+tively. Note that VMAs are created for in-use virtual memory
+                                                                         policies can be employed, e.g., on-demand allocation of small-
+regions, and most of them will be accessed.
+                                                                         sized TEAs with dynamic expansion. As TEA allocation is
+   DMT’s hardware extension requires additional power and
+                                                                         done by the OS, the policy can be decided as per workloads.
+on-chip space. We use CACTI [8] with 22 𝑛𝑚 technology
+to estimate its hardware cost. DMT consumes an additional
+4.87 𝑚𝑊 of leakage power and adds 0.03 𝑚𝑚 2 extra on-chip                8     Related Work
+space per MMU. The overheads are marginal based on the                     Accelerating address translation. DMT is inspired by
+fact that the Thermal Design Power of the modeled CPU,                   prior work on redesigning memory translation to reduce its
+Intel Xeon Gold 6138, is 125 𝑊 [31] and its die size is 694              overhead [3–5, 10, 12, 20, 23, 26, 54, 59, 64, 66–68, 70, 75, 80].
+𝑚𝑚 2 [78] with 14 𝑛𝑚 technology.                                         We compare the performance of DMT with the recent designs
+Direct Memory Translation for Virtualized Clouds                                     ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+in §6.2 and show that DMT/pvDMT can further reduce mem-           artifact includes the Linux kernel with DMT support, the
+ory translation overhead. At a high level, DMT differs from       simulator, peformance benchmarks, and experiment scripts.
+prior work with two main design principles: (1) co-designing      We have used the artifact to reproduce the evaluation results
+memory translation hardware with OS memory manage-                presented in the paper.
+ment, which greatly simplifies the design and is transparent
+to user applications, and (2) avoiding disruptive changes to      A.2     Artifact check-list (meta-information)
+the existing architecture and using backward compatible                 • How much time is needed to prepare workflow?: Around
+designs to achieve minimized overhead.                                    3 hours.
+   Huge page. Using huge pages to improve TLB coverage                  • How much time is needed to complete experiments?:
+                                                                          Around 72 hours.
+and shorten page table walks is practical and often only in-
+                                                                        • Publicly available?: Yes.
+volves software changes [29, 35, 36, 40, 43, 53, 55–57]. How-           • Code licenses?: GNU GPL v2.0 with Linux Syscall Note and
+ever, huge pages cannot fundamentally address the transla-                Apache License 2.0.
+tion overhead as it is less scalable and cannot eliminate all           • Archived?: Yes. https://doi.org/10.5281/zenodo.10681636
+the sequential page table walks. DMT is complementary to
+and can benefit from huge pages, as shown in our evaluation.      A.3     Description
+   Translation caching and prefetching. Prior work re-            A.3.1 How to access. The DMT prototype and other arti-
+duces translation overhead by using PTE prefetching [45]          facts are available at: https://github.com/xlab-uiuc/dmt
+and caching [9, 25, 63]. As we discuss in §6.2.2, prefetch-
+ing and caching can further unleash the power of DMT by           A.3.2 Hardware dependencies. The artifact requires at
+bringing PTEs into the caches in advance. Specifically, some      least 192 GB of physical memory and 1.5 TB of free disk
+building blocks of DMT are compatible with PTE prefetchers,       space. The CPUs must have nested paging support.
+specifically ASAP [45]. We believe that a unified infrastruc-
+                                                                  A.3.3 Software dependencies. The DMT artifact is tested
+ture to support both prefetching and DMT is viable.
+                                                                  on a server machine with Ubuntu 20.04.3 LTS on Linux 5.15
+   TLB efficiency. Prior work has greatly improved TLB            with DMT support. In principle, the artifact can run on any
+efficiency [6, 10, 19, 33, 34, 38, 58, 60, 61]. However, as TLB   Linux distribution; however, it would require modifications
+capacity does not increase at the rate as memory capacity and     of the experiment scripts.
+irregular memory access patterns of emerging workloads,
+off-TLB translation efficiency is increasingly relevant.          A.3.4 Data sets. The method to obtain data sets is included
+                                                                  in our artifact GitHub repo, located at https://github.com/
+9     Concluding Remarks                                          xlab-uiuc/dmt/blob/master/datasets/README.md
+We set to explore a practical address translation design for
+minimizing memory translation overhead in virtualized cloud       A.4     Installation
+environments. We settled with Direct Memory Translation           For instructions to install the artifact, please refer to the
+(DMT), a hardware-software extension that directly fetches        following files in our GitHub repository: https://github.com/
+the last-level page table entries containing the translation      xlab-uiuc/dmt/blob/master/README.md
+while maintaining backward compatibility with x86-based              We also provide a guide on setting up virtual machines:
+virtual memory. DMT makes us believe that an incremental          https://github.com/xlab-uiuc/dmt/blob/master/vm.md
+path towards highly efficient virtual memory is viable, even
+for virtualized environments including nested virtualization.     A.5     Evaluation and expected results
+                                                                  For instructions to run the artifact, please refer to the follow-
+Acknowledgement                                                   ing file in our GitHub repository: https://github.com/xlab-
+We thank our shepherd, Idan Yaniv, and the anonymous              uiuc/dmt/blob/master/README.md
+reviewers for their insightful comments that greatly improve        Additionally, you may refer to the following file for a min-
+the paper. We thank Jovan Stojkovic and Josep Torrellas for       imal working example: https://github.com/xlab-uiuc/dmt/
+valuable discussions. We thank Neil Zhao for the discussion       blob/master/minimal.md
+on side channels in paravirtualization systems. This work
+was funded by NSF CNS-1956007 and an Intel TSA grant.             A.6     Methodology
+                                                                  Submission, reviewing and badging methodology:
+A     Artifact Appendix
+                                                                        • https://www.acm.org/publications/policies/artifact-review-
+A.1    Abstract                                                           badging
+The DMT artifact was implemented based on Linux 5.15.127,               • http://cTuning.org/ae/submission-20201122.html
+and was developed and tested on Ubuntu 20.04.3 LTS. The                 • http://cTuning.org/ae/reviewing-20201122.html
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                             Jiyuan Zhang, Weiwei Jia, Siyuan Chai, Peizhe Liu, Jongyul Kim, and Tianyin Xu
+
+
+References                                                                                 com/DynamoRIO/dynamorio, Dec. 2023.
+ [1] Adams, K., and Agesen, O. A Comparison of Software and Hardware                  [19] Gandhi, J., Basu, A., Hill, M. D., and Swift, M. M. Efficient Memory
+     Techniques for x86 Virtualization. In Proceedings of the 26th ACM                     Virtualization: Reducing Dimensionality of Nested Page Walks. In
+     International Conference on Architectural Support for Programming                     Proceedings of the 47th Annual IEEE/ACM International Symposium on
+     Languages and Operating Systems (ASPLOS’06) (Oct. 2006).                              Microarchitecture (MICRO-47) (Dec. 2014).
+ [2] Agesen, O., Garthwaite, A., Sheldon, J., and Subrahmanyam, P.                    [20] Gandhi, J., Hill, M. D., and Swift, M. M. Agile Paging: Exceeding
+     The Evolution of an x86 Virtual Machine Monitor. ACM SIGOPS                           the Best of Nested and Shadow Paging. In Proceedings of the 43rd
+     Operating Systems Review (Dec. 2010), 3–18.                                           Annual International Symposium on Computer Architecture (ISCA’16)
+ [3] Ahn, J., Jin, S., and Huh, J. Revisiting Hardware-Assisted Page Walks                 (June 2016).
+     for Virtualized Systems. In Proceedings of the 39th Annual International         [21] Google. TCMalloc. https://github.com/google/tcmalloc, 2023.
+     Symposium on Computer Architecture (ISCA’12) (June 2012).                        [22] Gorman, M. Understanding the Linux Virtual Memory Manager. Pren-
+ [4] Ainsworth, S., and Jones, T. M. Compendia: Reducing Virtual-                          tice Hall, Apr. 2004.
+     Memory Costs via Selective Densification. In Proceedings of the 2021             [23] Gosakan, K., Han, J., Kuszmaul, W., Mubarek, I. N., Mukherjee, N.,
+     ACM SIGPLAN International Symposium on Memory Management                              Sriram, K., Tagliavini, G., West, E., Bender, M. A., Bhattachar-
+     (ISMM’21) (June 2021).                                                                jee, A., Conway, A., Farach-Colton, M., Gandhi, J., Johnson, R.,
+ [5] Alam, H., Zhang, T., Erez, M., and Etsion, Y. Do-It-Yourself Virtual                  Kannan, S., and Porter, D. E. Mosaic Pages: Big TLB Reach with
+     Memory Translation. In Proceedings of the 44th Annual International                   Small Pages. In Proceedings of the 28th ACM International Conference
+     Symposium on Computer Architecture (ISCA’17) (June 2017).                             on Architectural Support for Programming Languages and Operating
+ [6] Alverti, C., Psomadakis, S., Karakostas, V., Gandhi, J., Nikas, K.,                   Systems (ASPLOS’23) (Mar. 2023).
+     Goumas, G., and Koziris, N. Enhancing and Exploiting Contiguity                  [24] Graph 500 Steering Committee. Graph 500 Benchmark Specification.
+     for Fast Memory Virtualization. In Proceedings of the 47th Annual                     https://graph500.org/?page_id=12, 2017.
+     International Symposium on Computer Architecture (ISCA’20) (June                 [25] Gupta, S., Bhattacharyya, A., Oh, Y., Bhattacharjee, A., Falsafi,
+     2020).                                                                                B., and Payer, M. Rebooting Virtual Memory with Midgard. In
+ [7] Azure, M. Nested Virtualization in Azure. https://azure.microsoft.                    Proceedings of the 48th Annual International Symposium on Computer
+     com/en-us/blog/nested-virtualization-in-azure/, July 2017.                            Architecture (ISCA’21) (June 2021).
+ [8] Balasubramonian, R., Kahng, A. B., Muralimanohar, N., Shafiee,                   [26] Haria, S., Hill, M. D., and Swift, M. M. Devirtualizing Memory
+     A., and Srinivas, V. CACTI 7: New Tools for Interconnect Exploration                  in Heterogeneous Systems. In Proceedings of the 23rd International
+     in Innovative Off-Chip Memories. ACM Transactions on Architecture                     Conference on Architectural Support for Programming Languages and
+     and Code Optimization (TACO) 14, 2 (June 2017), 1–25.                                 Operating Systems (ASPLOS’18) (Mar. 2018).
+ [9] Barr, T. W., Cox, A. L., and Rixner, S. Translation Caching: Skip,               [27] HPC Challenge Benchmark. RandomAccess: GUPS (Giga Up-
+     Don’t Walk (the Page Table). In Proceedings of the 37th Annual Inter-                 dates Per Second).        https://hpcchallenge.org/projectsfiles/hpcc/
+     national Symposium on Computer Architecture (ISCA’10) (June 2010).                    RandomAccess.html, 2022.
+[10] Basu, A., Gandhi, J., Chang, J., Hill, M. D., and Swift, M. M. Efficient         [28] Huang, H., Lai, J., Rao, J., Lu, H., Hou, W., Su, H., Xu, Q., Zhong,
+     Virtual Memory for Big Memory Servers. In Proceedings of the 40th                     J., Zeng, J., Wang, X., He, Z., Han, W., Liu, J., Ma, T., and Wu, S.
+     Annual International Symposium on Computer Architecture (ISCA’13)                     PVM: Efficient Shadow Paging for Deploying Secure Containers in
+     (June 2013).                                                                          Cloud-native Environment. In Proceedings of the 29th Symposium on
+[11] Ben-Yehuda, M., Day, M. D., Dubitzky, Z., Factor, M., Har’El, N.,                     Operating Systems Principles (SOSP’23) (Oct. 2023).
+     Gordon, A., Liguori, A., Wasserman, O., and Yassour, B.-A. The                   [29] Hunter, A., Kennelly, C., Turner, P., Gove, D., Moseley, T., and
+     Turtles Project: Design and Implementation of Nested Virtualization.                  Ranganathan, P. Beyond malloc efficiency to fleet efficiency: a
+     In Proceedings of the 9th USENIX Symposium on Operating Systems                       hugepage-aware memory allocator. In Proceedings of the 15th USENIX
+     Design and Implementation (OSDI’10) (Oct. 2010).                                      Symposium on Operating Systems Design and Implementation (OSDI’21)
+[12] Bender, M. A., Bhattacharjee, A., Conway, A., Farach-Colton, M.,                      (July 2021).
+     Johnson, R., Kannan, S., Kuszmaul, W., Mukherjee, N., Porter, D.,                [30] Intel.        5-Level Paging and 5-Level EPT White Paper.
+     Tagliavini, G., Vorobyeva, J., and West, E. Paging and the Address-                   https://software.intel.com/content/www/us/en/develop/download/5-
+     Translation Problem. In Proceedings of the 33rd ACM Symposium on                      level-paging-and-5-level-ept-white-paper.html, May 2017.
+     Parallelism in Algorithms and Architectures (SPAA’21) (July 2021).               [31] Intel. Intel Xeon Gold 6138 Processor 27.5M Cache 2.00 GHz
+[13] Bienia, C., Kumar, S., Singh, J. P., and Li, K. The parsec benchmark                  Product Specifications. https://ark.intel.com/content/www/us/en/ark/
+     suite: Characterization and architectural implications. In Proceed-                   products/120476/intel-xeon-gold-6138-processor-27-5m-cache-2-
+     ings of the 17th international conference on Parallel architectures and               00-ghz.html, 2017.
+     compilation techniques (PACT ’08) (2008).                                        [32] Intel. Intel® 64 and IA-32 Architectures Developer’s Manual: Vol.
+[14] Cloud, G. About nested virtualization. https://cloud.google.com/                      3C. https://www.intel.com/content/www/us/en/developer/articles/
+     compute/docs/instances/nested-virtualization/overview, Dec. 2023.                     technical/intel-sdm.html, Dec. 2023.
+[15] Cox, G., and Bhattacharjee, A. Efficient Address Translation for                 [33] Jaleel, A., Ebrahimi, E., and Duncan, S. DUCATI: High-Performance
+     Architectures with Multiple Page Sizes. In Proceedings of the Twenty-                 Address Translation by Extending TLB Reach of GPU-Accelerated
+     Second International Conference on Architectural Support for Program-                 Systems. ACM Transactions on Architecture and Code Optimization
+     ming Languages and Operating Systems (ASPLOS’17) (Apr. 2017).                         (TACO) 16, 1 (Mar. 2019), 1–24.
+[16] Devices, A. M. AMD64 Architecture Programmer’s Manual: Vol-                      [34] Jia, W., Zhang, J., Shan, J., and Ding, X. Making Dynamic Page
+     umes 1-5. https://www.amd.com/content/dam/amd/en/documents/                           Coalescing Effective on Virtualized Clouds. In Proceedings of the 18th
+     processor-tech-docs/programmer-references/40332.pdf, June 2023.                       European Conference on Computer Systems (EuroSys’23) (May 2023).
+[17] Du, Y., Zhou, M., Childers, B. R., Mossé, D., and Melhem, R. Support-            [35] Jia, W., Zhang, J., Shan, J., Du, Y., Ding, X., and Xu, T. HugeGPT:
+     ing Superpages in Non-Contiguous Physical Memory. In Proceedings of                   Storing Guest Page Tables on Host Huge Pages to Accelerate Address
+     the 21st IEEE International Symposium on High Performance Computer                    Translation. In Proceedings of the 32nd International Conference on
+     Architecture (HPCA-21) (Feb. 2015).                                                   Parallel Architectures and Compilation Techniques (PACT’23) (Oct. 2023).
+[18] DynamoRIO. Dynamic Instrumentation Tool Platform. https://github.                [36] Kadekodi, R., Kadekodi, S., Ponnapalli, S., Shirwadkar, H., Ganger,
+Direct Memory Translation for Virtualized Clouds                                                     ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+     G. R., Kolli, A., and Chidambaram, V. WineFS: a hugepage-aware                 51, 2 (May 2004), 122–144.
+     file system for persistent memory that ages gracefully. In Proceedings    [55] Panwar, A., Bansal, S., and Gopinath, K. HawkEye: Efficient Fine-
+     of the 28th ACM Symposium on Operating Systems Principles (SOSP’21)            grained OS Support for Huge Pages. In Proceedings of the Twenty-Fourth
+     (Oct. 2021).                                                                   International Conference on Architectural Support for Programming
+[37] Kanellopoulos, K., Bera, R., Stojiljkovic, K., Bostanci, F. N.,                Languages and Operating Systems (ASPLOS’19) (Apr. 2019).
+     Firtina, C., Ausavarungnirun, R., Kumar, R., Hajinazar, N.,               [56] Panwar, A., Prasad, A., and Gopinath, K. Making Huge Pages Actu-
+     Sadrosadati, M., Vijaykumar, N., and Mutlu, O. Utopia: Efficient               ally Useful. In Proceedings of the Twenty-Third International Conference
+     Address Translation using Hybrid Virtual-to-Physical Address Map-              on Architectural Support for Programming Languages and Operating
+     ping. In Proceedings of the 56th Annual IEEE/ACM International Sym-            Systems (ASPLOS’18) (Mar. 2018).
+     posium on Microarchitecture (MICRO-56) (Dec. 2023).                       [57] Park, C. H., Cha, S., Kim, B., Kwon, Y., Black-Schaffer, D., and Huh,
+[38] Karakostas, V., Gandhi, J., Ayar, F., Cristal, A., Hill, M. D., McKin-         J. Perforated Page: Supporting Fragmented Memory Allocation for
+     ley, K. S., Nemirovsky, M., Swift, M. M., and Ünsal, O. Redundant              Large Pages. In Proceedings of the 47th Annual International Symposium
+     Memory Mappings for Fast Access to Large Memories. In Proceedings              on Computer Architecture (ISCA’20) (May 2020).
+     of the 42nd Annual International Symposium on Computer Architecture       [58] Park, C. H., Heo, T., Jeong, J., and Huh, J. Hybrid TLB Coalesc-
+     (ISCA’15) (June 2015).                                                         ing: Improving TLB Translation Coverage under Diverse Fragmented
+[39] Kwon, O., Lee, Y., and Hong, S. Pinning Page Structure Entries to              Memory Allocations. In Proceedings of the 44th Annual International
+     Last-Level Cache for Fast Address Translation. IEEE Access 10 (Oct.            Symposium on Computer Architecture (ISCA’17) (June 2017).
+     2022), 114552–114565.                                                     [59] Park, C. H., Vougioukas, I., Sandberg, A., and Black-Schaffer,
+[40] Kwon, Y., Yu, H., Peter, S., Rossbach, C. J., and Witchel, E. Coordi-          D. Every Walk’s a Hit: Making Page Walks Single-Access Cache
+     nated and Efficient Huge Page Management with Ingens. In Proceed-              Hits. In Proceedings of the 27th ACM International Conference on Ar-
+     ings of the 12th USENIX Symposium on Operating Systems Design and              chitectural Support for Programming Languages and Operating Systems
+     Implementation (OSDI’16) (Nov. 2016).                                          (ASPLOS’22) (Feb. 2022).
+[41] Levy, H. M., and Lipman, P. H. Virtual Memory Management in the           [60] Pham, B., Bhattacharjee, A., Eckert, Y., and Loh, G. H. Increasing
+     VAX/VMS Operating System. IEEE Computer 15, 3 (Mar. 1982), 35–41.              TLB Reach by Exploiting Clustering in Page Translations. In Proceed-
+[42] Lim, J. T., and Nieh, J. Optimizing Nested Virtualization Performance          ings of the 20th IEEE International Symposium on High Performance
+     Using Direct Virtual Hardware. In Proceedings of the Twenty-Fifth              Computer Architecture (HPCA-20) (Feb. 2014).
+     International Conference on Architectural Support for Programming         [61] Pham, B., Vaidyanathan, V., Jaleel, A., and Bhattacharjee, A.
+     Languages and Operating Systems (ASPLOS’20) (Mar. 2020).                       CoLT: Coalesced Large-Reach TLBs. In Proceedings of the 45th
+[43] Maas, M., Kennelly, C., Nguyen, K., Gove, D., McKinley, K. S., and             IEEE/ACM International Symposium on Microarchitecture (MICRO-45)
+     Turner, P. Adaptive Huge-Page Subrelease for Non-moving Mem-                   (Dec. 2012).
+     ory Allocators in Warehouse-Scale Computers. In Proceedings of the        [62] Redis. http://redis.io/, 2023.
+     2021 ACM SIGPLAN International Symposium on Memory Management             [63] Ryoo, J. H., Gulur, N., Song, S., and John, L. K. Rethinking TLB
+     (ISMM’21) (June 2021).                                                         Designs in Virtualized Environments: A Very Large Part-of-Memory
+[44] Marathe, Y., Gulur, N., Ryoo, J. H., Song, S., and John, L. K. CSALT:          TLB. In Proceedings of the 44th Annual International Symposium on
+     Context Switch Aware Large TLB. In Proceedings of the 50th Annual              Computer Architecture (ISCA’17) (June 2017).
+     IEEE/ACM International Symposium on Microarchitecture (MICRO-50)          [64] Skarlatos, D., Kokolis, A., Xu, T., and Torrellas, J. Elastic Cuckoo
+     (Oct. 2017).                                                                   Page Tables: Rethinking Virtual Memory Translation for Parallelism.
+[45] Margaritov, A., Ustiugov, D., Bugnion, E., and Grot, B. Prefetched             In Proceedings of the Twenty-Fifth International Conference on Archi-
+     Address Translation. In Proceedings of the 52nd Annual IEEE/ACM                tectural Support for Programming Languages and Operating Systems
+     International Symposium on Microarchitecture (MICRO-52) (Oct. 2019).           (ASPLOS’20) (Mar. 2020).
+[46] Margaritov, A., Ustiugov, D., Shahab, A., and Grot, B. PTEMagnet:         [65] Stojkovic, J., Mantri, N., Skarlatos, D., Xu, T., and Torrellas, J.
+     Fine-grained Physical Memory Reservation for Faster Page Walks in              Memory-Efficient Hashed Page Tables. In Proceedings of the 29th IEEE
+     Public Clouds. In Proceedings of the 26th ACM International Conference         International Symposium on High-Performance Computer Architecture
+     on Architectural Support for Programming Languages and Operating               (HPCA-29) (Feb. 2023).
+     Systems (ASPLOS’21) (Apr. 2021).                                          [66] Stojkovic, J., Skarlatos, D., Kokolis, A., Xu, T., and Torrellas, J.
+[47] Mazumdar, C., Mitra, P., and Basu, A. Dead Page and Dead Block                 Parallel Virtualized Memory Translation with Nested Elastic Cuckoo
+     Predictors: Cleaning TLBs and Caches Together. In Proceedings of               Page Tables. In Proceedings of the 27th ACM International Conference
+     the 27th IEEE International Symposium on High Performance Computer             on Architectural Support for Programming Languages and Operating
+     Architecture (HPCA-27) (Feb. 2021).                                            Systems (ASPLOS’22) (Feb. 2022).
+[48] Memcached. memcached - a distributed memory object caching                [67] Suchy, B., Campanoni, S., Hardavellas, N., and Dinda, P. CARAT:
+     system. https://memcached.org, 2023.                                           A Case for Virtual Memory through Compiler- and Runtime-Based
+[49] Microsoft. Frequently Asked Questions about Windows Subsystem                  Address Translation. In Proceedings of the 41st ACM SIGPLAN Confer-
+     for Linux. https://learn.microsoft.com/en-us/windows/wsl/faq, 2023.            ence on Programming Language Design and Implementation (PLDI’20)
+[50] Microsoft.         Virtualization-based Security (VBS).          https:        (June 2020).
+     //learn.microsoft.com/en-us/windows-hardware/design/device-               [68] Suchy, B., Ghosh, S., Kersnar, D., Chai, S., Huang, Z., Nelson, A.,
+     experiences/oem-vbs, Mar. 2023.                                                Cuevas, M., Bernat, A., Chaudhary, G., Hardavellas, N., Cam-
+[51] Mitosis Project. Mitosis Workload Btree. https://github.com/mitosis-           panoni, S., and Dinda, P. CARAT CAKE: Replacing Paging via Com-
+     project/mitosis-workload-btree, 2020.                                          piler/Kernel Cooperation. In Proceedings of the 27th ACM International
+[52] Molnar, I. Performance Counters for Linux. https://lwn.net/Articles/           Conference on Architectural Support for Programming Languages and
+     337493/, June 2009.                                                            Operating Systems (ASPLOS’22) (Feb. 2022).
+[53] Navarro, J., Iyer, S., and Cox, A. Practical, Transparent Operating       [69] Talluri, M., Hill, M. D., and Khalidi, Y. A. A New Page Table for
+     System Support for Superpages. In Proceedings of the 5th Symposium             64-bit Address Space. In Proceedings of the 15th ACM Symposium on
+     on Operating Systems Design and Implementation (OSDI’02) (Dec. 2002).          Operating Systems Principles (SOSP’95) (Dec. 1995).
+[54] Pagh, R., and Rodler, F. F. Cuckoo Hashing. Journal of Algorithms         [70] Teabe, B., Yuhala, P., Tchana, A., Hermenier, F., Hagimont, D., and
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                           Jiyuan Zhang, Weiwei Jia, Siyuan Chai, Peizhe Liu, Jongyul Kim, and Tianyin Xu
+
+
+     Muller, G. (No)Compromis: Paging Virtualization Is Not a Fatality. In               Page Management for Tiered Memory Systems. In Proceedings of the
+     Proceedings of the 17th ACM SIGPLAN/SIGOPS International Conference                 24th International Conference on Architectural Support for Programming
+     on Virtual Execution Environments (VEE’21) (Apr. 2021).                             Languages and Operating Systems (ASPLOS’19) (Apr. 2019).
+[71] Tramm, J. R., Siegel, A. R., Islam, T., and Schulz, M. XSBench - The           [80] Yaniv, I., and Tsafrir, D. Hash, Don’t Cache (the Page Table). In
+     Development and Verification of a Performance Abstraction for Monte                 Proceedings of the 2016 ACM SIGMETRICS International Conference
+     Carlo Reactor Analysis. In Proceedings of the International Conference              on Measurement and Modeling of Computer Systems (SIGMETRICS’16)
+     on Physics of Reactors (PHYSOR 2014) (Sept. 2014).                                  (June 2016).
+[72] VMware. Performance Evaluation of Intel EPT Hardware Assist.                   [81] Ye, H. Introduction to 5-Level Paging in 3rd Gen Intel Xeon Scalable
+     https://www.vmware.com/pdf/Perf_ESX_Intel-EPT-eval.pdf, 2009.                       Processors with Linux. https://lenovopress.lenovo.com/lp1468.pdf,
+[73] VMware. Support for running ESXi as a nested virtualization solution.               May 2021.
+     https://kb.vmware.com/s/article/2009916, Nov. 2023.                            [82] Yip, M.      Running Hyper-V on Amazon EC2 Bare Metal In-
+[74] Waldspurger, C. A. Memory Resource Management in VMware ESX                         stances. https://aws.amazon.com/blogs/compute/running-hyper-v-
+     Server. In Proceedings of the 5th Symposium on Operating Systems                    on-amazon-ec2-bare-metal-instances/, Aug. 2018.
+     Design and Implementation (OSDI’02) (Dec. 2002).                               [83] Zhang, F., Chen, J., Chen, H., and Zang, B. CloudVisor: Retrofitting
+[75] Wang, X., Zang, J., Wang, Z., Luo, Y., and Li, X. Selective Hard-                   Protection of Virtual Machines in Multi-tenant Cloud with Nested
+     ware/Software Memory Virtualization. In Proceedings of the 7th ACM                  Virtualization. In Proceedings of the Twenty-Third ACM Symposium on
+     SIGPLAN/SIGOPS International Conference on Virtual Execution Envi-                  Operating Systems Principles (SOSP’11) (Oct. 2011).
+     ronments (VEE’11) (Mar. 2011).                                                 [84] Zhang, L., Speight, E., Rajamony, R., and Lin, J. Enigma: Archi-
+[76] WikiChip. Intel Xeon Gold 6138. https://en.wikichip.org/wiki/intel/                 tectural and Operating System Support for Reducing the Impact of
+     xeon_gold/6138, 2019.                                                               Address Translation. In Proceedings of the 24th ACM International
+[77] Wrenger, L., Rommel, F., Halbuer, A., Dietrich, C., and Lohmann,                    Conference on Supercomputing (ICS’10) (June 2010).
+     D. LLFree: Scalable and Optionally-Persistent Page-Frame Allocation.           [85] Zhao, K., Xue, K., Wang, Z., Schatzberg, D., Yang, L., Manousis,
+     In Proceedings of the 2023 USENIX Annual Technical Conference (USENIX               A., Weiner, J., Van Riel, R., Sharma, B., Tang, C., and Skarlatos,
+     ATC’23) (July 2023).                                                                D. Contiguitas: The Pursuit of Physical Memory Contiguity in Data-
+[78] x86 cpus’ Guide. Intel Xeon Gold 6138. https://www.x86-guide.net/                   centers. In Proceedings of the 50th Annual International Symposium on
+     en/cpu/Intel-Xeon-Gold-6138-cpu-no6271.html, 2023.                                  Computer Architecture (ISCA’23) (June 2023).
+[79] Yan, Z., Lustig, D., Nellans, D., and Bhattacharjee, A. Nimble
+

@@ -1,0 +1,3333 @@
+TraceLab: Characterizing Coding Agent Workloads for LLM Serving
+Kan Zhu1
+
+Mathew Jacob1 Chenxi Ma1,2,* Yi Pan3 Stephanie Wang1
+Arvind Krishnamurthy1 Baris Kasikci1
+
+arXiv:2606.30560v2 [cs.LG] 30 Jun 2026
+
+1 University of Washington
+
+2 Wuhan University of Technology
+
+Abstract
+
+and Splitwise [60] capture real user interactions, but they are
+not focused on coding agents and lack multi-step tool-call behavior. Capability benchmarks such as Terminal-Bench [51]
+and SWE-bench [30] measure whether an agent can solve a
+task. They contain relatively few tasks, each narrowly scoped
+to a single problem. While they are standard for evaluating
+model accuracy, they are not designed to capture the diversity
+of real-world coding-agent usage from a serving system’s
+perspective.
+We aim to help fill this gap. Luckily, coding agents will
+by default log conversations and tool calls, which serves as a
+rich source of data for understanding real-world usage. We
+build a pipeline that extracts the data, normalizes the format,
+anonymizes it to protect user privacy, and finally runs the analysis to understand the workload characteristics. In this paper,
+we share initial insights from what is, to our knowledge, the
+first large-scale cross-provider trace of real coding-agent usage: about 4,300 sessions comprising roughly 350,000 LLM
+steps and 430,000 tool calls, collected from 43 developers
+over roughly eight months and spanning both Claude Code
+and Codex across more than 20 model versions. From our
+collected traces, we analyze the implications for LLM serving
+systems.
+At the session level, the workload is largely autonomous
+and consists of multiple LLM invocations and tool calls..
+To complete a user’s task, the agent will, on average, carry out
+8.8 LLM calls and invoke tools 10.8 times. It takes on average
+4.3 minutes to complete one request, with long tails whose p90
+exceeds 6.4 minutes. For the majority of iterations, the context
+grows as more user input, tool results, and LLM generations
+are added. However, two categories of context reduction are
+observed: a compaction near the context limit and a micro
+context reduction unique to Codex that occasionally occurs
+when the user starts their next request.
+Due to the multi-step nature of sessions, to avoid repeatedly prefilling the existing conversation history, modern LLM
+serving systems widely adopt prefix caching [103]. Prefix
+caching preserves the KV cache for history tokens, so each
+step only needs to prefill newly appended tokens. Although
+in API pricing, reading from the prefix cache is roughly 10×
+cheaper than performing a fresh prefill [5,56,57], the accumulated history in one session can become long, and the cache
+
+Coding agents are rapidly becoming a major application of
+agentic LLMs, but serving them efficiently remains challenging. Progress on this challenge requires understanding real
+workload patterns, yet the data needed for such analysis is
+largely absent. Existing public traces and benchmarks do not
+capture real, day-to-day coding-agent usage across multiple
+agents and model families for serving-system analysis. To
+help fill this gap, we collect and release a trace of roughly
+4,300 coding-agent sessions, containing about 350,000 LLM
+steps and 430,000 tool calls from our own day-to-day use
+of Claude Code and Codex. Our analysis shows that codingagent workloads feature long autonomous loops, long contexts with short outputs, diverse and heavily-tailed tool calls,
+and high but imperfect prefix cache hit rates. These findings
+point to concrete opportunities for optimizing serving, including lower-overhead tool calling, append-length-aware prefill,
+semantic-aware tool-latency prediction, and improved KVcache management around human-paced gaps. We release the
+dataset, trace collection pipeline, and analysis code at https:
+//github.com/uw-syfi/TraceLab.git; the project website is https://tracelab.cs.washington.edu.
+
+1
+
+3 Shanghai Jiao Tong University
+
+Introduction
+
+Agentic LLMs have grown rapidly, enabling models to handle
+increasingly complex tasks through reasoning and tool calling [65, 91]. Among these, coding agents are evolving especially fast, as companies release their own coding agents, e.g.,
+Claude Code from Anthropic [4], Codex from OpenAI [55],
+and Gemini CLI from Google [19]. Open-source solutions
+such as OpenCode [58] and DeepCode [22], which allow users
+to run local model deployments, are also gaining popularity.
+From a systems perspective, however, serving these coding
+agents is challenging. Contexts grow over sessions; SLOs are
+tight; and repeated tool calling places pressure on both the
+tool-serving infrastructure and the underlying LLM-serving
+engines. Understanding the characteristics of these workloads
+is a prerequisite for serving them efficiently.
+Existing benchmarks and traces only partially address this.
+Traces obtained from serving systems like Mooncake [63]
+*Work done while interning at the University of Washington.
+
+1
+
+must be read at every step. As a result, we observe that prefixcache reads dominate the overall API cost, under the pricing
+snapshot in Table 6.
+Within a step, LLM generation features long context
+but short output. Despite our expectation of long generations
+due to reasoning, the frequently occurring tool calls cut LLM
+generation into multiple steps, making each step’s LLM invocation have shorter output length than traditional reasoning
+workloads. The median LLM generation workload is about
+119K prefix tokens (prefix cache read of history context), 875
+append tokens (fresh new input tokens from user or tool results), and 214 output tokens. Despite the long context, both
+providers achieve good decode speed. The normalized decode
+speed has a median of 46.8 normalized tokens per second
+for Claude and 33.9 for Codex, both with significant variance
+(CV > 50%). For Codex, the median pure decode speed is
+61.3 with an estimated TTFT of 3.1 seconds per step.
+Additionally, tool calls are diverse but heavily tailed for
+popularity and latency. While more than 80 distinct tools are
+observed, the distribution is heavily skewed. The top 3 tools—
+Bash, Read, and Edit for Claude; exec_command, write_stdin,
+and apply_patch for Codex—account for more than 80% of
+all tool calls. The latency of tool calls is also diverse, spanning
+from milliseconds to hours. Tool calls longer than 1 min are
+only 4 percent of all tool calls, but they account for 85% of
+total tool-call time.
+Finally, the prefix cache greatly reduces the cost, but
+misses are still expensive. The global prefix cache hit rate
+is 95.7%, while most misses occur between the last request’s
+final output and the next request’s user input, as the delay due
+to human reading, thinking, and typing can frequently exceed
+the prefix cache eviction time. Overall, cache misses cause
+3.8× more tokens to be prefilled than prefills due to truly
+unique input tokens.
+Given these insights, we highlight the following research
+directions on optimizing LLM serving for coding agents:
+
+Overall, our work provides the first large-scale, crossprovider look into the real-world workload characteristics
+of coding agents. We release our datasets, trace collection
+and analysis pipeline, and we are excited to see how the community can use these resources to further understand and
+optimize for this emerging workload.
+
+2
+
+Background and Motivation
+
+2.1
+
+Agentic LLMs and Coding Agents
+
+Agentic LLMs, compared to traditional LLMs, are designed to
+interact with external tools and environments, perform multistep reasoning, and thus are more suitable for complex tasks.
+Coding agents, as a specific type of agentic LLMs, are designed to assist with programming tasks, such as code generation, debugging, and testing. In just a few years, they have
+become one of the most widely adopted applications of agentic LLMs. The 2025 Stack Overflow Developer Survey reports
+that 84% of developers now use or plan to use AI tools in their
+workflow [68], and individual products have reached enormous scale: GitHub Copilot surpassed 20 million users in
+2025 [18], Cursor reports more than 7 million monthly active
+users [6], and Anthropic’s Claude Code reached a $1 billion
+annualized revenue run-rate within roughly six months of its
+public launch [3].
+Agentic programming can be organized as a three-level
+hierarchy consisting of sessions, requests, and steps. A session
+is the highest-level unit of interaction. It maintains the agent’s
+accumulated context, including the conversation history, the
+contents of files the agent has read or modified, and the outputs
+of tool calls. This context persists across user interactions until
+the session terminates.
+Within a session, the user issues one or more requests.
+Each request corresponds to a natural-language task, such
+as repairing a failing test or adding a command-line option.
+Requests are processed sequentially, and each request inherits
+the context accumulated by prior requests in the same session.
+A request is typically resolved through an agentic loop
+composed of multiple steps. Each step consists of one LLM
+invocation together with any tool calls it produces. Given the
+current context, the LLM reasons about the task, may emit
+intermediate output, and then either invokes one or more tools
+or returns a final response to the user. When tools are invoked,
+their results are appended to the context and used as input to
+the next step. Thus, the first step of a request is user-initiated,
+while subsequent steps are tool-initiated. This loop continues
+until a step returns a final answer, at which point control
+returns to the user and the next request may begin from the
+updated session context. Concretely, the agentic loop has the
+following shape:
+
+1. The overhead of frequent tool-LLM switch motivates
+denser or fused tool invocations and lower-overhead tool
+call approval/runtime paths.
+2. The mixture of short and long append lengths motivates
+append-length-aware prefill routing, along with adaptive
+selection of kernels and serving-engine parallelism.
+3. The large latency variation for each tool type suggests
+that tool-latency prediction for KV cache eviction policy
+should consider the semantics of the requested operation
+and recent latency history, not just the tool name.
+4. The long prefix motivates sparse attention for reducing
+the decoding cost.
+
+User Input → LLM → Tool Calls
+Tool Results → LLM → Tool Calls
+..
+.
+
+5. The frequent idle gaps necessitate cheaper KV cache
+storage, a better compression algorithm, and wise KVcache eviction, or prefetching policies around those gaps.
+
+Tool Results → LLM → Final Answer
+2
+
+2.2
+
+Existing Datasets and Benchmarks
+
+• Metadata: session-level information such as the model,
+permission mode, and title.
+
+Despite the complexity and popularity of coding agents, there
+is a lack of public datasets that capture their real-world usage
+and suitable for guiding system optimization.
+Widely used workload traces for studying LLM serving systems, such as Mooncake [63], LMSYS-Chat-1M [101], BurstGPT [77], and Splitwise [60], capture LLM serving traffic
+at scale, but primarily model traditional usage—human chat,
+single-turn completion, or short multi-turn interactions—and
+thus lack the long-horizon, multi-step, tool-calling structure of
+agentic coding workloads. As a result, they are insufficient for
+characterizing the workload of coding agents or for evaluating
+modern serving systems under coding-agent traffic.
+Existing benchmarks for coding agents, such as TerminalBench [51] and SWE-bench [30], consist of realistic programming tasks but are built for a different goal: evaluating model
+accuracy on isolated tasks. For example, one Terminal-Bench
+task asks the agent to “implement an adaptive-rejection sampler,” a well-scoped problem. In practice, however, such a
+task is only a single request among many in the course of
+building a real project; replaying these benchmarks therefore
+captures one request in isolation and underestimates the context growth that accumulates over a session. Benchmark tool
+usage can also deviate from real-world behavior and lacks
+standardization: some benchmarks restrict the available tools,
+such as the bash-only setting in SWE-bench, while others
+leave the permitted toolset unspecified. Because the choice of
+available tools strongly shapes the tool-call distribution, this
+can materially change the resulting workload characteristics.
+Finally, although a few thousand tasks suffice for accuracy
+evaluation, this scale is too small for modeling the behavior
+of large serving fleets, particularly those using prefill–decode
+(PD) or attention–FFN (AF) disaggregation.
+In short, neither existing datasets nor benchmarks capture coding agents as persistent, tool-using systems—the
+long sessions, repeated tool calls, accumulated context, and
+human-paced gaps between requests that ultimately shape
+serving cost. To close this gap, we collect and analyze a
+large cross-provider trace of real coding-agent usage spanning
+many developers, agents, and models over an extended period.
+Because our dataset is collected from daily research workflows that use coding agents for system building, evaluation,
+and analysis, it directly captures coding agent behaviors in
+production-like settings, providing valuable insights for understanding coding-agent workloads and informing the design
+of future LLM serving systems.
+
+3
+
+Trace Format and Data Collection
+
+3.1
+
+Raw Agent Logs
+
+• User messages: user inputs, including the raw input text.
+• Reasoning: the agent’s internal reasoning steps. The
+reasoning text is encrypted for both Claude and Codex.
+• Output: intermediate natural-language output shown to
+the user, as raw text.
+• Tool calls: the tools invoked by the agent, with the tool
+type and raw arguments.
+• Tool results: the outputs returned by the tools, as raw
+text.
+Every event is timestamped, and each LLM invocation reports
+its token usage.
+3.2
+
+Normalization
+
+While Claude and Codex logs describe similar interactions,
+they differ in event structure, token accounting, and tooltiming metadata. To facilitate analysis, we normalize both
+into a unified, step-level schema in which each row corresponds to a single step, i.e., one LLM invocation together
+with the tool calls it produces.
+Token accounting. From a serving perspective, we decompose the total input tokens of each step, I, into two components: prefix tokens P, the history tokens retrieved from the
+prefix cache, and append tokens A, the tokens appended to the
+context in the current iteration, including user messages, tool
+results, and tokens introduced by prefix-cache misses. The
+providers report these components as follows:
+PClaude = cache_read_input_tokens,
+AClaude = input_tokens
++ cache_creation_input_tokens,
+PCodex = cached_input_tokens,
+ACodex = input_tokens_total
+− cached_input_tokens.
+We directly use output_tokens (O) reported by Claude
+and Codex for total generation length, which already includes reasoning tokens. Codex additionally reports separated
+reasoning_output_tokens, which we use later to characterize Codex’s generation timing.
+Throughout the paper we refer to these three categories as
+prefix tokens (P), append tokens (A), and output tokens (O).
+Timing. Each step also retains an ordered list of timing
+events—user messages, tool results, reasoning, output text,
+† A user-initiated step is a step whose first input event is a user message.
+This need not equal the number of user messages: (i) a message the user
+sends while the agent is still working is delivered together with the next tool
+result, so that step is counted as tool-initiated; and (ii) a message that never
+triggers another model call is not counted as a step at all.
+
+By default, both Claude Code and Codex persist a log for
+each session that records the full interaction between the user
+and the agent. Although the two systems use different raw
+schemas, both expose the same logical event types:
+3
+
+Table 1: Summary of the collected coding-agent trace. Token counts are in billions (B) and millions (M); the price column is an
+estimated API list-price equivalent.
+Metric
+
+Claude
+
+Codex
+
+Total
+
+opus-4-7 63.1%
+opus-4-6 12.0%
+haiku-4-5 7.9%
+sonnet-4-6 7.8%
+opus-4-8 7.7%
+Other 1.5%
+
+gpt-5.5 47.5%
+gpt-5.4 26.0%
+gpt-5.3-codex 13.7%
+gpt-5.2-codex 3.4%
+Other 9.3%
+
+23 models
+
+2,676
+37
+Oct 2025–Jun 2026
+140,338
+142,388
+∼$22.7K
+
+1,589
+22
+Sep 2025–Jun 2026
+216,823
+290,122
+∼$17.8K
+
+4,265
+43
+Sep 2025–Jun 2026
+357,161
+432,510
+∼$40.4K
+
+28.47 B
+1.19 B
+27.28 B
+96.9 M
+— (not reported)
+
+26.43 B
+1.15 B
+25.29 B
+90.1 M
+36.8 M
+
+54.90 B
+2.34 B
+52.56 B
+186.9 M
+—
+
+Models
+Model mix (% within provider)
+
+Scope & activity
+Sessions
+Distinct users
+Observation window
+LLM steps
+Tool calls
+Est. API price equiv.
+Tokens
+Total input tokens
+Append tokens
+Prefix tokens
+Output tokens (incl. reasoning)
+Reasoning tokens
+
+Table 2: Per-session, per-request, and per-step count distributions across the coding-agent trace.
+Metric
+
+Avg
+
+P25
+
+P50
+
+P90
+
+P99
+
+Per session
+Requests
+User-initiated steps†
+Tool-initiated steps
+Tool calls
+
+9.2
+8.9
+73.6
+101.4
+
+1
+1
+4
+8
+
+1
+1
+15
+25
+
+18
+17
+135
+176
+
+137
+129
+1,107
+1,438
+
+3.3
+
+To protect user privacy, we release only a sanitized trace.
+We replace all session, tool-call, project, and user identifiers
+with stable pseudonyms, and drop the raw user messages and
+tool input/output text, keeping only their character counts
+along with token usage, timestamps, and pseudonymous user
+identifiers for analysis. We summarize the resulting trace in
+Table 1.
+
+4
+
+Per request
+User-initiated steps
+Tool-initiated steps
+Tool calls
+
+0.9
+7.8
+10.8
+
+1
+0
+0
+
+1
+1
+2
+
+1
+20
+30
+
+1
+86
+113
+
+Per step
+Tool calls
+
+1.2
+
+1
+
+1
+
+2
+
+4
+
+Anonymization
+
+Session and Context Management
+
+In this section, we analyze coding-agent macroscopic metrics,
+including the agentic loop, the context management, and the
+cost and wall-clock time each session consumes.
+4.1
+
+Autonomous Loop
+
+First, we characterize the distribution of the number of requests, tool calls, and steps in Table 2 . A session on average
+has more than 9 requests, with a p99 of 137 requests, which
+highlights its persistent nature. Most of the steps are toolinitiated, so the loop is mostly autonomous. To solve one
+request, an agent on average takes around 8 steps with 11 tool
+calls. Each step on average uses slightly more than 1 tool
+call, suggesting that some tool calling is parallelized, but this
+phenomenon is not pervasive.
+
+and tool calls—from which we reconstruct its internal timeline. For tool latency, Codex reports the tool execution time
+explicitly, whereas for Claude we derive it from the tool’s call
+and return timestamps.
+4
+
+Table 3: Same-session context change, by step trigger. Each
+value is the per-step change in total input length (prefix tokens
++ append tokens) versus the previous step in the session.
+
+4.2
+
+Metric
+
+Claude
+
+Codex
+
+All steps
+Steps
+Positive (growth) %
+Negative (reduction) %
+Micro %
+Ordinary %
+Major reduction %
+Avg positive growth
+
+137,629
+99.60%
+0.39%
+0.06%
+0.09%
+0.24%
+1,719
+
+210,221
+96.56%
+3.43%
+1.08%
+1.73%
+0.62%
+1,838
+
+User-initiated steps
+Steps
+Positive (growth) %
+Negative (reduction) %
+Micro %
+Ordinary %
+Major reduction %
+Avg positive growth
+
+16,927
+98.21%
+1.71%
+0.37%
+0.57%
+0.77%
+1,527
+
+17,033
+68.63%
+31.32%
+12.47%
+18.09%
+0.76%
+2,742
+
+Tool-initiated steps
+Steps
+Positive (growth) %
+Negative (reduction) %
+Micro %
+Ordinary %
+Major reduction %
+Avg positive growth
+
+120,702
+99.79%
+0.21%
+0.02%
+0.03%
+0.16%
+1,746
+
+193,188
+99.03%
+0.97%
+0.07%
+0.29%
+0.61%
+1,783
+
+Table 4: Context compactions per session: a near-limit totalinput drop (≥64k) that recovers slowly (no rebound to 75%
+of the pre-drop level within three steps).
+Metric
+
+Claude
+
+Codex
+
+Sessions
+Major reductions (≥64k drop)
+of which compactions
+Sessions with ≥1 compaction
+
+2,676
+324
+284 (87.7%)
+120 (4.5%)
+
+1,589
+1,306
+1,235 (94.6%)
+292 (18.4%)
+
+Compactions per session
+Avg (all sessions)
+Avg (sessions with ≥1)
+P90 / P99 (sessions with ≥1)
+
+0.106
+2.37
+6 / 12
+
+0.777
+4.23
+8 / 34
+
+105 (37.0%)
+179 (63.0%)
+
+100 (8.1%)
+1,135 (91.9%)
+
+Trigger
+User-initiated
+Tool-initiated
+
+slowly, never rebounding to 75% of the pre-drop level within
+the next three steps. Table 4 reports the result. Most major
+reductions are genuine compactions (1,519 of 1,630).
+Compaction is not rare but not dominant either: 9.7% of
+sessions undergo at least one, and those that do average 3.7
+with a long tail (p99 of 33). It is overwhelmingly tool-initiated
+(86.5%, i.e. occurring mid-loop) rather than user-initiated, and
+far more common in Codex (18.4% of sessions) than Claude
+(4.5%), consistent with Codex’s shorter context length.
+4.3
+
+Cost Distribution
+
+We now compute the price of each session, request, and step.
+We use the providers’ published API pricing for the models [5,
+56, 57], summarized in Table 6, and categorize tokens into
+append tokens, prefix tokens, and output tokens. The result is
+shown in Table 5.
+A session costs $9.70 on average but only $0.61 at the
+median, with a heavy tail (p99 of $178) driven by a few very
+long sessions; a request costs $1.01 on average (median $0.33)
+and a step $0.11.
+Prefix tokens dominate spend. Although prefix tokens are
+billed at roughly one-tenth the fresh-input rate, their volume—
+the accumulating context replayed on every step—makes
+them 59.5% of total cost, versus 29.2% for append tokens, including Claude 5-minute cache-write charges, and only 11.2%
+for output tokens. Output tokens are cheap in aggregate despite their high per-token price simply because each step emits
+few tokens (median 214). This inverts the usual intuition that
+generation is the expensive part: for coding agents the cost is
+overwhelmingly in re-reading context.
+
+Context Growth and Compaction
+
+Next we investigate the context-management of coding agents.
+We show the statistics in Table 3. In most cases, context accumulates and positive growth happens, since new user input,
+tool results, and output all add to the prior context. However,
+we do observe negative growth. We categorize the reduction
+into micro-reduction (0–1024 tokens), ordinary reduction (1k–
+64k tokens), and major reduction (more than 64k tokens). For
+Claude, reduction overall is very rare, and mostly major reduction. Codex, however, has more frequent reductions, mostly
+occurring at user-initiated steps, and most of them are micro
+to ordinary reductions.
+One key type of context reduction is context compaction,
+triggered when the context nears the model’s limit: prior
+context is summarized and the session starts accumulating
+again from a very short history. We distinguish it from an
+arbitrary major reduction with three criteria: the total input
+must (i) drop by at least 64k tokens in one step, (ii) do so while
+near the session’s peak context (the pre-drop level is at least
+75% of the session’s observed maximum), and (iii) recover
+
+4.4
+
+Timing Distribution
+
+Finally, we break down wall-clock time in Table 7. We decompose time into three components: human thinking (the
+5
+
+Table 5: Per-session, per-request, and per-step cost (USD) by
+category.
+Metric
+
+Avg
+
+P50
+
+P90
+
+Per session
+Total
+Append tokens
+Prefix tokens
+Output tokens
+
+$9.70
+$2.83
+$5.77
+$1.09
+
+$0.61
+$0.24
+$0.17
+$0.16
+
+$13.4 $178
+$3.62 $46.5
+$7.55 $111
+$1.92 $16.9
+
+Per request
+Total
+Append tokens
+Prefix tokens
+Output tokens
+
+$1.01
+$0.29
+$0.60
+$0.11
+
+$0.33
+$0.04
+$0.16
+$0.03
+
+$2.44
+$0.73
+$1.35
+$0.29
+
+$9.33
+$3.91
+$6.51
+$1.08
+
+Per step
+Total
+Append tokens
+Prefix tokens
+Output tokens
+
+$0.11
+$0.03
+$0.07
+$0.01
+
+$0.07
+$0.00
+$0.05
+$0.01
+
+$0.20
+$0.03
+$0.12
+$0.03
+
+$0.72
+$0.68
+$0.41
+$0.12
+
+Table 7: Per-session, per-request, per-step, and individual latency wall-clock time by category.
+
+P99 % cost
+
+Metric
+
+P99 % time
+
+29.2%
+59.5%
+11.2%
+
+Per session, human capped (1h)
+Total
+1.8h 5.5m
+3.4h
+Human thinking
+1.2h 0.0s
+2.3h
+LLM generation
+16.1m 2.0m 26.7m
+Tool execution
+23.5m 14.9s 26.1m
+
+27.2h
+18.3h
+3.9h
+6.9h
+
+64.3%
+14.5%
+21.2%
+
+Per request
+Total (response time)
+LLM generation
+Tool execution
+
+4.3m 38.3s
+1.7m 28.8s
+2.5m 0.3s
+
+6.4m
+3.7m
+2.3m
+
+43.9m
+13.6m
+34.4m
+
+41.0%
+59.8%
+
+Per step
+LLM generation
+Tool execution
+
+11.5s
+16.8s
+
+4.9s
+0.1s
+
+20.2s
+10.0s
+
+1.3m
+3.2m
+
+40.7%
+59.3%
+
+Per individual latency
+Human thinking
+LLM generation
+Tool execution
+
+46.7m
+13.2s
+18.4s
+
+1.4m 20.6m
+5.7s 22.2s
+0.3s 13.6s
+
+13.9h
+1.4m
+3.6m
+
+29.2%
+59.5%
+11.2%
+
+5m Cache
+Output
+write read
+
+Claude
+Claude
+Claude
+Codex
+Codex
+
+6.25
+3.75
+1.25
+–
+–
+
+0.50
+0.30
+0.10
+0.50
+0.25
+
+P90
+
+29.2%
+59.5%
+11.2%
+
+Provider Model group Input
+5.00
+3.00
+1.00
+5.00
+2.50
+
+P50
+
+Per session
+Total elapsed
+Human thinking
+LLM generation
+Tool execution
+
+Table 6: API pricing snapshot used for cost accounting. Rates
+are USD per million tokens from provider pricing pages [5,56,
+57]; Claude cache-write rates use the 5-minute prompt-cache
+tier.
+
+Opus 4.6–4.8
+Sonnet 4.6
+Haiku 4.5
+GPT-5.5
+GPT-5.4
+
+Avg
+
+25.00
+15.00
+5.00
+30.00
+15.00
+
+8.2h 5.1m
+5.9h 206.5h
+7.6h 0.0s
+4.1h 190.0h
+16.1m 2.0m 26.7m
+3.9h
+23.5m 14.9s 26.1m
+6.9h
+
+92.3%
+3.3%
+4.8%
+
+p90 22.2s; and positive tool latencies have median 0.3s and
+p90 13.6s. When we cap each idle gap at one hour (the human
+capped block), the human share of the now cache-relevant
+budget falls to 64.3%, with generation and tool execution
+rising to 14.5% and 21.2%.
+Within an individual request, tool execution and generation
+both contribute to the response time: of the total 2,783 hours
+of response time, tools account for 59.8% versus 41.0% for
+generation. An average request takes 4.3 minutes end to end
+(median 38s, p90 6.4 min).
+
+gap from the previous event to the next user message), LLM
+generation (the observed time for the model to generate reasoning, output, and tool inputs), and tool execution (effective
+tool latency). Because human thinking happens between requests, request response time contains only generation and
+tool execution; the final block reports the individual positive
+human waits, generation spans, and tool latencies that match
+the corresponding CDF/summary distributions.
+From the table, the coding session is mostly idle waiting on
+the human: human thinking is 92.3% of session wall-clock,
+surpassing LLM generation (3.3%) and tool execution (4.8%).
+Most sessions are short—the median session is a single request with no inter-request gap—but a heavy tail of sessions
+left open for hours or days (session p99 elapsed of ∼206h)
+accumulates most of the idle time. In the individual latency
+view, positive human-input waits have median 1.4m and p90
+20.6m; observed LLM-generation spans have median 5.7s and
+
+4.5
+
+Takeaways and Systems Opportunities
+
+Takeaways
+• Autonomous, heavy-tailed sessions. The loop is largely
+self-driving—most steps are tool-initiated—and session
+length is heavy-tailed, with a few very long sessions
+dominating.
+• Compaction is rare. Major context reduction is rare;
+when it happens it is usually a genuine compaction near
+the context limit, with Codex additionally showing frequent micro-reductions that Claude does not.
+• Cost spent on prefix tokens. Prefix tokens, not genera6
+
+Table 8: Per-step prefix, append, and output token length distribution.
+Avg
+
+P25
+
+P50
+
+P90
+
+64k
+
+P99
+
+16k
+
+Append Tokens
+
+Tokens
+
+512k
+256k
+
+Prefix tokens
+Claude 194,361 59,949 126,180 467,082 918,111
+Codex 116,623 67,456 115,584 201,600 231,040
+Append tokens
+Claude
+8,479
+Codex
+5,283
+
+384
+406
+
+857
+886
+
+5,342 232,206
+8,310 121,009
+
+Output tokens
+Claude
+Codex
+
+132
+70
+
+252
+184
+
+1,671
+939
+
+256
+64
+4
+
+690
+415
+
+1
+0
+
+6,571
+3,508
+
+codex (sample n=48,565)
+claude (sample n=31,435)
+
+0
+
+1k
+
+2k
+
+4k
+
+8k 16k 32k 64k 128k 256k 512k
+
+Prefix Tokens
+
+Figure 1: Per-step prefix tokens vs. append tokens.
+
+• Human-bound sessions. Idle time waiting on the human dominates the session end-to-end time, while within
+a request tool execution and generation contribute comparable time.
+
+mainly have relatively large append tokens. They mostly represent prefix cache miss or initial prefills. The other group,
+with longer prefix, having much shorter append tokens, representing normal context growth due to tool result or user
+input.
+Table 9 quantifies this split. When there are few prefix
+tokens the append tokens dominate—at a prefix below 1k the
+median append is 78k tokens for Claude and 124k for Codex—
+whereas once the prefix grows past 32k the median collapses
+to well under 1k, as those steps carry only an incremental tool
+result or user turn.
+While long-append steps are rare, they contribute the majority of total prefill workload. Figure 2 shows this effect. For
+each provider, the upper bar is the share of steps and the lower
+bar the share of total append tokens, split by per-step append
+length. Over 90% of steps append fewer than 1k tokens, yet
+more than 70% of all append tokens come from the rare steps
+that append 10k or more.
+
+Systems Opportunities
+• Denser tool calling. Tool calls are frequent, yet most
+steps issue only one. Encouraging more tool calls per
+step—or fusing them—would amortize the LLM↔tool
+scheduling overhead and expose more tool-level parallelism.
+• Lower cache costs. Because cache reads are a leading
+cost driver, the prior context is worth storing and reloading more efficiently, including cost-effective KV-cache
+storage hardware and infrastructure, and sparse-attention
+schemes that shrink the prefix loading cost.
+
+LLM generation
+
+Next, we focus on the LLM generation and investigate the
+input, output and timing of the generation.
+5.1
+
+1k
+
+16
+
+tion, account for the majority of cost.
+
+5
+
+4k
+
+5.2
+
+Input length distribution
+
+Output length distribution
+
+In contrast to the large inputs, outputs are short. Table 8 shows
+a median of only 252 output tokens for Claude and 184 for
+Codex, with the p90 still under 1.7k. Even at the p99, output
+tokens stay in the few-thousand-token range, far below the
+input sizes. This is counterintuitive, by can be explained by
+the frequent tool calls. As we show in Section 4.1, one full
+response are effectively cut into average 8 tool call steps, thus
+the individual output length are short, and sometimes only
+generates next tool call parameters.
+Figure 4 shows the full per-step output distribution: both
+providers concentrate in the low hundreds of tokens, and
+Codex additionally has a pronounced spike of very short (∼40token) generations, due to its popular tool call write_stdin,
+that wait for prior command to finish or sending Ctrl+C for
+
+First, we investigate the per-step input length, split into prefix
+tokens (the replayed accumulated context) and append tokens
+(the freshly added, uncached input). Table 8 shows the distribution for both providers. A median Claude step reads back
+126k prefix tokens but appends only 857, while Codex reads
+116k and appends 886—roughly two orders of magnitude
+more prefix tokens than append tokens. Because Claude has
+a longer context length, its prefix stretches to a p99 of 918k
+tokens, while Codex saturates near 231k.
+In Figure 1, we further analyze the relationship between
+prefix and append lengths. Most of the data points fall in
+prefix length 32k-128k and append 256-8k. We can also see
+two major groups, one group, with short prefix length (<16k)
+7
+
+Table 9: Append tokens per step, conditioned on the number
+of prefix tokens, for each provider.
+Prefix
+
+Steps
+
+Avg
+
+P50
+
+P90
+
+Append length
+10-100 100-1k 1k-10k 10k-100k 100k-500k >=500k
+
+Claude
+
+P99
+
+Claude
+<1k
+1–2k
+2–4k
+4–8k
+8–16k
+16–32k
+32–64k
+64–128k
+128–256k
+>256k
+
+2,937
+0
+2
+530
+4,034
+10,248
+20,919
+33,571
+34,840
+33,257
+
+136.1K
+–
+2.7K
+122.0K
+38.8K
+35.4K
+2.8K
+1.6K
+1.4K
+1.4K
+
+78.4K
+–
+2.7K
+17.2K
+3.5K
+1.3K
+951
+793
+710
+762
+
+344.3K
+–
+3.8K
+385.3K
+108.5K
+30.7K
+5.3K
+3.7K
+3.2K
+3.1K
+
+871.9K
+–
+4.0K
+881.3K
+549.1K
+661.0K
+27.3K
+12.8K
+10.1K
+8.8K
+
+Codex
+<1k
+1–2k
+2–4k
+4–8k
+8–16k
+16–32k
+32–64k
+64–128k
+128–256k
+>256k
+
+626
+90
+2,108
+3,501
+5,503
+10,470
+29,925
+72,996
+91,598
+6
+
+116.3K
+22.2K
+56.4K
+60.2K
+22.8K
+9.6K
+3.7K
+2.7K
+2.2K
+750
+
+124.3K
+4.3K
+20.8K
+25.7K
+2.9K
+1.9K
+954
+796
+771
+900
+
+210.7K
+63.9K
+168.7K
+172.4K
+84.7K
+18.8K
+8.3K
+6.1K
+5.3K
+1.1K
+
+247.0K
+192.6K
+240.8K
+220.7K
+195.5K
+152.2K
+50.4K
+31.3K
+21.0K
+1.1K
+
+rounds
+tokens
+
+13%
+
+39%
+
+13%
+
+42%
+
+29%
+
+Codex
+rounds
+tokens
+0%
+
+52%
+
+38%
+
+23%
+
+35%
+
+25%
+
+50%
+
+Share of total
+
+38%
+
+75%
+
+100%
+
+Figure 2: Per-step append length by step count and by total
+append-token share, split by provider.
+close to the sum of the prior prefix and append, while the next
+step’s append should include the prior output. Figure 3 applies
+this test separately within each model and focuses on prior
+outputs of at least 2k tokens, where the signal is large enough
+to be visible. The figure indicates that Claude primarily uses
+output-resend. Codex, however, changes behavior across versions: gpt-5.4 is mostly output-cached, while gpt-5.5 is
+mostly output-resend.
+We hypothesize that this difference reflects KV-cache
+pool management choices in PD-disaggregated serving. The
+output-cached policy requires transferring the KV entries produced during decode back to the shared KV-storage backend.
+The next prefill instance can then load those entries, extend
+the cache for the next prompt, write the updated KV entries
+back to storage, and hand them off to the decode instance.
+This path is more complex, but it avoids re-prefilling the prior
+output. The output-resend policy, in contrast, only requires
+prefill instances to write to the shared KV-storage backend.
+Decode instances are read-only with respect to shared KV
+state: they fetch the prefix KV needed for generation, but
+discard the KV entries for newly generated output tokens.
+
+interruption.
+5.3
+
+53%
+
+Output token attribution
+
+Next, we investigate how a prior step’s output tokens are
+accounted for in the next step’s prompt. If the serving system
+saves the newly produced KV-cache entries during generation,
+then the next step can reuse the prior step’s whole prompt
+composition: prefix tokens, append tokens, and output tokens.
+We call this case output-cached. However, we also observe
+cases where the next step’s prefix excludes the prior output
+and instead re-sends it as part of the next step’s append tokens.
+We call this case output-resend.
+Figure 5 shows the two accounting schemes schematically.
+In Figure 5(a), the prior step has 10 units of prefix, 2 units of
+append, and 4 units of output; all 16 units become the next
+step’s prefix, followed by that step’s own append and output.
+In Figure 5(b), only the prior prefix and append are cached
+(10 + 2 = 12). The prior output is re-sent as part of the next
+step’s append; with one additional unit of fresh input, the next
+append becomes 4 + 1 = 5.
+We distinguish the two cases using their key invariants. Under output-cached, the next step’s prefix gain—the next prefix
+minus the prior prefix and append—should track the prior
+output. Under output-resend, the next prefix should remain
+
+5.4
+
+Timing
+
+We next examine trace-observed LLM generation latency.
+Let tinput be the latest input-event timestamp (user_message
+or tool_result) before the first model output, and let tlast
+be the last model-output timestamp (reasoning, text, or
+tool_call). For a step with provider-reported output tokens
+O, we define normalized decode speed as
+snorm =
+
+O
+.
+tlast − tinput
+
+This is an end-to-end trace speed: it includes TTFT, reasoning,
+visible output emission, and trace logging effects.
+For Codex steps with exact reasoning-token accounting,
+8
+
+4k
+
+Prior output vs next prefix gain
+
+Prior output vs next new input
+
+32k
+
+n=9,543
+512k
+256k median y-x: 112
+32k
+4k
+512
+64
+8
+10
+2k
+4k
+
+32k
+
+n=1,854
+512k
+256k median y-x: 415
+32k
+4k
+512
+64
+8
+10
+2k
+4k
+
+32k
+
+n=1,869
+512k
+256k median y-x: -2100
+32k
+4k
+512
+64
+8
+10
+2k
+4k
+
+median y-x: -3243
+
+next new input tokens
+
+Claude
+next prefix gain
+
+32k n=9,543
+512
+64
+8
+1
+0
+
+2k
+
+4k
+
+8k
+
+16k
+
+Prior output tokens
+
+4k
+
+median y-x: -3316
+
+next new input tokens
+
+gpt-5.5
+next prefix gain
+
+32k n=1,854
+512
+64
+8
+1
+0
+
+2k
+
+4k
+
+8k
+
+16k
+
+Prior output tokens
+
+4k
+
+median y-x: -140
+
+next new input tokens
+
+gpt-5.4
+next prefix gain
+
+32k n=1,869
+512
+64
+8
+1
+0
+
+2k
+
+4k
+
+8k
+
+16k
+
+Prior output tokens
+
+8k
+
+16k
+
+32k
+
+8k
+
+16k
+
+32k
+
+8k
+
+16k
+
+32k
+
+Prior output tokens
+
+Prior output tokens
+
+Prior output tokens
+
+Figure 3: Merged output-attribution evidence by model for previous outputs of at least 2k tokens. Left: prior output versus
+next-step prefix gain; right: prior output versus next-step append tokens.
+
+20k
+
+Invocations
+
+(a) Output cached as prefix
+
+codex
+claude
+
+2
+
+4
+
+10 + 2 + 4
+
+next
+
+15k
+
+1
+
+2
+
+(b) Output re-sent as new input
+
+10k
+5k
+0
+
+10
+
+prior
+
+0 16
+
+64
+
+256
+
+1k
+
+4k
+
+Output Tokens (binary scale)
+
+prior
+
+10
+
+next
+
+10 + 2
+prefix
+
+16k 32k
+
+2
+
+4
+4+1
+
+new input
+
+2
+
+output
+
+Figure 5: Two ways a prior step’s output can be accounted in
+the next step (schematic; bar lengths illustrative).
+
+Figure 4: Per-step output-token distribution by provider.
+
+We then estimate pure decode speed and residual TTFT as
+Ovisible
+,
+tvisible − treason
+∑(tvisible − treason )
+ℓ̂pure_decode =
+,
+∑ Ovisible
+d = (treason − tinput ) − Oreason ℓ̂pure_decode .
+TTFT
+spure_decode =
+
+let Oreason be reasoning tokens, Ovisible = O − Oreason be nonreasoning output tokens, treason be the reasoning timestamp,
+and tvisible be the last non-reasoning model-output timestamp.
+
+Figure 6 plots these timing metrics against the total input
+9
+
+Norm. decode
+(tokens/s)
+Norm. decode
+(tokens/s)
+Pure decode
+(tokens/s)
+
+TTFT
+(s)
+
+160
+120
+80
+40
+0
+160
+120
+80
+40
+0
+160
+120
+80
+40
+0
+40
+30
+20
+10
+0
+
+n=140,246
+w.avg=46.8 tok/s
+p25=35.3, med=52.6
+p90=81.4 tok/s
+
+Claude
+
+• Noisy decoding speed. Longer contexts are associated
+with slower observed generation, especially for Codex,
+but the variance remains large even at similar context
+lengths.
+
+bin p90
+bin median
+bin p25
+
+n=171,940
+w.avg=33.9 tok/s
+p25=19.1, med=32.7
+p90=54.7 tok/s
+
+Codex
+
+Systems Opportunities
+• Append-aware prefill optimization. The bimodal input structure suggests two different optimization targets.
+Rare long-append steps should be optimized for prefill
+throughput, while the common short-append steps may
+need another path for latency optimizations.
+
+bin p90
+bin median
+bin p25
+
+n=100,559
+w.avg=61.0 tok/s
+p25=53.2, med=57.1
+p90=109.6 tok/s
+
+Codex pure decode
+bin p90
+
+• Output-cache policy design. The coexistence of outputcached and output-resend behavior exposes a tradeoff
+between transferring decode-produced KV entries back
+to shared storage and re-prefilling prior outputs in the
+next step. Serving systems should choose this policy
+based on output length, cache pressure, and KV cache
+infra.
+
+bin median
+bin p25
+
+Codex residual TTFT
+
+n=100,556
+avg=3.4 s
+p25=1.5, med=2.3
+p90=6.4 s
+
+4k
+
+16k
+
+bin p90
+bin median
+bin p25
+
+64k
+256k
+Total input context tokens
+
+1M
+
+• Dedicated TTFT optimization. The significant residual
+TTFT for Codex suggests that better autoscaling, request
+routing, and decode admission control could meaningfully reduce end-to-end latency, especially for this multistep coding-agent workflows.
+
+Figure 6: Trace-observed LLM timing versus total input context length.
+context length. The median step is 46.8 and 33.9 normalized
+tokens/s for Claude and Codex, respectively, but the per-step
+variance is large at every context length. Claude’s binned
+median stays near 50–54 tokens/s through most of its range
+and drops only at the longest contexts, reaching roughly 43
+tokens/s around 740k input tokens. Codex shows a clearer
+context-length trend: its binned median falls from about 43
+tokens/s around 12k–23k input tokens to about 29 tokens/s
+near 185k. In the Codex-only panels, median pure decode
+speed falls from about 74 tokens/s around 12k input tokens
+to about 55 tokens/s near 185k, while median residual TTFT
+increases from about 1.5 s to 2.9 s over the same range. Thus,
+longer context is associated with slower observed generation,
+especially for Codex, but context length alone does not explain
+the wide spread; scheduling, model version, output shape, and
+backend state likely also contribute.
+5.5
+
+6
+
+Tool Calls
+
+In this section, we analyze coding agents’ tool-calling behavior, including tool call counts, latency, and human interactions.
+6.1
+
+Tool Call Count Distribution
+
+We first investigate tool call counts. In the trace, we observe 54
+different tools for Claude and 31 for Codex. Tool popularity
+is shown in Figure 7. The most common tool is command
+execution for both models, followed by file operations such
+as Read and Edit. For Claude, the top three tools account for
+over 80% of calls, while for Codex they account for 95%.
+6.2
+
+Tool Call Latency Distribution
+
+Next, we analyze tool call latency. Figure 9 shows the latency
+distribution for the top 12 most common tools for both Claude
+and Codex. Overall, average tool-call latency is 16.8s, but
+latency depends heavily on tool type. For example, file operations such as Read and Edit are mostly short, on the order of
+milliseconds to seconds, while Agent and AskUserQuestion
+can take minutes to finish. Even within each tool type, however, latency varies significantly. For example, Claude’s Bash
+tool ranges from milliseconds to minutes, although its median
+is below one second.
+Tool-call latency has a strong long tail. Figure 8 compares,
+for each latency bin, its share of tool calls with its share of
+total tool-call time. For Claude, calls under 1 s account for
+70% of calls but less than 1% of total tool time, while calls
+longer than 1 min are only 4.9% of calls but contribute 92%
+of total tool time. Codex is less extreme but still dominated
+
+Takeaways and Systems Opportunities
+
+Takeaways
+• Long context, short output. A typical step reads on the
+order of 100k (mostly cached) input tokens but emits
+only hundreds of output tokens.
+• Bimodal input structure. Steps with short prefixes tend
+to carry large append tokens, whereas when the prefix is
+long, the append tokens are usually incremental.
+• Mixed output attribution. Claude and GPT-5.5 primarily use resend output as next round input, whereas GPT5.4 primarily treats output as part of next round’s prefix.
+10
+
+Claude -- full distribution
+Other small
+2.7%
+
+Bash
+47.0%
+
+Small tools
+8.8%
+Grep
+2.3%
+Write
+2.7%
+TaskUpdate
+3.4%
+
+Expanded small-tool slice
+
+142k
+calls
+
+Edit
+13.0%
+
+8.8%
+
+AskUser
+Read
+22.8% Question
+0.6%
+WebSearch
+0.6%
+Glob
+0.7%
+
+Codex -- full distribution
+
+small tools
+
+WebFetch
+1.7%
+
+Expanded small-tool slice
+
+290k
+
+2.8%
+
+shell
+1.9%
+
+calls
+
+Agent
+0.8%
+update_plan
+0.5%
+view_image
+0.1%
+wait_agent
+0.1%
+spawn_agent
+<0.1%
+close_agent
+<0.1%
+Other small
+<0.1%
+
+exec
+cmd
+64.6%
+
+Small tools
+2.8%
+shell
+command
+2.6%
+apply_patch
+8.3%
+
+Table 10: Codex end-to-end and internal tool latency, with
+positive residual statistics.
+
+TaskCreate
+1.8%
+
+small tools
+
+write
+stdin
+21.7%
+
+Per-Call Latency
+<10ms 10-100ms 100ms-1s 1-10s 10s-1m 1-10m 10m-1h >=1h
+
+22%
+
+All timed
+exec_command
+write_stdin
+shell_command
+apply_patch
+
+253k 418.1h 341.5h 77.8h
+184k 97.8h 33.8h 64.1h
+61k 314.6h 303.7h 11.7h
+6.1k
+5.3h
+3.8h 1.8h
+2.5k
+0.5h
+0.3h 0.21h
+
+6.4
+
+Claude
+tool calls
+total latency
+
+Calls
+
+0%
+
+25%
+
+19%
+
+17%
+
+Res.
+
+Avg
+
+P50/90/99
+
+1.11s 0.13/0.24/10.0s
+1.26s 0.16/0.27/8.6s
+0.69s 0.01/0.10/14.9s
+1.08s 0.04/0.16/4.0s
+0.30s 0.01/0.41/3.9s
+
+Takeaways and System Opportunities
+
+• Heavily skewed tool call counts and latency. A small
+number of tools dominate call counts, and a small number of slow calls dominate total tool-call time.
+
+53%
+
+26%
+
+34%
+
+• Per-type latency variation Tool type can guide latency
+prediction, but there is still significant variation within
+each tool type.
+
+9%
+
+52%
+
+50%
+
+Int.
+
+Takeaways
+
+26%
+
+Codex
+24%
+tool calls
+26%
+total latency 11%
+
+E2E
+
+to-end and 341.5h of runner-reported internal execution, leaving 77.8h of residual (18.6%). The residual is dominated by
+exec_command, which contributes 64.1h. The average residual is 1.11s, and the p50/p90 remain small (0.13s/0.24s), but
+the p99 reaches 10.0s. Thus, aggregate overhead comes from
+many small gaps plus a long tail. Our hypothesis is that bash
+commands more likely require human or auto approval, which
+enlarges the p99 latency. Claude does not expose comparable internal timing coverage, so we do not make the same
+quantitative decomposition for Claude.
+
+Figure 7: Tool call count distribution for Claude and Codex.
+Command execution dominates both, followed by file operations such as read and edit.
+
+38%
+
+Tool
+
+Share of total
+
+75%
+
+100%
+
+• Considerable overhead For Codex, observed end-toend tool latency can substantially exceed runner-reported
+internal execution time, indicating non-execution overheads.
+
+Figure 8: Tool-call latency bins by call share and by totallatency share, split by provider.
+
+System Opportunities
+• Semantic-based latency prediction When predicting
+tool-call latency for prefix cache management, tool type
+alone is insufficient. The large variation within each
+tool type suggests using semantic information about the
+requested operation, together with recent latency history.
+[74]
+
+by slow calls: calls under 10 s account for 88% of calls but
+only 12% of time, while calls longer than 1 min are 3.1% of
+calls and 61% of time.
+6.3
+
+Tool Call Overhead
+
+Codex exposes two timing views for most tool calls: the traceobserved end-to-end span from tool emission to tool result,
+and the runner-reported internal execution time. For each call
+we defining overhead as R = max(0, Te2e − Tint ). This captures time around a tool call that is not reported as internal
+execution, which can include permission approval, runtime
+scheduling, shell startup, output propagation, client-side bookkeeping, etc.
+Table 10 reports this overhead for the 253,391 Codex tool
+calls with valid end-to-end and internal timings, covering
+87.3% of Codex tool calls. These calls account for 418.1h end-
+
+• Low overhead tool calling Developing low-latency
+auto-approval and reducing tool-call framework overhead can reduce tool call overhead, which is a nonnegligible part of tool call latency and overall session
+latency.
+
+7
+
+Prefix Cache
+
+In this section, we examine a key component of LLM serving
+for coding agents: the prefix cache. We analyze its hit rate
+and how it relates to idle time. Then we characterize the gap
+11
+
+Claude top 12
+
+Codex top 12
+
+Read (32,402)
+
+shell (5,416)
+
+TaskCreate (2,621)
+
+update_plan (1,406)
+
+TaskUpdate (4,801)
+
+apply_patch (24,134)
+
+Edit (18,458)
+
+close_agent (153)
+
+Write (3,847)
+
+spawn_agent (230)
+
+Grep (3,340)
+
+Other (<20 calls/... (61)
+
+Glob (945)
+
+view_image (358)
+
+Bash (66,983)
+
+exec_command (187,481)
+
+WebFetch (2,352)
+
+shell_command (7,624)
+
+WebSearch (908)
+
+write_stdin (62,848)
+
+Agent (1,155)
+
+request_user_input (53)
+
+AskUserQuestion (784)
+
+wait_agent (310)
+
+100ms
+
+1s
+
+10s
+
+1min
+
+Effective latency (log scale)
+
+10min
+
+100ms
+
+1s
+
+10s
+
+1min
+
+Effective latency (log scale)
+
+10min
+
+Figure 9: Effective tool-call latency for the top 12 tools by call count in each provider. Boxes show the interquartile range, center
+lines show medians, and whiskers show p5–p95.
+Table 11: Token-weighted prefix cache hit rate by provider
+and step trigger.
+Metric
+
+Claude
+
+Codex
+
+Total
+
+Prefix cache-hit rate
+Prefix hit rate (user-initiated)
+Prefix hit rate (tool-result)
+
+95.8%
+86.9%
+97.9%
+
+95.7%
+78.2%
+97.2%
+
+95.7%
+84.4%
+97.5%
+
+7.2
+
+Next, we dive into the prefix cache eviction time. We measure the idle time between steps and plot the corresponding
+prefix cache hit rate in Figure 11. For both Claude and Codex,
+long gaps are significantly more common for user-initiated
+steps than for tool-result steps. When the gap is larger than 5
+minutes, low-hit-rate steps begin to appear, and after 1 hour, almost all steps miss the cache. Tool gaps, especially for Codex,
+rarely exceed 5 minutes, since Codex moves long-running
+tasks into the background.
+
+to the optimal, the trade-off between KV storage space and
+the eviction time of cached prefixes, and the consumer-visible
+cost of human thinking time.
+7.1
+
+Prefix Cache Eviction Time
+
+7.3
+
+Gap to Optimal and Redundant Prefill
+
+While the overall cache hit ratio is high, there is still a gap
+to optimal. Specifically, the upper bound of the prefix cache
+hit rate is determined by the user prompts and tool results,
+since these are truly fresh tokens the system has never seen
+before. To measure them precisely, we take the total context
+growth and subtract the output tokens. Table 12 reports these
+fresh tokens against the total append tokens. Across all steps,
+fresh tokens are only 19.0% of append tokens (12.3% for
+Claude, 25.8% for Codex), meaning the remaining ∼81%
+of prefill can, in principle, be served from cache, marking
+the gap to optimal. The split is sharply step-dependent: userinitiated steps are almost entirely re-sent context (fresh is just
+1.7% of their append tokens for Claude and 4.5% for Codex),
+due to their lower cache hit rate, whereas tool-result steps
+carry more of the genuinely new content (27.1% and 40.5%,
+
+Per-Step Prefix Cache Hit Rate
+
+To begin with, we break down the cache hit rate by step type.
+Table 11 shows that prefix caching is consistently high overall:
+both Claude and Codex serve about 96% of prompt tokens
+from the prefix cache. The main misses are user-initiated
+steps, where human thinking time can make the idle time
+long enough to trigger eviction; tool-result steps remain nearperfect because they usually resume shortly.
+In Figure 10, we further illustrate the prefix cache hit rate
+over an example session. Most steps are initiated close together in time, so the prefix cache retains the context. At step
+28, a cache miss occurs due to 10 minutes of human inactivity,
+causing a large fresh prefill.
+12
+
+Time
+
+150k
+
++10m
+0m
+
+prefix / cache read
+
+5m
+
+20m
+
+append / new input
+
+total input
+
+25m
+
+30m
+
+45m
+
+50m
+
+user-initiated
+
+Input tokens
+
+125k
+100k
+75k
+50k
+25k
+0
+
+1 2 3 4
+User
+User
+
+5
+
+6
+
+7
+
+8
+
+9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40
+User
+User
+User
+User
+User
+User
+User
+User
+User
+
+Agentic steps
+
+Figure 10: Example session progression over the first 40 agentic steps. Bars decompose each step input into prefix tokens and
+append tokens; the black line shows total input, red dashed lines mark user-initiated steps, and the top strip shows elapsed time.
+
+Hit rate
+
+100%
+
+claude (16,865)
+
+claude (120,404)
+
+> 5m wait
+1h wait
+
+50%
+0% low hit
+codex (17,028)
+100%
+
+Hit rate
+
+> 5m wait
+1h wait
+
+low hit
+
+codex (157,694)
+
+50%
+0%
+
+0s 10ms 100ms 1s
+
+10s 1m 5m
+
+Human idle time
+
+1h 6h 1d 7d
+
+0s
+
+10ms 100ms 1s
+
+10s 1m 5m
+
+Tool duration
+
+1h
+
+6h 1d
+
+Figure 11: Prefix cache hit rate versus the idle time preceding a step (log x-axis), for Claude (top) and Codex (bottom).
+B · Tgeneration /(T̂human + T̂tool + Tgeneration ), where Tgeneration is
+the average LLM generation time, and T̂human and T̂tool are the
+average human thinking time and tool latency, capped by the
+eviction time. This indicates that the ratio of the suspended
+requests’ KV cache storage to that of the active decoding
+requests is approximately
+
+respectively).
+We further compute the prefill amplification factor, the
+ratio of total prefilled tokens to the irreducible fresh tokens—
+equivalently 1/(fresh % of append)—i.e., how many times
+more tokens are prefilled than a perfect, eviction-free cache
+would require. The deployed cache amplifies prefill by 5.3×
+overall (8.1× for Claude, 3.9× for Codex), flagging an optimization opportunity.
+7.4
+
+R=
+
+Storage Trade-off
+
+T̂human + T̂tool
+.
+Tgeneration
+
+We sweep the eviction time and derive the corresponding
+achievable hit rate and prefill amplification under an idealized rule: a step is a complete cache miss when its preceding
+idle gap exceeds the eviction time, and a full hit otherwise.
+Figure 12 plots all three quantities against a shared evictiontimeout axis. Raising the timeout from 1 min to 1 h lifts the
+achievable hit rate from 85.4% to 98.6%, but increases the
+
+We next examine the trade-off between the prefix cache storage space and the hit rate. Based on the observed human
+thinking time, tool latency, and LLM generation time, we
+vary the cache eviction time and compute the corresponding
+hit rate and storage space. With a global request batch B, the
+fraction of request that is actively decoding is approximately
+13
+
+Codex
+
+Total
+
+Overall
+Total append tokens
+Total fresh tokens
+Fresh % of append
+Prefill amplification
+
+1,154.0 M
+142.1 M
+12.3%
+8.1×
+
+1,115.6 M
+288.1 M
+25.8%
+3.9×
+
+2,269.6 M
+430.2 M
+19.0%
+5.3×
+
+User-initiated
+Total append tokens
+Total fresh tokens
+Fresh % of append
+Prefill amplification
+
+672.1 M
+11.4 M
+1.7%
+58.8×
+
+454.7 M
+20.4 M
+4.5%
+22.3×
+
+1,126.8 M
+31.8 M
+2.8%
+35.4×
+
+Tool-result
+Total append tokens
+Total fresh tokens
+Fresh % of append
+Prefill amplification
+
+481.8 M
+130.7 M
+27.1%
+3.7×
+
+661.0 M
+267.7 M
+40.5%
+2.5×
+
+Storage ratio R
+(susp./active KV)
+
+Claude
+
+1,142.8 M
+398.4 M
+34.9%
+2.9×
+
+8
+7
+6
+5
+4
+3
+2
+1
+0
+100×
+50×
+20×
+10×
+5×
+2×
+1×
+
+Claude
+Codex
+
+1s
+
+10s
+
+1m
+
+5m
+
+Cache eviction timeout
+
+30m
+
+2h
+
+Figure 12: Prefix cache eviction trade-off versus the eviction
+timeout (shared log x-axis), for Claude and Codex: achievable hit rate (top), storage ratio R of suspended to active KV
+(middle), and prefill amplification (bottom).
+Table 13: Upper-bound append-token and cost savings from
+eliminating user-thinking-induced prefix cache misses.
+
+storage ratio from R = 0.74 to R = 5.07 (∼7× more suspended KV). Most of the gain is cheap: by 5 min the hit rate
+is already ∼94% at R ≈ 1.9, and the remaining push to 1 h
+costs ∼2.7× more storage for only ∼4 more points of hit rate.
+The prefill amplification panel (bottom) tells a similar story.
+An idealized cache that never evicts would prefill only fresh
+tokens, so its amplification floors at 1×; tightening the eviction time re-prefills evicted context and inflates it (merged
+18.9× at 1 min, 7.4× at 5 min, 1.8× at 1 h).
+7.5
+
+100%
+90%
+80%
+70%
+60%
+50%
+
+Prefill amp.
+(total / fresh)
+
+Metric
+
+Achievable
+hit rate
+
+Table 12: Fresh prefill versus total append tokens, by provider
+and step trigger. Fresh tokens are the per-step context growth
+minus the prior step’s output tokens; prefill amplification is
+append tokens/fresh.
+
+Metric
+
+Claude
+
+Codex
+
+Total
+
+User steps w/ predecessor
+16,927
+17,033
+33,960
+Observed append
+1.19 B
+1.15 B
+2.34 B
+Append after retained cache
+541.9 M
+721.7 M
+1.26 B
+Append reduction
+648.1 M (54.5%) 423.9 M (37.0%) 1.07 B (45.9%)
+Observed total cost
+$22,654
+$17,777
+$40,431
+Cost after retained cache
+$18,973
+$16,269
+$35,242
+Cost reduction
+$3,680 (16.2%) $1,508 (8.5%) $5,189 (12.8%)
+Avg saved / reduced step
+$0.263
+$0.116
+$0.192
+
+Cost of Human Thinking Time
+
+The eviction sweep above is a system/operator view: longer
+retention improves hit rate but consumes more KV storage.
+We now analyze the same prefix cache behavior from a consumer perspective. For a user, “thinking” between requests
+can become a direct cost: if the session prefix expires during
+the pause, the next user-initiated step pays the fresh-input
+price to prefill context that was already present before the
+pause.
+We estimate an upper bound on this consumer-side cost
+by asking how much append prefill could be avoided if userinitiated steps retained their prefix cache across human thinking time. For each user-initiated step S with a predecessor
+step P in the same session, we keep the total input length unchanged but cap the append tokens at the net context growth,
+max(0, LS − LP ), where L is prefix tokens plus append tokens.
+If the observed append tokens is already smaller than this
+value, we leave it unchanged. Tool-result steps and sessionfirst steps are also unchanged. This assumes shifted tokens
+
+can be served from cache at the cache-read rate, so the resulting savings are an upper bound rather than an achievable
+policy guarantee. Table 13 reports the resulting token and cost
+reductions.
+Table 13 shows that this upper-bound estimate reduces
+append prefill by 1.07 B tokens overall, or 45.9% of observed
+append tokens. At current list prices, this corresponds to a
+final cost reduction of $5,189 (12.8%) over priced rounds.
+The reduction is larger for Claude in both token and dollar
+terms due to its longer average context length.
+7.6
+
+Takeaways and System Opportunities
+
+Takeaways
+• User-initiated steps miss the cache. Overall prefix
+cache hit rate is high, but user-initiated steps are more
+likely to miss the cache due to longer idle time.
+14
+
+• Idle time driven misses. Cache misses mainly increase
+when idle time is larger than 5 min and almost never hit
+when past 1 h.
+
+productivity and technical-debt outcomes. TraceLab is mainly
+system-focused, investigating the system implications of agentic workloads.
+
+• Large gap to optimal. Only 19% of append tokens are
+fresh, indicating a large gap to optimal and significant
+redundant prefill, and a trade-off exists between hit rate
+and storage space.
+
+8.2
+
+Production LLM serving traces and conversation
+datasets
+
+8
+
+Related Work
+
+Large-scale LLM serving traces have driven many top-tier systems papers, but their workloads are mostly chat, API, or codecompletion traffic. Mooncake [63] releases a replayed production trace with arrival times, token counts, and remapped block
+hashes for the Kimi serving stack. Splitwise [60] characterizes
+Azure “coding” and “conversation” traces, where the coding
+trace is closer to Copilot-style completion than multi-step
+agent execution. BurstGPT [77], DynamoLLM [69], ServeGen [82], KVCache Cache in the Wild [75], POLCA [61],
+and BatchLLM [104] study burstiness, energy, request generation, multi-turn shared-prefix reuse, power oversubscription, and global prefix sharing in production or productionlike LLM traffic. A second family of datasets, including
+LMSYS-Chat 1M [101], WildChat [100], MT-Bench [102],
+Chatbot Arena [13], OpenAssistant [34], WildBench [41],
+and Clio [71], captures real conversational use or derives
+benchmarks from user conversations. These traces are useful
+for trace-driven serving research, but they do not expose the
+session/request/step structure of coding agents: long accumulated context, frequent tool-triggered model invocations, tool
+latency, and human-paced gaps between requests.
+TraceLab fills this missing workload category by measuring real coding-agent traffic at the systems detail needed for
+serving decisions.
+
+8.1
+
+Real-world coding-agent traces and developer usage
+
+8.3
+
+• Human thinking time is costly. In our retained-cache
+upper-bound estimate, cache misses after human thinking time account for 45.9% of append tokens and 12.8%
+of total priced cost.
+System Opportunities
+• Step type driven eviction. Choosing the right eviction
+time depends on the ratio of cache storage cost to prefill
+cost. Advances in KV compression and reductions in
+storage cost can help reduce the prefill workload.
+• Prediction based prefetching. Gap-duration prediction
+and KV cache prefetching can evict the cache more aggressively while still providing similar TTFT for the
+user.
+• Keeping the cache alive. Agent harnesses can periodically refresh the cache during long human-thinking gaps
+to avoid eviction and reduce prefill cost, or reduce the
+frequency of user interventions through better automation.
+
+Some existing work studies coding agents and AI-assisted
+programming in real use. CacheWise [74] is a companion
+systems study from the same broad research direction: it
+uses CATraces, a real Claude Code trace, to characterize
+closed-loop coding-agent requests and to design a vLLM
+KV-cache layer with prefix-aware scheduling and predictive
+eviction from tool-call metadata. TraceLab builds on this line
+but analyzes a much broader cross-provider trace spanning
+Claude Code and Codex with several orders of magnitude
+larger token counts. SWE-chat [9] collects thousands of real
+coding-agent sessions from open-source developers and analyzes behavioral outcomes such as vibe-coding, code survival,
+and security. AgentPack [109] and The Rise of AI Teammates in Software Engineering [38] collect large numbers of
+agent-authored code edits or pull requests from GitHub. These
+works analyze code-change outcomes but not the interaction
+timeline or serving system that produced them. Programming
+by Chat [73], Reading Between the Lines [54], the GitHub
+Copilot productivity study [110], the professional-developer
+qualitative study [27], and the Cursor adoption study [20]
+similarly characterize how developers use AI coding tools,
+ranging from IDE chat logs and surveys to repository-level
+
+Coding-agent benchmarks and tool-use evaluation
+
+Software-engineering benchmarks evaluate whether agents
+can solve tasks. SWE-bench [30] and its variants, including SWE-bench Multimodal [88], Multi-SWE-bench [96],
+SWE-Gym [59], and SWE-Lancer [53], use realistic issueresolution tasks. Terminal-Bench [51] evaluates agents in
+containerized terminal environments. LiveCodeBench [28],
+BigCodeBench [108], HumanEval [12], MBPP [7], DS1000 [35], APPS [21], RepoBench [43], ClassEval [15],
+CrossCodeEval [14], Commit0 [99], MLE-bench [11], and
+Prompting LLMs to Tackle the Full Software Development Lifecycle [36] cover competitive programming, library use, data science, repository context, cross-file completion, whole-library generation, ML engineering, and full
+software development workflows. Agent frameworks and tooluse benchmarks provide the execution substrate for these
+tasks: SWE-agent [87] and OpenHands [76] implement toolusing software-engineering agents; Agentless [81] and AutoCodeRover [97] explore more structured repair pipelines;
+ReAct [91] and Toolformer [65] define influential reasoningand-action and tool-learning paradigms; tau-bench [90], tau2bench [8], ToolLLM [64], Gorilla [62], AgentBench [44], WebArena [106], GAIA [52], and OSWorld [86] test general tool
+15
+
+use, web interaction, computer use, and multi-step assistance.
+These benchmarks and frameworks are essential for capability evaluation, but they are intentionally task-centric: a
+benchmark instance is usually a single isolated request, often
+with constrained tooling and limited session history. TraceLab instead measures whole day-to-day sessions, capturing
+accumulated context, human delays, repeated tool calls, cache
+retention, and serving cost that benchmark replay cannot faithfully represent.
+8.4
+
+using empirical tool-call distributions and scheduling costs.
+TraceLab pinpoints the noisy tool latency and human thinking time of the coding trace, which requires further research
+on how to manage the prefix cache.
+8.6
+
+Another line of work reduces the cost of long contexts by changing attention or compressing KV state.
+StreamingLLM [85], InfLLM [83], Native Sparse Attention [95], MoBA [49], MInference [29], and Quest [72] reduce attention cost through locality and block-level or pagelevel importance estimation and sparse selection. H2O [98],
+Scissorhands [47], SnapKV [39], PyramidKV [10], DuoAttention [84], KIVI [48], and KVQuant [24] reduce KV
+footprint through heavy-hitter retention, prompt-token selection, layer/head-aware budgets, quantization, or mixed
+full/streaming-head caches.
+These techniques are often evaluated on long documents
+or long-context benchmarks, but TraceLab demonstrate that
+the same pressure appears in coding agents because sessions
+replay very large prefixes while appending only small tool
+results or user turns.
+
+LLM serving systems and agent-aware scheduling
+
+Modern LLM serving systems optimize batching, memory
+management, disaggregation, and scheduling. Orca [93] introduced iteration-level batching for variable-length generation. vLLM/PagedAttention [33] manages KV memory in
+non-contiguous pages and enables prefix sharing. SarathiServe [2], DistServe [105], Splitwise [60], Inference without
+Interference [25], and DeepSpeed-FastGen [23] target the prefill/decode throughput-latency trade-off through chunked prefills, phase splitting, or disaggregated execution. FlexGen [66]
+studies throughput-oriented offloading, AlpaServe [40] investigates statistical multiplexing, Fast Distributed Inference
+Serving [79] performs token-level preemptive scheduling,
+Llumnix [70] enables live migration, LoongServe [78] proposes elastic sequence parallelism, and NanoFlow [107]
+presents Intra-device parallelism, these work greatly enhanced
+the throughput and SLO attainment for large deployments.
+Agent- and program-aware systems extend this direction:
+SGLang [103] support RadixAttention for prefix reuse, Parrot [42] schedules application dataflow via semantic variables,
+Autellix [50] treats agent executions as dynamic programs or
+DAGs, and VibeServe [32] uses agents to tailor serving stacks
+for specific use cases.
+These systems provide the mechanisms to serve codingagent traffic, and several already recognize that agent programs are not independent stateless requests. TraceLab provides a standard benchmark to guide the evolve of serving
+engines for real coding agents.
+8.5
+
+Long-context attention and KV compression
+
+9
+
+Limitations and Future Work
+
+Our study has several limitations that also point to future work.
+First, our trace is drawn from our own day-to-day use of coding agents. Although it spans multiple developers, agents, and
+model versions, the results may not fully generalize to other
+organizations, development workflows, or agent domains. Second, our analysis is limited to externally visible logs, including
+prompts, model responses, tool calls, timestamps, and token
+metadata. Without internal telemetry from service providers,
+we can identify workload patterns but can only infer the mechanisms behind them, such as scheduling policies, cache behavior, or backend routing. Third, agent workloads are expanding
+beyond coding to broader computer-use and automation tasks.
+Future trace studies should extend this methodology to other
+agent domains and compare how their context growth, tool
+use, latency, and cache behavior differ from coding-agent
+workloads.
+
+Prefix-cache and KV-state management
+
+KV reuse is central to efficient multi-turn and agentic serving.
+SGLang’s RadixAttention [103], Mooncake [63], Preble [67],
+Pensieve [94], ChunkAttention [92], Hydragen [31], Prompt
+Cache [17], CacheBlend [89], CacheGen [46], EPIC [26], and
+LMCache [45] study different ways to reuse, place, retrieve,
+compress, or recompute KV state across requests and prompt
+fragments. CachedAttention/AttentionStore [16] and InferCept [1] are especially close to interactive or augmented LLM
+settings: they consider saving session KV across idle periods
+or choosing among GPU retention, CPU swapping, and recomputation when generation pauses for tools or humans.
+DualPath [80] observes that agentic workloads can shift the
+bottleneck to loading large KV state from external storage,
+while Continuum [37] selects a TTL for finished-request KV
+
+10
+
+Conclusion
+
+In this paper, we present a trace-based analysis of codingagent workloads. Notably, we find that these workloads feature long autonomous loops, long contexts paired with short
+outputs, strongly long-tailed tool calls, and high yet imperfect
+prefix-cache hit rates. Taken together, these observations point
+to serving opportunities, including denser or lower-overhead
+tool calling, append-length-specific prefill optimization, and
+better KV-cache eviction or prefetching around human-paced
+gaps. We hope this work provides a useful reference for future
+system research on coding agents and, more broadly, on LLMbased agents, and we look forward to community efforts that
+extend this trace-based analysis methodology to larger-scale
+16
+
+and more diverse agent workloads.
+
+Weng, and Aleksander Madry.
+˛
+Mle-bench: Evaluating
+machine learning agents on machine learning engineering, 2025.
+
+References
+[1] Reyna Abhyankar, Zijian He, Vikranth Srivatsa, Hao
+Zhang, and Yiying Zhang. Infercept: Efficient intercept
+support for augmented large language model inference,
+2024.
+
+[12] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan,
+Henrique Ponde de Oliveira Pinto, Jared Kaplan, Harri
+Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, Alex Ray, Raul Puri, Gretchen Krueger, Michael
+[2] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree
+Petrov, Heidy Khlaaf, Girish Sastry, Pamela Mishkin,
+Mohan, Nipun Kwatra, Bhargav S. Gulavani, Alexey
+Brooke Chan, Scott Gray, Nick Ryder, Mikhail Pavlov,
+Tumanov, and Ramachandran Ramjee.
+Taming
+Alethea Power, Lukasz Kaiser, Mohammad Bavarian,
+throughput-latency tradeoff in llm inference with
+Clemens Winter, Philippe Tillet, Felipe Petroski Such,
+sarathi-serve, 2024.
+Dave Cummings, Matthias Plappert, Fotios Chantzis,
+Elizabeth Barnes, Ariel Herbert-Voss, William HebAnthropic acquires
+bun
+[3] Anthropic.
+gen Guss, Alex Nichol, Alex Paino, Nikolas Tezak, Jie
+as
+claude
+code
+reaches
+$1b milestone.
+Tang, Igor Babuschkin, Suchir Balaji, Shantanu Jain,
+https://www.anthropic.com/news/
+William Saunders, Christopher Hesse, Andrew N. Carr,
+anthropic-acquires-bun-as-claude-code-reaches-usd1b-milestone,
+Jan Leike, Josh Achiam, Vedant Misra, Evan Morikawa,
+2025. Reached $1B annualized run-rate revenue within
+Alec Radford, Matthew Knight, Miles Brundage, Mira
+∼6 months of public launch; accessed 2026-06-14.
+Murati, Katie Mayer, Peter Welinder, Bob McGrew,
+Dario Amodei, Sam McCandlish, Ilya Sutskever, and
+[4] Anthropic. Claude code. https://www.anthropic.
+Wojciech Zaremba. Evaluating large language models
+com/claude-code, 2025. Terminal-based coding
+trained on code, 2021.
+agent; accessed 2026-06-21.
+[13] Wei-Lin Chiang, Lianmin Zheng, Ying Sheng, Anastasios Nikolas Angelopoulos, Tianle Li, Dacheng Li,
+Hao Zhang, Banghua Zhu, Michael Jordan, Joseph E.
+Gonzalez, and Ion Stoica. Chatbot arena: An open platform for evaluating llms by human preference, 2024.
+
+[5] Anthropic. Claude API pricing. https://platform.
+claude.com/docs/en/about-claude/pricing,
+2026. Accessed 2026-06-25.
+[6] Anysphere. Cursor: The AI code editor. https:
+//en.wikipedia.org/wiki/Cursor_(company),
+2025. Reports 7M+ monthly active users; accessed
+2026-06-14.
+
+[14] Yangruibo Ding, Zijian Wang, Wasi Uddin Ahmad,
+Hantian Ding, Ming Tan, Nihal Jain, Murali Krishna
+Ramanathan, Ramesh Nallapati, Parminder Bhatia,
+Dan Roth, and Bing Xiang. Crosscodeeval: A diverse
+and multilingual benchmark for cross-file code completion, 2023.
+
+[7] Jacob Austin, Augustus Odena, Maxwell Nye, Maarten
+Bosma, Henryk Michalewski, David Dohan, Ellen
+Jiang, Carrie Cai, Michael Terry, Quoc Le, and Charles
+Sutton. Program synthesis with large language models,
+2021.
+
+[15] Xueying Du, Mingwei Liu, Kaixin Wang, Hanlin Wang,
+Junwei Liu, Yixuan Chen, Jiayi Feng, Chaofeng Sha,
+Xin Peng, and Yiling Lou. Classeval: A manuallycrafted benchmark for evaluating llms on class-level
+code generation, 2023.
+
+[8] Victor Barres, Honghua Dong, Soham Ray, Xujie Si,
+and Karthik Narasimhan. τ2 -bench: Evaluating conversational agents in a dual-control environment, 2025.
+[9] Joachim Baumann, Vishakh Padmakumar, Xiang Li,
+John Yang, Diyi Yang, and Sanmi Koyejo. Swe-chat:
+Coding agent interactions from real users in the wild,
+2026.
+
+[16] Bin Gao, Zhuomin He, Puru Sharma, Qingxuan Kang,
+Djordje Jevdjic, Junbo Deng, Xingkun Yang, Zhou Yu,
+and Pengfei Zuo. Cost-efficient large language model
+serving for multi-turn conversations with cachedattention, 2024.
+
+[10] Zefan Cai, Yichi Zhang, Bofei Gao, Yuliang Liu,
+Yucheng Li, Tianyu Liu, Keming Lu, Wayne Xiong,
+Yue Dong, Junjie Hu, and Wen Xiao. Pyramidkv: Dynamic kv cache compression based on pyramidal information funneling, 2025.
+
+[17] In Gim, Guojun Chen, Seung seob Lee, Nikhil Sarda,
+Anurag Khandelwal, and Lin Zhong. Prompt cache:
+Modular attention reuse for low-latency inference,
+2024.
+
+[11] Jun Shern Chan, Neil Chowdhury, Oliver Jaffe, James
+Aung, Dane Sherburn, Evan Mays, Giulio Starace,
+Kevin Liu, Leon Maksin, Tejal Patwardhan, Lilian
+
+[18] GitHub.
+GitHub copilot surpasses 20 million
+users.
+https://dataconomy.com/2025/07/31/
+github-copilot-now-has-over-20-million-users/,
+17
+
+2025. Figure reported in Microsoft Q4 FY25 earnings;
+accessed 2026-06-14.
+
+Holistic and contamination free evaluation of large
+language models for code, 2024.
+
+[19] Google. Gemini CLI: An open-source ai agent
+that brings the power of gemini directly into your
+terminal. https://github.com/google-gemini/
+gemini-cli, 2025. Accessed 2026-06-21.
+
+[29] Huiqiang Jiang, Yucheng Li, Chengruidong Zhang,
+Qianhui Wu, Xufang Luo, Surin Ahn, Zhenhua Han,
+Amir H. Abdi, Dongsheng Li, Chin-Yew Lin, Yuqing
+Yang, and Lili Qiu. Minference 1.0: Accelerating prefilling for long-context llms via dynamic sparse attention, 2024.
+
+[20] Hao He, Courtney Miller, Shyam Agarwal, Christian
+Kästner, and Bogdan Vasilescu. Speed at the cost
+of quality: How cursor ai increases short-term velocity and long-term complexity in open-source projects,
+2026.
+
+[30] Carlos E. Jimenez, John Yang, Alexander Wettig,
+Shunyu Yao, Kexin Pei, Ofir Press, and Karthik
+Narasimhan. Swe-bench: Can language models resolve real-world github issues?, 2024.
+
+[21] Dan Hendrycks, Steven Basart, Saurav Kadavath, Mantas Mazeika, Akul Arora, Ethan Guo, Collin Burns,
+Samir Puranik, Horace He, Dawn Song, and Jacob
+Steinhardt. Measuring coding challenge competence
+with apps, 2021.
+
+[31] Jordan Juravsky, Bradley Brown, Ryan Ehrlich,
+Daniel Y. Fu, Christopher Ré, and Azalia Mirhoseini.
+Hydragen: High-throughput llm inference with shared
+prefixes, 2024.
+
+[22] HKUDS. Deepcode: Open agentic coding. https:
+//github.com/HKUDS/DeepCode, 2025. Accessed
+2026-06-21.
+
+[32] Keisuke Kamahori, Shihang Li, Simon Peter, and Baris
+Kasikci. Vibeserve: Can ai agents build bespoke llm
+serving systems?, 2026.
+
+[23] Connor Holmes, Masahiro Tanaka, Michael Wyatt,
+Ammar Ahmad Awan, Jeff Rasley, Samyam Rajbhandari, Reza Yazdani Aminabadi, Heyang Qin, Arash
+Bakhtiari, Lev Kurilenko, and Yuxiong He. Deepspeedfastgen: High-throughput text generation for llms via
+mii and deepspeed-inference, 2024.
+
+[33] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory
+management for large language model serving with
+pagedattention, 2023.
+[34] Andreas Köpf, Yannic Kilcher, Dimitri von Rütte,
+Sotiris Anagnostidis, Zhi-Rui Tam, Keith Stevens,
+Abdullah Barhoum, Nguyen Minh Duc, Oliver
+Stanley, Richárd Nagyfi, Shahul ES, Sameer Suri,
+David Glushkov, Arnav Dantuluri, Andrew Maguire,
+Christoph Schuhmann, Huu Nguyen, and Alexander
+Mattick. Openassistant conversations – democratizing
+large language model alignment, 2023.
+
+[24] Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W. Mahoney, Yakun Sophia Shao,
+Kurt Keutzer, and Amir Gholami. Kvquant: Towards
+10 million context length llm inference with kv cache
+quantization, 2025.
+[25] Cunchen Hu, Heyang Huang, Liangliang Xu, Xusheng
+Chen, Jiang Xu, Shuang Chen, Hao Feng, Chenxi
+Wang, Sa Wang, Yungang Bao, Ninghui Sun, and
+Yizhou Shan. Inference without interference: Disaggregate llm inference for mixed downstream workloads,
+2024.
+
+[35] Yuhang Lai, Chengxi Li, Yiming Wang, Tianyi Zhang,
+Ruiqi Zhong, Luke Zettlemoyer, Scott Wen tau Yih,
+Daniel Fried, Sida Wang, and Tao Yu. Ds-1000: A
+natural and reliable benchmark for data science code
+generation, 2022.
+
+[26] Junhao Hu, Wenrui Huang, Weidong Wang, Haoyi
+Wang, Tiancheng Hu, Qin Zhang, Hao Feng, Xusheng
+Chen, Yizhou Shan, and Tao Xie. Epic: Efficient
+position-independent caching for serving large language models, 2025.
+
+[36] Bowen Li, Wenhan Wu, Ziwei Tang, Lin Shi, John
+Yang, Jinyang Li, Shunyu Yao, Chen Qian, Binyuan
+Hui, Qicheng Zhang, Zhiyin Yu, He Du, Ping Yang,
+Dahua Lin, Chao Peng, and Kai Chen. Prompting large
+language models to tackle the full software development lifecycle: A case study, 2024.
+
+[27] Ruanqianqian Huang, Avery Reyna, Sorin Lerner, Haijun Xia, and Brian Hempel. Professional software
+developers don’t vibe, they control: Ai agent use for
+coding in 2025, 2025.
+
+[37] Hanchen Li, Runyuan He, Qiuyang Mang, Qizheng
+Zhang, Huanzhi Mao, Xiaokun Chen, Hangrui Zhou,
+Alvin Cheung, Joseph Gonzalez, and Ion Stoica. Continuum: Efficient and robust multi-turn llm agent
+scheduling with kv cache time-to-live, 2026.
+
+[28] Naman Jain, King Han, Alex Gu, Wen-Ding Li, Fanjia Yan, Tianjun Zhang, Sida Wang, Armando SolarLezama, Koushik Sen, and Ion Stoica. Livecodebench:
+18
+
+[38] Hao Li, Haoxiang Zhang, and Ahmed E. Hassan. The
+rise of ai teammates in software engineering (se) 3.0:
+How autonomous coding agents are reshaping software
+engineering, 2025.
+
+[48] Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong,
+Zhaozhuo Xu, Vladimir Braverman, Beidi Chen, and
+Xia Hu. Kivi: A tuning-free asymmetric 2bit quantization for kv cache, 2024.
+
+[39] Yuhong Li, Yingbing Huang, Bowen Yang, Bharat
+Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle Cai,
+Patrick Lewis, and Deming Chen. Snapkv: Llm knows
+what you are looking for before generation, 2024.
+
+[49] Enzhe Lu, Zhejun Jiang, Jingyuan Liu, Yulun Du, Tao
+Jiang, Chao Hong, Shaowei Liu, Weiran He, Enming
+Yuan, Yuzhi Wang, Zhiqi Huang, Huan Yuan, Suting
+Xu, Xinran Xu, Guokun Lai, Yanru Chen, Huabin
+Zheng, Junjie Yan, Jianlin Su, Yuxin Wu, Neo Y.
+Zhang, Zhilin Yang, Xinyu Zhou, Mingxing Zhang,
+and Jiezhong Qiu. Moba: Mixture of block attention
+for long-context llms, 2025.
+
+[40] Zhuohan Li, Lianmin Zheng, Yinmin Zhong, Vincent
+Liu, Ying Sheng, Xin Jin, Yanping Huang, Zhifeng
+Chen, Hao Zhang, Joseph E. Gonzalez, and Ion Stoica. Alpaserve: Statistical multiplexing with model
+parallelism for deep learning serving, 2023.
+
+[50] Michael Luo, Xiaoxiang Shi, Colin Cai, Tianjun Zhang,
+Justin Wong, Yichuan Wang, Chi Wang, Yanping
+Huang, Zhifeng Chen, Joseph E. Gonzalez, and Ion
+Stoica. Autellix: An efficient serving engine for llm
+agents as general programs, 2025.
+
+[41] Bill Yuchen Lin, Yuntian Deng, Khyathi Chandu, Faeze
+Brahman, Abhilasha Ravichander, Valentina Pyatkin,
+Nouha Dziri, Ronan Le Bras, and Yejin Choi. Wildbench: Benchmarking llms with challenging tasks from
+real users in the wild, 2024.
+
+[51] Mike A. Merrill, Alexander G. Shaw, Nicholas Carlini, Boxuan Li, Harsh Raj, Ivan Bercovich, Lin
+Shi, Jeong Yeon Shin, Thomas Walshe, E. Kelly
+Buchanan, Junhong Shen, Guanghao Ye, Haowei Lin,
+Jason Poulos, Maoyu Wang, Marianna Nezhurina, Jenia Jitsev, Di Lu, Orfeas Menis Mastromichalakis,
+Zhiwei Xu, Zizhao Chen, Yue Liu, Robert Zhang,
+Leon Liangyu Chen, Anurag Kashyap, Jan-Lucas
+Uslu, Jeffrey Li, Jianbo Wu, Minghao Yan, Song
+Bian, Vedang Sharma, Ke Sun, Steven Dillmann, Akshay Anand, Andrew Lanpouthakoun, Bardia Koopah,
+Changran Hu, Etash Guha, Gabriel H. S. Dreiman,
+Jiacheng Zhu, Karl Krauth, Li Zhong, Niklas Muennighoff, Robert Amanfu, Shangyin Tan, Shreyas Pimpalgaonkar, Tushar Aggarwal, Xiangning Lin, Xin Lan,
+Xuandong Zhao, Yiqing Liang, Yuanli Wang, Zilong
+Wang, Changzhi Zhou, David Heineman, Hange Liu,
+Harsh Trivedi, John Yang, Junhong Lin, Manish Shetty,
+Michael Yang, Nabil Omi, Negin Raoof, Shanda Li,
+Terry Yue Zhuo, Wuwei Lin, Yiwei Dai, Yuxin Wang,
+Wenhao Chai, Shang Zhou, Dariush Wahdany, Ziyu
+She, Jiaming Hu, Zhikang Dong, Yuxuan Zhu, Sasha
+Cui, Ahson Saiyed, Arinbjörn Kolbeinsson, Jesse Hu,
+Christopher Michael Rytting, Ryan Marten, Yixin
+Wang, Alex Dimakis, Andy Konwinski, and Ludwig
+Schmidt. Terminal-bench: Benchmarking agents on
+hard, realistic tasks in command line interfaces, 2026.
+
+[42] Chaofan Lin, Zhenhua Han, Chengruidong Zhang,
+Yuqing Yang, Fan Yang, Chen Chen, and Lili Qiu. Parrot: Efficient serving of llm-based applications with
+semantic variable, 2024.
+[43] Tianyang Liu, Canwen Xu, and Julian McAuley. Repobench: Benchmarking repository-level code autocompletion systems, 2023.
+[44] Xiao Liu, Hao Yu, Hanchen Zhang, Yifan Xu, Xuanyu Lei, Hanyu Lai, Yu Gu, Hangliang Ding, Kaiwen
+Men, Kejuan Yang, Shudan Zhang, Xiang Deng, Aohan Zeng, Zhengxiao Du, Chenhui Zhang, Sheng Shen,
+Tianjun Zhang, Yu Su, Huan Sun, Minlie Huang, Yuxiao Dong, and Jie Tang. Agentbench: Evaluating llms
+as agents, 2025.
+[45] Yuhan Liu, Yihua Cheng, Jiayi Yao, Yuwei An, Xiaokun Chen, Shaoting Feng, Yuyang Huang, Samuel
+Shen, Rui Zhang, Kuntai Du, and Junchen Jiang. Lmcache: An efficient kv cache layer for enterprise-scale
+llm inference, 2025.
+[46] Yuhan Liu, Hanchen Li, Yihua Cheng, Siddhant Ray,
+Yuyang Huang, Qizheng Zhang, Kuntai Du, Jiayi Yao,
+Shan Lu, Ganesh Ananthanarayanan, Michael Maire,
+Henry Hoffmann, Ari Holtzman, and Junchen Jiang.
+Cachegen: Kv cache compression and streaming for
+fast large language model serving, 2024.
+
+[52] Grégoire Mialon, Clémentine Fourrier, Craig Swift,
+Thomas Wolf, Yann LeCun, and Thomas Scialom.
+Gaia: a benchmark for general ai assistants, 2023.
+
+[47] Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao
+Wang, Victor Xie, Zhaozhuo Xu, Anastasios Kyrillidis,
+and Anshumali Shrivastava. Scissorhands: Exploiting
+the persistence of importance hypothesis for llm kv
+cache compression at test time, 2023.
+
+[53] Samuel Miserendino, Michele Wang, Tejal Patwardhan,
+and Johannes Heidecke. Swe-lancer: Can frontier llms
+earn $1 million from real-world freelance software
+engineering?, 2025.
+19
+
+[54] Hussein Mozannar, Gagan Bansal, Adam Fourney, and
+Eric Horvitz. Reading between the lines: Modeling
+user behavior and costs in ai-assisted programming,
+2024.
+
+[66] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Daniel Y. Fu, Zhiqiang Xie,
+Beidi Chen, Clark Barrett, Joseph E. Gonzalez, Percy
+Liang, Christopher Ré, Ion Stoica, and Ce Zhang. Flexgen: High-throughput generative inference of large
+language models with a single gpu, 2023.
+
+[55] OpenAI. Codex CLI: A lightweight coding agent
+that runs in your terminal. https://github.com/
+openai/codex, 2025. Accessed 2026-06-21.
+
+[67] Vikranth Srivatsa, Zijian He, Reyna Abhyankar, Dongming Li, and Yiying Zhang. Preble: Efficient distributed prompt scheduling for llm serving, 2024.
+
+[56] OpenAI. API pricing. https://openai.com/api/
+pricing/, 2026. Accessed 2026-06-25.
+
+[68] Stack Overflow. 2025 stack overflow developer
+survey: Ai. https://survey.stackoverflow.co/
+2025/ai/, 2025. Reports 84% of developers use or
+plan to use AI tools; accessed 2026-06-14.
+
+[57] OpenAI. Codex pricing. https://developers.
+openai.com/codex/pricing, 2026. Accessed 202606-25.
+[58] OpenCode. Opencode: The open source AI coding
+agent. https://opencode.ai/, 2025. Accessed
+2026-06-21.
+
+[69] Jovan Stojkovic, Chaojie Zhang, Íñigo Goiri, Josep
+Torrellas, and Esha Choukse. Dynamollm: Designing llm inference clusters for performance and energy
+efficiency, 2024.
+
+[59] Jiayi Pan, Xingyao Wang, Graham Neubig, Navdeep
+Jaitly, Heng Ji, Alane Suhr, and Yizhe Zhang. Training
+software engineering agents and verifiers with swegym, 2025.
+
+[70] Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao,
+Xinyi Zhang, Yong Li, and Wei Lin. Llumnix: Dynamic scheduling for large language model serving,
+2024.
+
+[60] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka
+Shah, Íñigo Goiri, Saeed Maleki, and Ricardo Bianchini. Splitwise: Efficient generative llm inference
+using phase splitting, 2024.
+
+[71] Alex Tamkin, Miles McCain, Kunal Handa, Esin Durmus, Liane Lovitt, Ankur Rathi, Saffron Huang, Alfred
+Mountfield, Jerry Hong, Stuart Ritchie, Michael Stern,
+Brian Clarke, Landon Goldberg, Theodore R. Sumers,
+Jared Mueller, William McEachen, Wes Mitchell, Shan
+Carter, Jack Clark, Jared Kaplan, and Deep Ganguli.
+Clio: Privacy-preserving insights into real-world ai use,
+2024.
+
+[61] Pratyush Patel, Esha Choukse, Chaojie Zhang, Íñigo
+Goiri, Brijesh Warrier, Nithish Mahalingam, and Ricardo Bianchini. Polca: Power oversubscription in llm
+cloud providers, 2023.
+[62] Shishir G. Patil, Tianjun Zhang, Xin Wang, and
+Joseph E. Gonzalez. Gorilla: Large language model
+connected with massive apis, 2023.
+
+[72] Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan
+Xiao, Baris Kasikci, and Song Han. Quest: Queryaware sparsity for efficient long-context llm inference,
+2024.
+
+[63] Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang,
+Yongwei Wu, Weimin Zheng, and Xinran Xu. Mooncake: A kvcache-centric disaggregated architecture for
+llm serving, 2025.
+
+[73] Ningzhi Tang, Chaoran Chen, Zihan Fang, Gelei Xu,
+Maria Dhakal, Yiyu Shi, Collin McMillan, Yu Huang,
+and Toby Jia-Jun Li. Programming by chat: A largescale behavioral analysis of 11,579 real-world aiassisted ide sessions, 2026.
+
+[64] Yujia Qin, Shihao Liang, Yining Ye, Kunlun Zhu,
+Lan Yan, Yaxi Lu, Yankai Lin, Xin Cong, Xiangru
+Tang, Bill Qian, Sihan Zhao, Lauren Hong, Runchu
+Tian, Ruobing Xie, Jie Zhou, Mark Gerstein, Dahai Li,
+Zhiyuan Liu, and Maosong Sun. Toolllm: Facilitating
+large language models to master 16000+ real-world
+apis, 2023.
+
+[74] Shubham Tiwari, Tapan Chugh, Nash Rickert, Simon
+Peter, Ratul Mahajan, and Haiying Shen. Cachewise: Understanding workloads and optimizing kvcache management for efficiently serving llm coding
+agents, 2026.
+
+[65] Timo Schick, Jane Dwivedi-Yu, Roberto Dessì,
+Roberta Raileanu, Maria Lomeli, Luke Zettlemoyer,
+Nicola Cancedda, and Thomas Scialom. Toolformer:
+Language models can teach themselves to use tools,
+2023.
+
+[75] Jiahao Wang, Jinbo Han, Xingda Wei, Sijie Shen,
+Dingyan Zhang, Chenguang Fang, Rong Chen,
+Wenyuan Yu, and Haibo Chen. Kvcache cache in the
+wild: Characterizing and optimizing kvcache cache at
+a large cloud provider, 2026.
+20
+
+[76] Xingyao Wang, Boxuan Li, Yufan Song, Frank F. Xu,
+Xiangru Tang, Mingchen Zhuge, Jiayi Pan, Yueqi Song,
+Bowen Li, Jaskirat Singh, Hoang H. Tran, Fuqiang Li,
+Ren Ma, Mingzhang Zheng, Bill Qian, Yanjun Shao,
+Niklas Muennighoff, Yizhe Zhang, Binyuan Hui, Junyang Lin, Robert Brennan, Hao Peng, Heng Ji, and
+Graham Neubig. Openhands: An open platform for ai
+software developers as generalist agents, 2025.
+
+[86] Tianbao Xie, Danyang Zhang, Jixuan Chen, Xiaochuan
+Li, Siheng Zhao, Ruisheng Cao, Toh Jing Hua, Zhoujun Cheng, Dongchan Shin, Fangyu Lei, Yitao Liu,
+Yiheng Xu, Shuyan Zhou, Silvio Savarese, Caiming
+Xiong, Victor Zhong, and Tao Yu. Osworld: Benchmarking multimodal agents for open-ended tasks in
+real computer environments, 2024.
+[87] John Yang, Carlos E. Jimenez, Alexander Wettig, Kilian Lieret, Shunyu Yao, Karthik Narasimhan, and Ofir
+Press. Swe-agent: Agent-computer interfaces enable
+automated software engineering, 2024.
+
+[77] Yuxin Wang, Yuhan Chen, Zeyu Li, Xueze Kang,
+Yuchu Fang, Yeju Zhou, Yang Zheng, Zhenheng Tang,
+Xin He, Rui Guo, Xin Wang, Qiang Wang, Amelie Chi
+Zhou, and Xiaowen Chu. Burstgpt: A real-world workload dataset to optimize llm serving systems, 2025.
+[78] Bingyang Wu, Shengyu Liu, Yinmin Zhong, Peng Sun,
+Xuanzhe Liu, and Xin Jin. Loongserve: Efficiently
+serving long-context large language models with elastic sequence parallelism, 2024.
+
+[88] John Yang, Carlos E. Jimenez, Alex L. Zhang, Kilian
+Lieret, Joyce Yang, Xindi Wu, Ori Press, Niklas Muennighoff, Gabriel Synnaeve, Karthik R. Narasimhan,
+Diyi Yang, Sida I. Wang, and Ofir Press. Swe-bench
+multimodal: Do ai systems generalize to visual software domains?, 2024.
+
+[79] Bingyang Wu, Yinmin Zhong, Zili Zhang, Shengyu
+Liu, Fangyue Liu, Yuanhang Sun, Gang Huang, Xuanzhe Liu, and Xin Jin. Fast distributed inference
+serving for large language models, 2024.
+
+[89] Jiayi Yao, Hanchen Li, Yuhan Liu, Siddhant Ray, Yihua Cheng, Qizheng Zhang, Kuntai Du, Shan Lu, and
+Junchen Jiang. Cacheblend: Fast large language model
+serving for rag with cached knowledge fusion, 2025.
+
+[80] Yongtong Wu, Shaoyuan Chen, Yinmin Zhong, Rilin
+Huang, Yixuan Tan, Wentao Zhang, Liyue Zhang,
+Shangyan Zhou, Yuxuan Liu, Shunfeng Zhou, Mingxing Zhang, Xin Jin, and Panpan Huang. Dualpath:
+Breaking the storage bandwidth bottleneck in agentic
+llm inference, 2026.
+
+[90] Shunyu Yao, Noah Shinn, Pedram Razavi, and Karthik
+Narasimhan. τ-bench: A benchmark for tool-agentuser interaction in real-world domains, 2024.
+[91] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak
+Shafran, Karthik Narasimhan, and Yuan Cao. React:
+Synergizing reasoning and acting in language models,
+2023.
+
+[81] Chunqiu Steven Xia, Yinlin Deng, Soren Dunn, and
+Lingming Zhang. Agentless: Demystifying llm-based
+software engineering agents, 2024.
+
+[92] Lu Ye, Ze Tao, Yong Huang, and Yang Li. Chunkattention: Efficient self-attention with prefix-aware kv
+cache and two-phase partition, 2024.
+
+[82] Yuxing Xiang, Xue Li, Kun Qian, Wenyuan Yu, Ennan
+Zhai, and Xin Jin. Servegen: Workload characterization and generation of large language model serving in
+production, 2026.
+
+[93] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim,
+Soojeong Kim, and Byung-Gon Chun. Orca: A
+distributed serving system for Transformer-Based
+generative models. In 16th USENIX Symposium
+on Operating Systems Design and Implementation
+(OSDI 22), pages 521–538, Carlsbad, CA, July 2022.
+USENIX Association.
+
+[83] Chaojun Xiao, Pengle Zhang, Xu Han, Guangxuan
+Xiao, Yankai Lin, Zhengyan Zhang, Zhiyuan Liu, and
+Maosong Sun. Infllm: Training-free long-context extrapolation for llms with an efficient context memory,
+2024.
+
+[94] Lingfan Yu, Jinkun Lin, and Jinyang Li. Stateful large
+language model serving with pensieve, 2024.
+
+[84] Guangxuan Xiao, Jiaming Tang, Jingwei Zuo, Junxian
+Guo, Shang Yang, Haotian Tang, Yao Fu, and Song
+Han. Duoattention: Efficient long-context llm inference with retrieval and streaming heads, 2024.
+
+[95] Jingyang Yuan, Huazuo Gao, Damai Dai, Junyu Luo,
+Liang Zhao, Zhengyan Zhang, Zhenda Xie, Y. X. Wei,
+Lean Wang, Zhiping Xiao, Yuqing Wang, Chong Ruan,
+Ming Zhang, Wenfeng Liang, and Wangding Zeng. Native sparse attention: Hardware-aligned and natively
+trainable sparse attention, 2025.
+
+[85] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song
+Han, and Mike Lewis. Efficient streaming language
+models with attention sinks, 2024.
+21
+
+[96] Daoguang Zan, Zhirong Huang, Wei Liu, Hanwu Chen,
+Linhao Zhang, Shulin Xin, Lu Chen, Qi Liu, Xiaojian Zhong, Aoyan Li, Siyao Liu, Yongsheng Xiao,
+Liangqiang Chen, Yuyu Zhang, Jing Su, Tianyu Liu,
+Rui Long, Kai Shen, and Liang Xiang. Multi-swebench: A multilingual benchmark for issue resolving,
+2025.
+
+Neubig. Webarena: A realistic web environment for
+building autonomous agents, 2024.
+[107] Kan Zhu, Yufei Gao, Yilong Zhao, Liangyu Zhao,
+Gefei Zuo, Yile Gu, Dedong Xie, Tian Tang, Qinyu
+Xu, Zihao Ye, Keisuke Kamahori, Chien-Yu Lin, Ziren
+Wang, Stephanie Wang, Arvind Krishnamurthy, and
+Baris Kasikci. Nanoflow: Towards optimal large language model serving throughput, 2025.
+
+[97] Yuntong Zhang, Haifeng Ruan, Zhiyu Fan, and Abhik
+Roychoudhury. Autocoderover: Autonomous program
+improvement, 2024.
+
+[108] Terry Yue Zhuo, Minh Chien Vu, Jenny Chim, Han
+Hu, Wenhao Yu, Ratnadira Widyasari, Imam Nur Bani
+Yusuf, Haolan Zhan, Junda He, Indraneil Paul, Simon
+Brunner, Chen Gong, Thong Hoang, Armel Randy Zebaze, Xiaoheng Hong, Wen-Ding Li, Jean Kaddour,
+Ming Xu, Zhihan Zhang, Prateek Yadav, Naman Jain,
+Alex Gu, Zhoujun Cheng, Jiawei Liu, Qian Liu, Zijian
+Wang, Binyuan Hui, Niklas Muennighoff, David Lo,
+Daniel Fried, Xiaoning Du, Harm de Vries, and Leandro Von Werra. Bigcodebench: Benchmarking code
+generation with diverse function calls and complex
+instructions, 2025.
+
+[98] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong
+Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Ré, Clark Barrett, Zhangyang
+Wang, and Beidi Chen. H2 o: Heavy-hitter oracle for
+efficient generative inference of large language models,
+2023.
+[99] Wenting Zhao, Nan Jiang, Celine Lee, Justin T Chiu,
+Claire Cardie, Matthias Gallé, and Alexander M Rush.
+Commit0: Library generation from scratch, 2024.
+[100] Wenting Zhao, Xiang Ren, Jack Hessel, Claire Cardie,
+Yejin Choi, and Yuntian Deng. Wildchat: 1m chatgpt
+interaction logs in the wild, 2024.
+
+[109] Yangtian Zi, Zixuan Wu, Aleksander BoruchGruszecki, Jonathan Bell, and Arjun Guha. Agentpack:
+A dataset of code changes, co-authored by agents and
+humans, 2026.
+
+[101] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Tianle
+Li, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang,
+Zhuohan Li, Zi Lin, Eric P. Xing, Joseph E. Gonzalez,
+Ion Stoica, and Hao Zhang. Lmsys-chat-1m: A largescale real-world llm conversation dataset, 2024.
+
+[110] Albert Ziegler, Eirini Kalliamvakou, Shawn Simister,
+Ganesh Sittampalam, Alice Li, Andrew Rice, Devon
+Rifkin, and Edward Aftandilian. Productivity assessment of neural code completion, 2022.
+
+[102] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan
+Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric P. Xing, Hao Zhang, Joseph E.
+Gonzalez, and Ion Stoica. Judging llm-as-a-judge with
+mt-bench and chatbot arena, 2023.
+[103] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie,
+Chuyue Sun, Jeff Huang, Cody Hao Yu, Shiyi Cao,
+Christos Kozyrakis, Ion Stoica, Joseph E. Gonzalez,
+Clark Barrett, and Ying Sheng. Sglang: Efficient execution of structured language model programs, 2024.
+[104] Zhen Zheng, Xin Ji, Taosong Fang, Fanghao Zhou,
+Chuanjie Liu, and Gang Peng. Batchllm: Optimizing
+large batched llm inference with global prefix sharing
+and throughput-oriented token batching, 2026.
+[105] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu,
+Yibo Zhu, Xuanzhe Liu, Xin Jin, and Hao Zhang. Distserve: Disaggregating prefill and decoding for goodputoptimized large language model serving, 2024.
+[106] Shuyan Zhou, Frank F. Xu, Hao Zhu, Xuhui Zhou,
+Robert Lo, Abishek Sridhar, Xianyi Cheng, Tianyue
+Ou, Yonatan Bisk, Daniel Fried, Uri Alon, and Graham
+22
+
+

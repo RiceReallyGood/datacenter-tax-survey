@@ -1,0 +1,1188 @@
+                                                    Squeezy: Rapid VM Memory Reclamation for
+                                                               Serverless Functions
+                                                 Orestis Lagkas Nikolos                                 Chloe Alverti                           Stratos Psomadakis
+                                                 olagkas@cslab.ece.ntua.gr                           xalverti@illinois.edu                   psomas@cslab.ece.ntua.gr
+                                              National Technical University Of                       University of Illinois               National Technical University Of
+                                                          Athens                                     Urbana-Champaign                                 Athens
+                                                      Athens, Greece                                     Illinois, USA                            Athens, Greece
+
+                                                                             Georgios Goumas                              Nectarios Koziris
+                                                                        goumas@cslab.ece.ntua.gr                     nkoziris@cslab.ece.ntua.gr
+                                                                      National Technical University Of             National Technical University Of
+arXiv:2411.12893v2 [cs.OS] 6 Dec 2025
+
+
+
+
+                                                                                  Athens                                       Athens
+                                                                              Athens, Greece                               Athens, Greece
+                                        Abstract                                                                   ACM Reference Format:
+                                        Resource elasticity is one of the key defining characteristics             Orestis Lagkas Nikolos, Chloe Alverti, Stratos Psomadakis, Georgios
+                                                                                                                   Goumas, and Nectarios Koziris. 2026. Squeezy: Rapid VM Memory
+                                        of the Function-as-a-Service (FaaS) serverless computing par-
+                                                                                                                   Reclamation for Serverless Functions. In 21st European Conference
+                                        adigm. While compute resources assigned to VM-sandboxed                    on Computer Systems (EUROSYS ’26), April 27–30, 2026, Edinburgh,
+                                        functions can be seamlessly adjusted on the fly, memory                    Scotland Uk. ACM, New York, NY, USA, 16 pages. https://doi.org/
+                                        elasticity remains challenging. Hot(un)plugging memory re-                 10.1145/3767295.3769357
+                                        sources suffers from long reclamation latencies and occupies
+                                        valuable CPU resources. We identify the obliviousness of                   1    Introduction
+                                        the OS memory manager to the hotplugged memory as the                      One of the defining features of Function-as-a-Service[3, 12,
+                                        key issue hindering hot-unplug performance, and design                     15, 27, 28, 33] (FaaS) serverless computing paradigm is the
+                                        Squeezy, a novel approach for fast and efficient VM memory                 pay-as-you-go model, in which providers execute functions
+                                        hot(un)plug, targeting VM-sandboxed serverless functions.                  on-demand and charge users only for the resources con-
+                                        Our key insight is that by segregating hotplugged memory                   sumed during function execution. This critical feature re-
+                                        regions from regular VM memory, we are able to bound the                   quires up- and down-scaling compute and memory resources
+                                        lifetime of allocations within these regions thus enabling                 dynamically and transparently, based on the incoming load.
+                                        their fast and efficient reclamation. We implement Squeezy                 Providers typically scale the resources by increasing or de-
+                                        in Linux v6.6 as an extension to the OS memory manager. Our                creasing the number of function instances that serve requests.
+                                        evaluation reveals that Squeezy is an order-of-magnitude                   Ideally, this would be combined with the dynamic and syn-
+                                        faster than state-of-the-art, keeping tail latency bounded,                chronous allocation and release of their resources, i.e., mem-
+                                        when reclaiming VM memory, achieving sub-second recla-                     ory and CPU. Unfortunately, such resource agility is difficult
+                                        mation of multiple GiBs of memory while serving realistic                  to achieve while guaranteeing performance objectives.
+                                        FaaS load.                                                                    The performance tax of resource elasticity in FaaS is highly
+                                                                                                                   dependent on the isolation model used. Functions are typi-
+                                        CCS Concepts: • Computer systems organization →
+                                                                                                                   cally sandboxed within containers [18] deployed on virtual
+                                        Cloud computing; • Software and its engineering → Vir-
+                                                                                                                   machines (VMs) [1]. FaaS providers may choose to a) de-
+                                        tual machines; Virtual memory; Allocation / deallocation
+                                                                                                                   ploy each function instance in a new dedicated microVM,
+                                        strategies.
+                                                                                                                   i.e., the single-container-per-VM model (1:1) adopted by AWS
+                                        Keywords: Cloud Computing, Serverless, FaaS, Virtualiza-                   Lambda [12], or b) deploy multiple function instances of the
+                                        tion, Memory Elasticity, Ballooning, Memory Hotunplug,                     same user in a single larger VM, i.e., the multi-container-per-
+                                        Partitioning, Allocation                                                   VM (N:1) model adopted by Microsoft Azure [52].
+                                                                                                                      The 1:1 model facilitates the immediate release of occu-
+                                                                                                                   pied resources when a function instance is reclaimed; it only
+                                                                                                                   requires shutting down the VM that was hosting it. Unfortu-
+                                        This work is licensed under a Creative Commons Attribution 4.0 Interna-    nately, this agility comes at the cost of higher start-up delays,
+                                        tional License.
+                                        EUROSYS ’26, Edinburgh, Scotland Uk
+                                                                                                                   i.e., cold starts [66, 74], and per-instance memory overhead,
+                                        © 2026 Copyright held by the owner/author(s).                              as scaling up involves booting a new (guest) Operating Sys-
+                                        ACM ISBN 979-8-4007-2212-7/26/04                                           tem (OS) and initializing the function’s runtime. While a long
+                                        https://doi.org/10.1145/3767295.3769357                                    line of research [9, 19, 26, 66, 71] attempts to tackle these
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk                                                           Lagkas Nikolos, et al.
+
+
+performance pathologies of the otherwise agile 1:1 model,           interleaving of the memory footprints of different instances,
+the N:1 model inherently reduces the start-up cost and the          without breaking the fundamental property of on demand
+per-instance memory tax. It spawns new function instances           memory allocation. We extend the hot(un)plug interface
+in already running VMs, hence reusing the initialized guest         to make it aware of these partitions, i.e., to dynamically
+OS and runtime state of the VM. However, the N:1 model              populate them during plug operations and to reclaim them
+trades off resource allocation flexibility for cold-start perfor-   instantly during unplug requests. With Squeezy, unplugging
+mance. Naturally, it requires larger VMs, that will be able to      only involves removing the empty partitions of terminated
+accommodate the deployment of multiple concurrent func-             function instances without migrating any pages. By avoiding
+tion instances. However, these resources remain allocated           migrations, Squeezy also eliminates the memory bandwidth
+–albeit idle– even when the load is low, as function instances      and CPU interference of unplugging, which can impact the
+terminate and get reclaimed.                                        performance of other concurrently running functions during
+    In this paper, we focus on the N:1 model and explore a          VM down-sizing [25].
+solution for the agile adjustment of its VM resources. Since           We integrate Squeezy with an OpenWhisk-based FaaS
+compute resources can be (de)allocated on the fly [7, 83], we       runtime [10, 78] that implements the N:1 model. Squeezy
+focus on memory elasticity. As we show, sizing-up the VM            interfaces with the runtime to hot(un)plug partitions when it
+memory is a relatively cheap operation, but memory reclama-         scales up and down the number of running instances based
+tion remains a persisting problem. The state-of-practice inter-     on the incoming load. Our evaluation reveals that Squeezy
+faces for memory elasticity, i.e., memory ballooning [65, 73]       is an order-of-magnitude faster than state-of-the-art when
+and vDIMM memory hotplugging [44], reclaim memory un-               reclaiming VM memory, achieving sub-second reclamation
+reliably and slowly, consuming precious CPU resources, and          of multiple GiBs of memory while serving realistic FaaS
+potentially inducing fragmentation in the system [21, 30, 47].      load. When host memory becomes scarce, we show that
+virtio-mem [30] is a state-of-the-art approach that improves        Squeezy’s agile VM resizing can keep tail latency bounded
+upon both. However, we experimentally show that it still re-        (10% slowdown), while significantly reducing memory uti-
+quires multiple seconds to reclaim 2 GiB of memory (§ 6.1.1).       lization. Finally, we compare scaling up instances inside a
+This is especially problematic for the FaaS use-case, as the        Squeezy N:1 VM to using 1:1 microVMs and study the cold
+bursty access patterns of FaaS require memory and CPU               start performance and memory utilization.
+resource scaling in sub-second granularity [35].
+    We identify the guest OS memory management as a key
+issue hindering VM memory reclamation performance. The
+                                                                    2     Background and Motivation
+memory pages of processes running inside a VM (e.g., func-          2.1   Function Isolation Models
+tion instances) are typically spread across the guest physical      FaaS providers use two main models [42] to securely deploy
+address space and interleaved with pages from other pro-            function instances into virtual machines: i) the multi-contai-
+cesses, as modern OSes allocate memory on demand and                ner-per-VM (N:1) [27, 52] and ii) the single-container-per-
+non-contiguously [4]. Thus, when a process exits and re-            VM (1:1) [12] model. The N:1 model scales up the number of
+leases its memory, the freed pages are commonly scattered           function instances (containers) of the same user within the
+across blocks of guest memory that also hold occupied pages         same VM to handle spikes in incoming load. The 1:1 model
+(Figure 3), for other processes or the OS. These pages need to      deploys instead each function instance in a lightweight VM,
+be migrated before the blocks in question can be reclaimed by       i.e., a microVM, and scales up the number of VMs. While both
+the host and these migrations dominate the performance of           models are adopted by the industry [12, 27], each presents its
+VM down-sizing [47]. We argue that memory hot(un)plugging           own trade-offs with respect to i) cold start delays, ii) resource
+needs to be coupled with informed guest memory management           sharing, and iii) resource allocation.
+to ensure fast and reliable VM memory reclamation.                  Cold starts. During scale up events, the 1:1 model incurs
+    To this end, we design Squeezy: an extension to the guest       the overhead of booting a new microVM, hence penalizing
+OS memory manager tailored for N:1 FaaS VMs. Our insight            cold start execution. For this reason, providers typically opt
+is that the maximum memory per function instance is defined         for keeping idle VMs alive [26, 66], in order to avoid cold
+by the user. Squeezy is thus able to leverage the predictable       start costs, trading tied down idling resources for sustainable
+memory requirements of FaaS to segregate the footprints of          performance [34, 35, 66, 74]. While a long line of research
+the N function instances that run inside the VM. It partitions      attempts to optimize the VM cold-start overhead [9, 39, 68,
+the guest memory into fixed-sized chunks (partitions), based        71, 74], starting a new VM is in principle a costlier operation
+on the configured function memory, and optimizes their              than creating a new container [43, 53] – which is how the
+dynamic hot(un)plugging. It assigns a dedicated partition           N:1 model scales up instances. The N:1 model also incurs less
+for each function instance in the system and extends the OS         overhead for the runtime initialization, during cold starts,
+memory manager to serve each instance’s allocation requests         as the runtime dependencies of new function instances are
+from its own dedicated partition. This way it eliminates the        typically already cached in the shared VM, e.g., the container
+Squeezy: Rapid VM Memory Reclamation for Serverless Functions                                                                    EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+
+
+root file system could already be cached by the guest OS page                                         the load drops, the runtime evicts the majority of these in-
+cache. In our experiments we find that cold start execution                                           stances and the memory utilization decreases. However this
+is 1.6x faster in the N:1 model (§6.3).                                                               elasticity is not reflected in the host system, where idle mem-
+                                                                                                      ory remains allocated, matching the maximum concurrency
+ The multi-container-per-VM model (N:1) reduces the mi-                                               factor that the VM reached since it booted.
+ croVM boot overhead of cold starts (Figure 11).
+                                                                                                       The multi-container-per-VM model (N:1) ties down idle
+Resource sharing. The 1:1 model also has higher memory                                                 resources when the load is low (Figure 1).
+costs, as it requires a separate guest OS and function runtime
+per function instance. As already mentioned earlier, the N:1                                             We consider this rigid resource over-provisioning [20, 25,
+model instead shares the OS and runtime state among the                                               41] one of the major drawbacks of the N:1 model that may
+instances that are co-located within the same VM. In our                                              overshadow its benefits. To put this into scope, Figure 2
+experiments we find that the 1:1 model increases a new                                                depicts the number of instances that are created and evicted
+instance’s footprint by 2.53x on average (§6.3).                                                      per minute for the 10 most popular functions in the Azure
+                                                                                                      production traces [52], when we simulate a random hour in
+ The multi-container-per-VM model (N:1) has a lower mem-                                              the trace and assume that idle instances are evicted after 5
+ ory tax per function (Figure 11).                                                                    inactive minutes. We observe that thousands of instances can
+                                                                                                      be scaled up and down per minute. Reclaiming memory from
+                                   Guest              Host
+                                                                                                      the evicted ones and re-distributing it to the newly created
+                        12.5
+                                                                            50                        instances is essential for resource efficiency. A natural way to
+   Memory Usage (GiB)
+
+
+
+
+                                             Idle Memory
+                        10.0
+                                                                            40                        address the problem is to reclaim memory and CPU resources
+                                                               #Instances
+
+
+
+
+                         7.5
+                                                                            30                        at runtime. While CPU reclamation is well studied [7, 11,
+                                                                            20
+                                                                                                      42, 51, 83], the efficient dynamic resizing of VM memory
+                         5.0
+                                                                                                      remains an open challenge, especially under the tight latency
+                         2.5                                                10
+                                                                                                      requirements of FaaS [42].
+                         0.0                                                 0
+                               0            200          400                     0    200       400
+                                                                                                                                           Creations        Evictions
+                                           Time (s)                                  Time (s)
+                                                                                                                      1500
+
+Figure 1. The N:1 model reserves memory for N instances
+                                                                                                         #Instances
+
+
+
+
+even when the load is low and a large number of concurrent                                                            1000
+
+instances are reclaimed by the FaaS runtime.
+                                                                                                                       500
+
+Resource allocation. In the 1:1 model, the resources allo-
+cated per instance (microVM) follow the target function’s                                                                0
+                                                                                                                             0       10      20        30        40     50     60
+resource limits as defined by the user [34]. Thus, when the                                                                                        Time (min)
+provider decides to scale down function resources, it can                                             Figure 2. An analysis of the invocation pattern of the 10
+shut down a microVM and instantly release a predictable                                               most popular functions in the Azure production traces [66]
+amount of memory and CPU shares in the host system. On                                                shows that thousands of instances are created and evicted
+the other hand, in the N:1 model, the resource reservation is                                         per minute. Mechanisms that enable the dynamic and agile
+subject to the concurrency factor, i.e., the number of function                                       resizing of N:1 VMs are essential to save resources.
+instances provisioned to be deployed concurrently within
+the same VM. For this model, VMs are typically provisioned                                            2.2             Dynamically Adjusting VM Memory
+with enough memory to accommodate multiple (N) instances.                                             The state-of-practice and art techniques to resize a VM’s
+However, as the number of required instances varies over                                              memory are a) ballooning [13, 72] and b) virtio-mem [30]
+time, e.g., based on the incoming load, this model frequently                                         vDIMM memory hotplugging [30, 44]. Memory ballooning
+results in memory waste [25, 41–43].                                                                  implements a paravirtualized interface, where a guest dri-
+   Figure 1 shows the memory utilization, i.e., the allocated                                         ver (controlled by the hypervisor) allocates (inflation) and
+memory, measured inside a VM (guest), configured for 50                                               de-allocates (deflation) guest memory pages to scale down
+concurrent function instances (50:1), and the host system,                                            and up its memory resources. Our results (§6.1) corroborate
+when we serve a bursty trace of requests, based on real-                                              past studies [30] that ballooning suffers from high scaling
+world load [66, 83], using a N:1 FaaS runtime (§5). The figure                                        overhead as it reclaims and releases memory to the host at
+also reports the number of running instances over time. We                                            the granularity of a page.
+observe that the memory utilization in the guest increases                                              Virtio-mem [30] dynamically adjusts VM memory by em-
+as the FaaS runtime scales up the number of concurrent in-                                            ulating the hot(un)plugging of physical DIMMs in the hy-
+stances to serve the spikes in the incoming load. Later, when                                         pervisor. It exposes a new device, i.e., the paravirtualized
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk                                                                  Lagkas Nikolos, et al.
+
+
+DIMM, sliced in small slots each capable of independent                    from ZONE_MOVABLE, but their footprints are interleaved
+(un)plugging for agile VM memory adjustment. While faster                  across multiple memory blocks of the zone. Linux allocates
+than ballooning, our study corroborates past findings [25,                 memory lazily, at the page granularity (4KiB or 2MiB), when
+31, 47] that virtio-mem still suffers from high OS overhead.               the processes access their pages for the first time (page fault).
+   Virtio-mem relies on the native Linux mechanisms to                     To serve a fault, the OS allocates any available page, hinder-
+hot(un)plug memory. Linux manages memory in the granu-                     ing contiguous mappings, scattering the workload’s footprint
+larity of pages (i.e., 4KiB), but adds and removes ((un)plugs)             and interleaving it with other processes.
+memory in the granularity of blocks, i.e., 128MiB for x86.                    This interleaving eventually penalizes memory unplug-
+Hotplugging a memory block involves two major steps: a)                    ging. For example, in Figure 3, when the instance F2 termi-
+add the memory block to the OS (hot-add) and b) expose it to               nates and releases its memory pages, the host may request
+the OS allocator (online). Hot-add updates the OS metadata                 to reclaim the released memory. The guest will try to isolate
+for physical memory, such as the Linux memory map array                    (offline) memory (e.g., via virtio-mem) equal to the size of the
+(memmap), and online releases the new block’s pages to the                 terminated instance by iterating over the system’s memory
+OS allocator, exposing the newly-plugged memory as usable.                 blocks. Due to the interleaving with the F1’s footprint, most
+Our results (§6.2.1) indicate that hotplug is a relatively cheap           blocks will be at least partially occupied, thus the guest will
+operation, especially for the number of blocks that FaaS                   have to a) migrate some pages to isolate enough memory
+functions typically require (§5).                                          blocks, and b) then offline and unplug them. In Section 6.1.1
+Hotunplugging a memory block involves two major steps                      we measure that these migrations slow down unplugging
+as well: a) retract the pages of the block from the OS allocator           by 61.5% (on average across different unplug memory sizes).
+(offline) and b) remove the block from the OS by destroying                These migrations can also penalize the performance of other
+all the corresponding metadata (hot-remove). The first step                running processes in the VM as they consume precious CPU
+dominates unplug performance as it commonly involves                       cycles [30] (§6.2.1 – Figure 7).
+migrating occupied pages.
+   Page migrations are indirectly induced by the guest OS                      Page migrations hinder VM memory reclamation perfor-
+memory manager. Memory that is hot-plugged is typically                        mance and can penalize other processes running inside the
+added to a special zone of the OS memory allocator, i.e., the                  down-sizing VM (Figures 5 and 9).
+ZONE_MOVABLE memory zone. This special zone separates
+movable and non-movable pages in the system in an attempt
+                                                                              Finally, another source of overhead in memory unplug-
+to guarantee that blocks in this zone can be offlined [58, 84].
+                                                                           ging stems from the unnecessary zeroing of memory blocks.
+The memory manager uses it to serve all allocation requests
+                                                                           When unplugging memory, virtio-mem uses generic rou-
+for data that in principle can be migrated, e.g., user-space
+                                                                           tines of the OS memory allocator in order to reserve (isolate)
+allocations and file system caches (i.e., page cache). The mem-
+                                                                           the memory to be offlined from the rest of the system. The
+ory blocks that populate the zone can be offlined as soon as
+                                                                           Linux kernel is commonly configured to zero pages upon
+all their occupied pages are migrated to other free pages /
+                                                                           allocation [16], as a security hardening measure. This config-
+blocks in the system. As the OS commonly interleaves the
+                                                                           uration leads to the unnecessary zeroing of the about-to-be-
+footprint of different processes [4, 79], such expensive migra-
+                                                                           unplugged memory, as the allocator routines are oblivious to
+tions are frequent when attempting to unplug the memory
+                                                                           the hot(un)plugging operations in progress, and they default
+of a process after it terminates.
+                                                                           to zeroing-out the offlining pages. We find that zeroing-out
+                                                                           memory blocks that are about to be offlined accounts for 24%
+       F1              F2                   F1                 F2          of unplug operations latency on average (Figure 5).
+Page
+                                                                           3     Squeezy Overview
+                                                                           We observe that the key reason that hinders VM memory
+Memory Block    Zone Movable         Squeezy Partition Squeezy Partition
+                                                                           reclamation performance is that the existing hot(un)plug
+       (a) Vanilla Linux                         (b) Squeezy               interfaces attempt to blindly reclaim guest OS memory. For
+                                                                           example, virtio-mem [30] needs to scan the guest physical
+Figure 3. Linux interleaves processes footprint within phys-               memory linearly and migrate occupied pages to isolate and
+ical memory blocks. When F2 exits, the F1 pages that are                   remove memory blocks. While it is hard to identify and iso-
+co-located in the same blocks have to be migrated to reclaim               late free memory on general purpose VMs, e.g., VMs hosting
+memory. Squeezy partitions processes footprints.                           multiple long-running workloads with working sets that
+                                                                           vary over time and input, we observe that memory usage
+  Figure 3 depicts a VM with 2 running function instances.                 is far more predictable for the serverless use-case. The oc-
+The OS has mapped their virtual addresses with pages only                  cupied and free memory inside a VM can be identified and
+Squeezy: Rapid VM Memory Reclamation for Serverless Functions                    EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+
+
+managed at the granularity of the deployed function’s mem-          with the hotplugged memory and the runtime will spawn
+ory resource limits, as defined by the user. However, to be         and assign a new function instance to this partition (§4.2).
+able to hot-add and hot-remove such coarse-grained blocks           Physical memory allocation. Similarly to normal VM
+fast, avoiding migrations, special mechanisms are necessary         memory hotplugging with virtio-mem, Squeezy does not
+to guarantee the isolation of instances footprints.                 allocate any physical memory on plugging. The hotplugged
+    The goal of this work is to provide such mechanisms to          guest physical memory corresponds to a virtual memory
+dynamically and efficiently resize N:1 FaaS VMs while reduc-        range of the virtual machine monitor (VMM). Physical mem-
+ing the memory waste of the original N:1 model (§2.1). We           ory pages will be allocated on demand, when the Squeezy-
+build on existing state-of-the-art memory hot(un)plugging           enabled function in the guest actually touches the hotplugged
+interfaces, i.e., virtio-mem, and attempt to address their per-     memory for the first time, via nested page faults. Thus its
+formance pathologies, as identified in Section 2.2, under the       static partitioning does not increase memory usage; each
+scope of the FaaS use-case.                                         instance will occupy only the amount of memory it touches
+    To that end, we design Squeezy, an extension to the guest       and not the entire Squeezy partition size.
+OS memory manager, to efficiently manage the memory of              Distinguishing shared and private allocations. To pre-
+serverless functions, enabling its rapid reclamation. Aligned       serve the memory savings of the N:1 model, Squeezy em-
+to our analysis in Section 2, we set the following main goals:      ploys a shared partition per VM to back the file mappings
+Resource elasticity. Squeezy should be able to track the            of all instances. File mappings typically correspond to li-
+memory requirements of the total number of alive function           braries and runtime dependencies shared across instances,
+instances running inside the same VM, scaling up and down           i.e., they are instantiated once in memory and mapped mul-
+its memory resources accordingly. Squeezy should also be            tiple times. This partition is pre-populated at boot time for
+fast enough to cope with the bursty load of serverless func-        each VM based on the characteristics of each function. The
+tions that frequently requires the up- and down-scaling of          anonymous mappings of the instances are backed by private
+resources in (sub)second intervals [35].                            partitions as discussed above.
+Resource sharing. Squeezy should allow the sharing of               Partition-aware unplugging. As instances run isolated
+runtime state, e.g., libraries, across the function instances       into Squeezy partitions, unplugging the memory of a termi-
+that run in the same VM to preserve the memory saving               nated instance involves zero migrations, thus minimal in-
+benefits of the N:1 model.                                          terference, under Squeezy. Unplug operations are triggered
+Minimal interference. Squeezy should not affect the per-            by a serverless runtime (§4.2), when instances inside a VM
+formance of other running function instances in the VM.             are reclaimed due to a drop in the incoming load. Squeezy
+    To achieve them, Squeezy introduces two mechanisms:             extends the unplug interface of the OS to directly identify
+• It partitions guest memory between running function in-           the Squeezy partitions that are emptied when the instances
+   stances to isolate their footprints.                             terminate, and instantly offlines them.
+• It makes the OS hot(un)plug interface (i.e., virtio-mem)
+   aware of these partitions, to enable their fast and efficient
+   reclamation when instances terminate.
+Squeezy partitions. Squeezy leverages the pre-defined mem-          4     Squeezy Implementation
+ory requirements of function instances to partition the avail-      We implement Squeezy in Linux v6.6, extending: i) the (guest)
+able guest memory of a N:1 VM into N fixed-sized chunks             OS memory manager and ii) the virtio-mem hot(un)plug
+(partitions). Each chunk can host a single function instance.       guest driver (§4.1). We also integrate Squeezy to a FaaS run-
+    Squeezy memory cannot be used for generic allocations;          time to dynamically resize N:1 VMs (§4.2).
+it is reserved and excluded from the main OS allocation path.
+Instead, an instance explicitly asks to be backed by Squeezy
+memory, using a dedicated API described in Section 4. In
+that case, it is mapped to a Squeezy partition and all its allo-    4.1   Squeezy OS Mechanisms
+cations (i.e., anonymous memory) are served from it. Once           Extending the OS memory manager. As described in Sec-
+a partition is assigned to an instance, it is locked until the      tion 3, Squeezy partitions the guest physical memory into
+instance terminates. Figure 3b shows how different instances        chunks, that will host non-interleaved function instances.
+are isolated into different memory partitions under Squeezy.        The size of each Squeezy partition must match the memory
+    Squeezy partitions are initially empty. When the serverless     requirements of the function to be deployed in the specific
+runtime decides to scale-up the number of function instances        VM under the N:1 serverless model. This parameter is known
+running inside the N:1 VM, e.g., due to a load spike, it triggers   when the VM is set-up by a serverless runtime, as the mem-
+a plug event. This event will populate a Squeezy partition          ory resource limits of each function are defined by the user
+                                                                    (§4.2). Thus we configure the partition size as a boot param-
+                                                                    eter for the guest OS.
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk                                                         Lagkas Nikolos, et al.
+
+
+   We implement Squeezy partitions as different zones (zone       allocation path, in order to only allocate pages from the
+structs), similar to ZONE_MOVABLE, in the Linux physical mem-     specific partition for the process.
+ory manager. Each zone represents the guest physical mem-         Squeezy waitqueue. Squeezy decouples the onlining of
+ory region of a Squeezy partition and is stored in the per-       Squeezy partitions via (hot)plug events, from their assign-
+NUMA node zonelists of the kernel (node_zones). Each parti-       ment to processes (function instances) via the Squeezy syscall
+tion is uniquely identified by its partition id.                  interface. While the FaaS runtime orchestrates and effec-
+   At boot time, we create 𝑁 such Squeezy zone structures,        tively couples these events (§4.2), i.e., it issues plug oper-
+that initially link to empty partitions. This sets the maximum    ations which populate Squeezy partitions in tandem with
+concurrency that can be supported by the VM, i.e., only           corresponding Squeezy-enabled function instance creations,
+𝑁 function instances can be concurrently deployed at any          these two events happen asynchronously. There is therefore
+point in time. We use the term concurrency factor for 𝑁 and       a chance that requests for Squeezy partitions may occur be-
+expose it as a boot parameter to be set by the serverless         fore the Squeezy zone has been fully populated and brought
+runtime. We note that the maximum memory requirements             online. We use a waitqueue for the synchronization of par-
+per instance, i.e., partition rated size, are identical in this   tition assignment requests. When a process requests to be
+design, as each instance refers to the same function or to        assigned to a Squeezy partition we first check if a Squeezy
+functions with similar memory requirements. We further            partition is populated and free. If not the requesting process
+discuss the implications of choosing 𝑁 in Section 7. Note         is placed in the afore-mentioned waitqueue, until a plug op-
+that unlike an over-provisioned VM, this design pre-sets          eration that populates a Squeezy partition completes. We
+the maximum concurrency but does not pre-allocate the             note that the setup of the OS sandboxing mechanisms (e.g.,
+corresponding memory resources. The 𝑁 Squeezy partitions          cgroups, network) can proceed in parallel with the plugging
+are initially empty (at boot time); they are not backed by        event, i.e., before the process (function instance) is assigned
+physical memory pages, as discussed in Section 3. They are        to a Squeezy partition.
+instead populated and emptied dynamically by plug and             Squeezy memory allocation. As a Squeezy process starts
+unplug operations, triggered by the FaaS runtime (§4.2).          executing inside the VM, its virtual memory accesses trigger
+   Squeezy populates only one partition at boot time, the         the lazy allocation of guest physical memory through page
+shared Squeezy partition, that is dedicated to store shared       faults. Squeezy intercepts the faults and implements a dedi-
+runtime and language dependencies across concurrently run-        cated handler that allocates pages from the Squeezy partition
+ning function instances in the VM. Its size is also a boot time   that is assigned to the process, instead of allocating pages
+parameter set by the serverless runtime We elaborate in           from generic and shared OS zones (e.g., from ZONE_MOVABLE).
+Section 4.2 how the FaaS runtime decides what size to use.        This guarantees the confinement of the footprint of each
+Plugging a Squeezy partition. The Squeezy partition plug-         Squeezy process within a single partition.
+ging starts when the hot(un)plug driver inside the guest,            Since the function instances running in a N:1 FaaS VM
+i.e, virtio-mem, receives a plug request from the hypervisor.     correspond to the same function (§2), they share the same
+The driver becomes aware that a specific range, correspond-       container root file system and runtime dependencies. To
+ing to the partition(s) size, of its managed memory has been      achieve the design goal of preserving the sharing of language
+plugged by the hypervisor and uses the kernel memory onlin-       and runtime dependencies among the function instances run-
+ing interfaces accordingly. We intercept the onlining process     ning in the VM (§3), Squeezy distinguishes between faults for
+in order to instruct the kernel to correlate the memory range     anonymous and file mappings. For the first, it allocates pages
+with the corresponding Squeezy partition(s), populate the         from the process-assigned Squeezy partition, as described
+free pages of the Squeezy partition and notify the users of       above. For the latter, it uses the system-wide shared Squeezy
+the interface, as explained in the next paragraph.                partition, as described in previous paragraphs. It faults-in
+The Squeezy interface. We design a system-call based inter-       each file page once and subsequently maps it to the address
+face for Squeezy, which allows the assignment of populated        space of any Squeezy process that touches it upon a fault.
+Squeezy partitions to function instances. The interface allows    Essentially, this design implements a file caching layer for all
+the calling process to request the OS to serve its memory         function instances via a dedicated shared Squeezy partition.
+allocations via Squeezy partitions. For each such request, we        As discussed above, Squeezy applies the user-set memory
+scan the list of Squeezy partitions (zonelist) in order to find   limits of each function via the Squeezy partition size. If a
+an available (empty) Squeezy partition. Upon success, the         function tries to allocate more memory than the size of the
+partition is marked as reserved. Per-partition locks are used     Squeezy partition, OS mechanisms (e.g, the OOM Killer) are
+to avoid race conditions for concurrent requests.                 triggered to kill the Squeezy process and prevent violations
+   Linux uses a memory descriptor (mm_struct) to represent        of partition isolation.
+each process’s address space. We add a new field in the           Handling fork(). When a Squeezy process calls the fork()
+memory descriptor to store the partition id that is assigned      system call to create a new process, we assign the child to
+to each Squeezy process. This is then used on the memory          the parent’s Squeezy partition. Thus we co-locate all threads
+Squeezy: Rapid VM Memory Reclamation for Serverless Functions                                           EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+
+
+and processes of a function instance on the same Squeezy                                  to spikes in the incoming load. In Section 6, we evaluate a
+partition. To handle this case, we add a partition reference                              Squeezy-aware FaaS runtime based on OpenWhisk.
+counter (partition_users) for each Squeezy partition, to track                            Scaling up. Figure 4 (left) shows the steps that take place
+the number of concurrent processes (mm_structs), that each                                when the runtime decides to spawn a new function instance
+partition is assigned to. When the partition_users reaches                                to scale up resources for function A. The runtime sends a
+zero, the partition is no longer in use, thus we mark it as                               request to to the agent that runs inside the VM to scale up
+free, hence reclaimable by virtio-mem.                                                    function instances 1 . It also employs the hypervisor in
+Unplugging a Squeezy partition. The unplug operation                                      the host to send a plug request to the guest, asking to add
+starts upon receiving an unplug request from the hypervi-                                 memory equal to the requirements of the instance, i.e., the
+sor. The hot(un)plug driver, i.e, virtio-mem, inside the guest,                           memory size pre-defined by the user. The Squeezy plug path
+keeps track of free Squeezy partition(s) via their reference                              is triggered, and the guest populates a Squeezy partition 2 .
+counter (partition_users), as described above. When the dri-                              The agent then spawns a new instance using the Squeezy
+ver receives an unplug operation from the hypervisor, it                                  syscall interface 3 . A new container is created and starts
+immediately offlines and removes a free partition without                                 executing with all its private allocations being served by and
+migrating any of the pages, as the partition is guaranteed to                             isolated in the just-plugged Squeezy partition.
+be empty. The serverless runtime coordinates the hypervisor                               Scaling down. Figure 4 (right) shows the steps that take
+unplug operations with the function recycle operations. It                                place when the runtime decides to evict a function instance
+can thus know the exact number of free Squeezy partitions                                 to scale down resources for function B. The agent that runs
+in the VM. The virtio-mem driver then informs the hypervi-                                inside the VM shuts down the function container and informs
+sor that the memory blocks corresponding to the unplugged                                 the runtime for the successful down-scaling 4 . The runtime
+Squeezy partition(s) have been removed. The hypervisor im-                                then employs the hypervisor in the host to send an unplug
+mediately releases the pages to the host using the madvise()                              request to the guest asking to reclaim memory equal to the
+system call to mark them as not needed (MADV_DONTNEED).                                   memory freed by the recycle 5 . The Squeezy unplug path is
+   As discussed in Section 2, virtio-mem might trigger the                                triggered in the guest, which i) identifies the empty Squeezy
+unnecessary zeroing of pages that are to be unplugged, due                                zone of the recycled container, ii) directly removes it without
+to the obliviousness of the Linux memory allocator to the                                 any migrations, and iii) notifies the hypervisor 6 .
+unplug operations in progress. We thus modify the Linux                                   VM creation. As discussed earlier, when the runtime cre-
+memory allocator to be hot(un)plug aware and skip the zero-                               ates a VM that will host Squeezy function instances it must
+ing of the pages that are about to be unplugged. This memory                              declare during boot i) the Squeezy private partition size,
+will eventually get zeroed out later, when it is re-allocated,                            matching the memory resource limit set for the function,
+either by the host or by another VM.                                                      ii) the shared Squeezy partition size, matching the size of
+                                                                                          the runtime and language dependencies of the function, and
+             VM 1 – FUNC A                                       VM 2 – FUNC B            iii) the maximum number of function instances that will be
+                               Agent                Agent                                 deployed in the VM (concurrency factor 𝑁 ).
+      C         C      C                                         C          C
+                           3 Syscall
+                                       Scale Down
+
+
+
+
+                                                                                          5     Methodology
+                                       Scale Up
+
+
+
+
+  Squeezy Partitions                                        6        Squeezy Partitions   5.1   Experimental Setup
+                                       1 4                                                Hardware setup. We use a dual-socket 40-core Intel Xeon
+                                FaaS Runtime (Host)                                       E5-2630 server with 128GiB of memory per socket as a host.
+          Squeezy Plug 2         VMM (hypervisor)               5 Squeezy Unplug
+                                                                                          For the dynamically resized N:1 VMs of the FaaS experiments,
+                                                                                          we set the number of vCPUs per VM based on the CPU shares
+ Figure 4. Squeezy integration into a serverless runtime
+                                                                                          of the target function (Table 1) and the max concurrency
+                                                                                          factor (N) of every experiment. To minimize jitter, we use a
+4.2   Squeezy Integration Into a FaaS Runtime                                             single NUMA node, pin each vCPU on a single core, and set
+Squeezy is an OS mechanism designed for the rapid recla-                                  the core frequency to 2.2GHz. We also enable the Transparent
+mation of VM memory resources of serverless function in-                                  Huge Page (THP) mechanism in the host.
+stances when they terminate. A serverless runtime can lever-                              System software. We implement Squeezy on Linux Kernel
+age the Squeezy interface in order to (un)plug and (de)allocate                           6.6.30 in ∼ 800 Lines of Code (LOC). We use the Cloud Hy-
+Squeezy memory as it scales up and down function instances                                pervisor (v38.0) as the virtual machine monitor (VMM) for
+in the N:1 serverless model. Figure 4 shows how Squeezy can                               the N:1 VMs as it includes a well tested Rust implementation
+be integrated into such a runtime. For simplicity, we show the                            of the virtio-mem [30] interface. We use microVMs for the
+scaling up / down workflow for only one function instance.                                evaluation of the 1:1 model.
+However, the same applies when the runtime concurrently                                   Workloads. We use the memhog [50] microbenchmark and
+scales up or down multiple function instances to respond                                  the FaaS functions of Table 1 for our evaluation. They consist
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk                                                                                                         Lagkas Nikolos, et al.
+
+    Function      Description         vCPU shares   Memory (MiB)
+                                                                                          6000
+
+
+
+
+                                                                   Reclaim Latency (ms)
+       Cnn     JPEG classification       1.0             768
+       Bert       ML inference           1.0             1536                             5000
+                                                                                                                                                                          Rest
+       BFS     Breadth-first search      1.0              768                             3000
+                                                                                                                                                                          VMExits
+                                                                                          2000
+      HTML        Web service            0.25             768                                                                                                             Migration
+                                                                                          1000
+Table 1. Serverless functions used in the evaluation and their                                                                                                            Zeroing
+                                                                                           500
+assigned resource limits per instance.
+                                                                                             0
+                                                                                                    128           256           512          1024          2048
+of a function from FunctionBench [38] (CNN) and three real-
+
+
+
+
+                                                                                                 Virtio-mem
+
+
+
+                                                                                                               Virtio-mem
+
+
+
+                                                                                                                             Virtio-mem
+
+
+
+                                                                                                                                           Virtio-mem
+
+
+
+                                                                                                                                                         Virtio-mem
+                                                                                                     Balloon
+
+                                                                                                   Squeezy
+
+                                                                                                                   Balloon
+
+                                                                                                                 Squeezy
+
+                                                                                                                                 Balloon
+
+                                                                                                                               Squeezy
+
+                                                                                                                                               Balloon
+
+                                                                                                                                             Squeezy
+
+                                                                                                                                                             Balloon
+
+                                                                                                                                                           Squeezy
+world functions from [78] (HTML, BFS, and Bert). These func-
+tions are sufficiently memory-intensive to assess Squeezy’s
+allocation and reclamation mechanisms realistically. They
+also represent both main memory allocation types: anony-                                                       Reclaimed Memory (MiB)
+mous memory (e.g., BFS) and file-backed page cache (e.g.,
+HTML, Bert, CNN). We aim to show that Squeezy performs             Figure 5. Average latency (ms) to reclaim memory of differ-
+well under high memory demand, and we expect similar               ent sizes from a guest with memhog-loaded CPUs.
+benefits in scenarios with a higher number of small-sized
+functions. The table also summarizes the vCPU and memory           Squeezy memory hot-unplugging to vanilla virtio-mem un-
+limits that we use for the function instances (containers) [78].   plugging and to balloon inflation. For Squeezy, we deploy
+The memory limits are tailored for concurrency N=1 (Fig-           each memhog instance within a plugged squeezy partition.
+ure 11b).
+                                                                   6.1.1 Reclamation Latency. For this set of experiments
+5.2     Evaluation Scenarios                                       we spawn 32 memhog instances on a 32:1 VM. We tailor
+                                                                   the total VM memory size so that the 32 instances fully oc-
+Reclaiming VM memory. We benchmark the downsizing
+                                                                   cupy its entire memory. We let the instances execute for a
+of a N:1 VM running memhog. We study a) memory reclama-
+                                                                   warm-up period and then we kill them iteratively. The host
+tion latency and b) CPU utilization. We compare Squeezy to
+                                                                   reclaims VM memory that equals the killed instance’s mem-
+a) vanilla virtio-mem memory unplugging (virtio-mem) and
+                                                                   ory size on every step. We report the average latency of the
+b) to reclaiming memory using the balloon driver (balloon).
+                                                                   32 reclamation steps. We repeat the same experiment while
+Integration into a FaaS runtime. We study the perfor-
+                                                                   increasing the memhog memory size. All considered sizes
+mance of a FaaS OpenWhisk-based autoscaler [78] that uses
+                                                                   are representative of the memory limits of FaaS functions.
+dynamically resized N:1 VMs. We evaluate a) the achieved
+                                                                      Figure 5 shows the reclamation latency achieved by the
+memory reclamation throughput, b) cold start delays and c)
+                                                                   different methods per memory size. We break down the
+the CPU interference when the runtime serves requests from
+                                                                   latency to the costs of a) page zeroing (guest), b) page migra-
+a production trace [83] and there is abundance of memory
+                                                                   tion (guest), c) serving VM exits (host) and d) the rest.
+in the host system. We also study performance when we re-
+                                                                      As expected, ballooning is the less performant interface
+strict the available memory in the host to emulate the spawn
+                                                                   and is dominated by the costs of serving VM exits (81% on
+and reclaim patterns of a large scale end-to-end experiment
+                                                                   average). To reclaim memory, the guest balloon driver allo-
+(Figure 2). For this experiment, the memory reclamation
+                                                                   cates (reserves) guest physical pages and reports them back
+speed of scale down events impacts end-to-end performance,
+                                                                   to the hypervisor (VM exit) which releases them to the host
+as VMs have to wait for memory to be freed to scale up their
+                                                                   (balloon inflation). The interface operates at the granularity
+number of instances. We compare Squeezy performance to
+                                                                   of a page, thus when the reclaimed memory size increases
+a) vanilla virtio-mem and b) a version of virtio-mem that
+                                                                   the overhead of the technique explodes.
+incorporates optimization techniques from HarvestVM [24]
+                                                                      Virtio-mem hot-unplugging is 2.34x faster than ballooning
+(proactive reclaim, buffering).
+                                                                   (on average), as it reclaims memory at larger chunks, i.e.,
+ 1:1 vs. N:1 model performance trade-offs. Finally, we
+                                                                   in 128 MiB memory blocks, and thus eliminates VM Exit
+compare the cold start delays and the memory usage of the
+                                                                   overheads. However, it still requires 617 ms to reclaim 512
+N:1 model, implemented with dynamically resized VMs via
+                                                                   MiB of memory and almost 2.5 seconds to reclaim 2 GiB.
+Squeezy, to using 1:1 microVMs.
+                                                                   The overhead stems from the migration of occupied pages
+                                                                   per reclaimed memory block (61.5% on average) and their
+6      Evaluation
+                                                                   zeroing (24% on average).
+6.1     Reclaiming VM Memory                                          Squeezy eliminates both the page migration and the zero-
+We first evaluate memory reclamation from a N:1 VM that            ing overhead of virtio-mem, and is 10.9x faster in reclaiming
+hosts multiple instances of memhog [50]. Memhog repeat-            memory (on average). It only requires 127 ms to reclaim 2
+edly (de)allocates chunks of memory of fixed size and thus         GiB of memory. Its partitions isolate a process’s footprint
+stresses the CPU and memory usage of the VM. We compare            in contiguous memory blocks; when the process exits, the
+Squeezy: Rapid VM Memory Reclamation for Serverless Functions                                                       EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+
+
+     Reclaim Latency (ms)                   Virtio-mem       Squeezy                                            Balloon              Virtio-mem                                   Squeezy
+
+
+
+
+                                                                                                                                        VMM CPU Utilization (%)
+                            2000                                                                     100                                                          100
+
+
+
+
+                                                                              vCPU Utilization (%)
+                            1500                                                                      80                                                           80
+
+                                                                                                      60                                                           60
+                            1000
+                                                                                                      40                                                           40
+                             500
+                                                                                                      20                                                           20
+                                   0   20       40        60      80   100
+                                              Memory Usage (%)                                         0                                                            0
+                                                                                                           0   50     100      150                                      0   50     100      150
+                                                                                                                    Time (s)                                                     Time (s)
+Figure 6. Reclaiming 2 GiB out of a 64 GiB VM while increas-
+ing its memory utilization. Squeezy performance is robust                    Figure 7. CPU utilization (%) of the kernel threads that serve
+and decoupled from the availability of free pages.                           downsizing requests and run in the guest (left) and in the
+                                                                             host (hypervisor / VMM, right) for each method, as we repet-
+blocks can be reclaimed instantly without any migrations                     itively reclaim 512 MiB of guest memory. Squeezy requires
+as there are no occupied pages by other processes. Squeezy                   negligible CPU resources to operate.
+also defers zeroing the blocks to the host.
+Sensitivity to memory utilization. We observe that the                       reclaim 512 MiB of VM memory, sleeping between each step,
+performance of vanilla virtio-mem depends on the number                      for a 200 second experiment.
+of occupied pages per reclaimed block. We conduct a sen-                        The ballooning host kernel thread results in CPU usage
+sitivity study. Figure 6 shows the latency to unplug 2 GiB                   spikes while serving the VM exits of the balloon inflation.
+from a 64 GiB VM while we increase the utilization of the                    Virtio-mem’s guest kernel thread heavily uses the vCPU
+rest of the memory by increasing the number of running                       to migrate pages during unplug operations. In a following
+memhog instances. For this set of experiments we remove                      paragraph, we show how this affects the performance of
+page zeroing overheads from vanilla virtio-mem as well, to                   other processes running in the guest concurrently. Squeezy
+isolate the effect of page migrations.                                       requires negligible CPU resources to reclaim memory and
+   Vanilla virtio-mem unplug latency exhibits an upward                      thus minimizes interference.
+trend along with the memory utilization, as the number of
+                                                                             6.2                       Integration Into a FaaS Runtime
+potentially occupied pages and thus migrations per memory
+block increases. We observe that as soon as 20% of the VM                    In this set of experiments, we study the integration of dynam-
+memory is occupied, page migrations start to significantly                   ically resized N:1 VMs to a FaaS deployment. We build upon
+slow down unplug operations. This is attributed to the ran-                  an OpenWhisk-based runtime [78], by adding the required
+dom placement of memhog’s pages over multiple memory                         functionality to spawn functions as containers inside VMs
+blocks by the guest OS memory allocator (§2.2) even when                     and resize the VMs on demand based on the incoming load
+the memory pressure is low. This randomness makes unplug                     (§4.2). We study the FaaS functions of Table 1. We deploy
+performance also unpredictable, i.e., there are fluctuations                 each function inside a dedicated VM, following the N:1 VM
+in unplug latency as we increase the memory utilization.                     model (§2.1). In our experiments, we always have a single
+   Squeezy instead has robust performance decoupled from                     N:1 VM per function type, and we calibrate the max con-
+the guest load. It always reclaims 2 GiB of memory within                    currency (N) of the VM to match the maximum number of
+∼125 ms by instructing the virtio-mem driver to unplug the                   alive instances maintained by the runtime for every trace of
+unused memory blocks of empty Squeezy partitions.                            requests. N ranges from 9-36.
+                                                                                The serverless runtime in the host schedules incoming
+6.1.2 CPU Utilization. As discussed in Section 2, another                    requests to the N:1 VMs, and a dispatcher (Agent) within each
+performance aspect of the mechanisms that reclaim VM                         VM ensures their execution. When there are no available
+memory is the amount of CPU resources that they require                      idle function instances (i.e., containers) to serve an incoming
+to operate. For this set of experiments, we add a dedicated                  request, the Agent creates a new instance (scale up event).
+vCPU to the VM and pin the guest kernel threads of the                       After the request runs to completion, the Agent keeps the
+different reclamation interfaces, i.e., the thread of the balloon            function instance cached (keep-alive) for a fixed amount
+driver and the thread of the virtio-mem driver for vanilla                   of time (2 minutes). When new requests arrive, the Agent
+and Squeezy memory hot-unplugging. We also pin the vCPU                      reuses the cached idle function instances. When the keep-
+to a dedicated physical core in the host. Similarly, we pin the              alive window expires, the Agent evicts the function instances
+host / VMM kernel threads of the interfaces to a separate                    that were not reused during that window (scale down event).
+dedicated physical core. This allows us to isolate and study                 The Agent is also in charge of sharing the CPU resources
+their CPU activity. Figure 7 shows the CPU utilization (%)                   among the running instances based on their pre-configured
+of the guest and the host kernel threads as we repeatedly                    CPU share limits (Table 1).
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk                                                                                    Lagkas Nikolos, et al.
+
+
+                                                 Virtio-mem       Squeezy                                            Virtio-mem         Squeezy
+                                      4
+
+
+
+            Throughput (MiB/s)
+                                 10
+                                                                                                         400
+
+
+
+
+                                                                                          Latency (ms)
+                (logscale)
+                                                                                                         200
+                                      3
+                                 10
+                                                                                                           0
+                                          HTML   Cnn      BFS   Bert Geomean
+                                                                                                               100       120      140        160
+                                                                                                                           Time (s)
+Figure 8. Memory reclamation throughput (MiB/s) while
+evicting function instances based on realistic FaaS load.                      Figure 9. CNN request latency during a scale-down event.
+                                                                               Virtio-mem page migrations slow down the running CNN
+                                                                               instances by consuming CPU resources. Squeezy instead
+  We extend the runtime to support the dynamic up and                          does not interfere with their execution.
+down-sizing of the VM memory during scale up and down
+events (Figure 4). We add and reclaim VM memory based on
+the number of instances that are created / evicted and the                     Scaling down. When the load drops in the traces, the FaaS
+function memory requirements (Table 1).                                        runtime scales down the number of instances, leading to
+                                                                               memory hot-unplug events. In Figure 8 we report the through-
+6.2.1 Resizing FaaS VMs Under Realistic Load. We use
+                                                                               put, in MiB/s, with which vanilla virtio-mem and Squeezy re-
+the Azure Functions Trace 2021 collection [83] to drive the
+                                                                               claim memory for each function. We observe a similar trend
+invocations of every function. We select 4 traces with bursty
+                                                                               to our micro-benchmarking results (§6.1.1), i.e., Squeezy
+request patterns and map them randomly to our functions.
+                                                                               achieves 7x higher reclamation throughput (on average).
+Specifically, we assign each trace to a function of Table 1
+                                                                                  To further investigate the impact of unplugging events
+and for each trace invocation, we generate a request to the
+                                                                               on instances running on the same VM, we co-locate CNN
+FaaS runtime for the function it has been assigned to. For
+                                                                               and HTML function instances. We continue to drive their
+this experiment, the available memory in the host is abun-
+                                                                               requests based on the Azure bursty traces. However, the load
+dant and can fit all the instances created by the runtime
+                                                                               of the two functions fluctuates at different time intervals and
+during the entire trace execution. Thus memory elasticity
+                                                                               around the ≈125s mark of the experiment the FaaS runtime
+does not directly affect end-to-end performance, i.e., there
+                                                                               scales down the HTML instances while multiple CNN in-
+is no requirement to reclaim a VM’s idle memory to enable
+                                                                               stances continue to run in the VM, serving requests. Figure 9
+the scale-up event of another VM. Our target is to study
+                                                                               shows the average end-to-end latency for each second for the
+the performance of dynamically resizing the memory of N:1
+                                                                               CNN requests served, around the minute of the scale-down
+VMs when they serve realistic FaaS load.
+                                                                               event. Vanilla virtio-mem slows down requests by more than
+Scaling up. The bursts of requests in the traces trigger scale
+                                                                               2x. The virtio-mem driver’s guest kernel thread has been
+up events that result in memory hot-plug operations. This
+                                                                               scheduled by the OS to migrate pages using one of the vC-
+can potentially penalize the cold start execution of the new
+                                                                               PUs that are also assigned to the CNN instances. The CPU
+instances due to the added plug delays. To study this penalty,
+                                                                               utilization caused by the migrations (Figure 7) penalizes their
+we compare the cold start execution of a new instance when
+                                                                               performance. Squeezy’s minimal CPU usage, on the other
+we plug its memory (virtio-mem and Squeezy) to the cold
+                                                                               hand, avoids any interference with the running instances.
+start latency of deploying it on a statically long-running over-
+provisioned N:1 VM (no plugging). We measure that the plug                     6.2.2 End-to-end Execution When Memory is Lim-
+operation has negligible overhead for both methods – it costs                  ited. We now restrict the available host memory for our
+35-45ms for all function sizes. Guest page fault handling in-                  experiment and synthetically generate load for each func-
+curs no lookup latency; as discussed in § 4.1 each function                    tion to emulate the spawn and reclaim patterns of a large
+is assigned a Squeezy partition Id at creation, allowing di-                   scale real-world trace (Figure 2) in our smaller-scale setup (4
+rect allocation with 0% impact. However, overall cold-start                    functions, single host). Specifically, we study the end-to-end
+execution on a dynamically resized VM is 3-35% slower com-                     performance when memory is scarce and scale up events
+pared to a static VM. This indirect penalty stems from the                     have to actively reuse the released memory of concurrently
+slower accesses to freshly plugged memory; they trigger                        scaled-down (evicted) idle instances. When the available
+costly VM exits (nested page faults) that map the touched                      memory in the system is not enough to scale up instances at
+guest pages to physical resources. Nevertheless, we consider                   the rate that the runtime demands, based on the incoming
+these cold-start costs of memory elasticity manageable. In                     load, the latter attempts to evict as many idle instances as
+a later paragraph (§ 6.3), we show that they remain signifi-                   necessary and reclaim their memory to proceed. For this set
+cantly lower compared to booting a 1:1 microVM, which also                     of experiments, memory reclamation efficiency can affect
+needs to fault in its memory.                                                  the performance at the tail, as scale up events may have to
+Squeezy: Rapid VM Memory Reclamation for Serverless Functions                                                                                             EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+
+
+wait for scale down events to finish to secure the necessary                                                                                they primarily utilize buffered or proactively reclaimed mem-
+memory resources to proceed.                                                                                                                ory from HTML and CNN instances. Conversely, HTML and
+   We normalize performance to the case that we have been                                                                                   CNN experience degraded performance due to the prema-
+studying so far: there is enough free host memory and no                                                                                    ture and aggressive reclamation of their instances, reducing
+reclamation is necessary to secure resources for the hotplug                                                                                their load capacity and increasing tail-latency. In contrast,
+phases of the scale-up events (Abundant Memory). We run                                                                                     Squeezy uses synchronous memory reclamation and does
+the same experiment and we restrict the available memory                                                                                    not reserve memory, enhancing robustness and reducing
+in the host to ∼ 70% of the maximum memory used in the                                                                                      memory waste (on the right of Figure 10). While this incurs
+Abundant Memory scenario. We compare Squeezy’s dynamic                                                                                      minor overhead for BFS (15%) during scale-ups, it prevents
+VM resizing to a) vanilla virtio-mem and to b) an enhanced                                                                                  performance degradation for other functions.
+version of virtio-mem, which incorporates optimization tech-                                                                                 Memory utilization. Finally, we study the memory utiliza-
+niques from HarvestVM (HarvestVM-opts) [24]. While the                                                                                      tion throughout the duration of the experiment and report
+original proposal builds on ballooning, there is no available                                                                               the results, in Figure 10 (right), normalized to the maximum
+implementation and the paper targets Windows VMs under                                                                                      memory usage reached in the Abundant Memory scenario,
+Hyper-V. We thus isolate and study optimization techniques,                                                                                 i.e., the maximum footprint when no reclamation is involved.
+proposed by HarvestVM, by applying them to our set-up.                                                                                      The spikes and drops for the dynamic methods represent
+Specifically we study a) proactive reclamation of memory,                                                                                   the tug-of-war between instance creations (memory alloca-
+i.e., reclaiming more memory than necessary for the ongoing                                                                                 tions / scale up) and evictions (memory reclamations / scale
+scale up events in the system, and b) reserving some slack                                                                                  down). During scale up events, the HarvestVM-opts method
+memory (buffering), which can be used by plug events to                                                                                     races between allocating reclaimed memory of proactively
+hide some of the delays of slow VM memory reclamation                                                                                       evicted idling instances (≈ 90 s) or allocating from the re-
+during VM up-sizing.                                                                                                                        served buffer if the reclamation happens at a slower rate than
+                                                                                                                                            the allocation (≈ 200 s). With virtio-mem, new instance allo-
+                            Abundant Memory                Virtio-mem                                   HarvestVM-opts           Squeezy    cations primarily use reclaimed memory when unplugging
+                                                                                              100
+                                                                                                                         8220 GiB·s         occurs quickly (≈ 90 s) but when reclamation is slow the
+                                                                     Memory Utilization (%)
+
+
+
+
+                   4
+                                                                                                                                            method runs into time-outs. For example, around the ≈ 200 s
+Norm P99 latency
+
+
+
+
+                                                                                                                         6459 GiB·s
+
+                                                                                               75
+                   3                                                                                                     6780 GiB·s         mark, virtio-mem fails to reclaim the necessary memory
+                   2                                                                           50
+                                                                                                                         3706 GiB·s
+                                                                                                                                            to scale up the target number of instances in time, delay-
+                                                                                               25
+                                                                                                                                            ing the execution of the incoming requests, forcing them
+                   1
+                                                                                                                                            to be served by already alive instances, when they eventu-
+                   0                                                                            0                                           ally become free later on – impacting tail latency. These
+                         ml       n         s     rt             n                                  0          200        400         600
+                       Ht       Cn     Bf       Be            ea                                                  Time(s)
+                                                           m
+                                                       Geo                                                                                  reclamation timeouts lead virtio-mem to reclaim less mem-
+                                                                                                                                            ory than initially targeted, forcing it to use the maximum
+Figure 10. Fast memory reclamation sustains tail latency                                                                                    memory available in the system. Squeezy reliably reclaims
+while saving memory resources.                                                                                                              the requested memory just in time, as shown by the drops
+                                                                                                                                            preceding spikes, and redistributes it to scale up events, keep-
+ Tail latency. Figure 10 (left) shows the normalized P99 la-                                                                                ing memory consumption low. Squeezy reduces the overall
+tency for the entire experiment per function and method. We                                                                                 accounted memory footprint of the functions throughout
+observe that virtio-mem’s slow memory reclamation severely                                                                                  the duration of the experiment (GiB·s) by 45% and 42.5%
+penalizes tail latency (3.15x slower on average), as scale up                                                                               compared to HarvestVM-opts and Virtio-mem respectively.
+events are frequently delayed. Applying the HarvestVM op-                                                                                   We note that the higher tail latency of Virtio-mem leads to
+timizations improves performance but at the cost of higher                                                                                  longer total experiment execution.
+memory consumption due to the additional reserved buffers
+(on the right of Figure 10). It also remains significantly slower
+compared to the case that pluggable memory is an infinite                                                                                   6.3   Comparing the N:1 and 1:1 Models
+resource (1.36x on average). Squeezy’s fast memory recla-                                                                                   Finally, we compare the N:1 model, implemented with elastic
+mation keeps tail latency bounded (1.1.x slower on average),                                                                                Squeezy VMs, to the 1:1 model that deploys each function
+while also minimizing memory utilization, as we describe                                                                                    instance to a single microVM. We boot the 1:1 microVMs with
+in the next paragraph. Moreover, we note that HarvestVM                                                                                     the minimum memory required to deploy a single function
+optimizations can negatively impact system robustness due                                                                                   instance (Table 1) and assign 1 vCPU to each microVM. We
+to the more aggressive reclamation of instances when the                                                                                    compare the two models in terms of: a) cold start delays and
+reserved buffers are full. Depending on the trace request pat-                                                                              b) memory footprint. Specifically, we compare booting a 1:1
+terns, specific functions might be penalized or favored: for                                                                                microVM and creating a new instance to plugging memory
+example, we observe that BFS and Bert perform well because                                                                                  on an already running N:1 VM and creating the instance.
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk                                                                                                         Lagkas Nikolos, et al.
+
+
+Cold start execution. Figure 11a breaks down cold-start                                                           Microservices are commonly deployed as containers on Ku-
+execution to a) VMM cold delays, b) the sandbox initializa-                                                       bernetes clusters, configured with a maximum amount of
+tion (container), and c) the function initialization and exe-                                                     memory [61]. For microservices deployed in VM-sandboxed
+cution [78]. The VMM overhead corresponds to boot delays                                                          containers [36], Squeezy could be used to reap the benefits
+for the 1:1 model and the memory plug latency for the N:1.                                                        of rapid and lightweight VM memory reclamation, when
+                                                                                                                  microservice instances terminate, obviating the need for VM
+                                                                                                                  over-provisioning.
+                               VMM cold delays         Container Init                          1:1          N:1
+                                                                                                                  Static partitioning. For longer-running workloads, with
+Cold start runtime (s)
+
+
+
+
+                               Function Init           Function Exec                   1500
+                         7                                                                                        less predictable memory requirements, the static partitioning
+
+
+                                                                        Memory (MiB)
+                         6                                                                                        scheme of Squeezy might not be optimal and it would need
+                         5                                                             1000
+                         4                                                                                        to be extended, to allow for the plugging and unplugging
+                         3
+                         2                                                              500                       of variably-sized partitions. The trigger for plugging and
+                         1
+                                                                                                                  unplugging would also need to change and be controlled
+                             Html      Cnn       Bfs         Bert
+                                                                                          0                       by the application running inside the VM instead. We note,
+                             1:1
+                             N:1
+
+
+                                      1:1
+                                      N:1
+
+
+                                                 1:1
+                                                 N:1
+
+
+                                                            1:1
+                                                            N:1
+
+
+
+
+                                                                                              Html Cnn Bfs Bert
+                                                                                                                  however, that for workloads with predictable memory foot-
+                               (a) Cold start latencies.                       (b) Memory footprint.              prints, the static partitioning approach of Squeezy does not
+                                                                                                                  imply static memory allocation. Squeezy partitions enable
+Figure 11. The N:1 and 1:1 model performance trade-offs.                                                          the OS to bound, temporally and spatially, the memory allo-
+Dynamically resized N:1 is implemented with Squeezy.                                                              cations of processes, but they do not entail any memory al-
+                                                                                                                  locations. Memory in each partition is allocated on-demand,
+                                                                                                                  via nested page faults, in page granularity (4KiB or 2MiB), as
+   We observe that boot overheads slow down 1:1 cold start                                                        the Squeezy-enabled process touches its memory (§3, §4.1).
+execution by 20.2% on average. Deploying a new instance                                                           Using Squeezy to optimize keep-alive instances. We con-
+on an already running N:1 VM eliminates this cost and the                                                         sider for future work integrating the concept of soft-state
+model’s VMM overhead (plug memory) is only 1.19% on                                                               and soft memory [22, 60] with Squeezy. Applications could
+average. We also observe that compared to the 1:1 VM cold                                                         request Squeezy partitions to use as soft-memory, in order
+run, the container initialization in the N:1 VM is 1.33x faster                                                   to store application controlled soft-state. Under memory
+and the function initialization and execution is 1.25x and                                                        pressure, the hypervisor could rapidly reclaim soft-memory
+1.08x faster respectively (on average). The reason for these                                                      Squeezy partitions. Similarly to soft-state, the rapid VM recla-
+speed-ups is that the N:1 model shares some state among                                                           mation, enabled by Squeezy, could be used to reclaim unused
+the running instances, e.g., the container file system and the                                                    memory of garbage-collected runtimes, such as Java and
+runtime dependencies are cached and shared via the guest                                                          Javascript [86], for VM-sandboxed function instances under
+OS page cache. Thus the initialization of new instances finds                                                     the N:1 model. Finally, in a similar direction, we consider
+some data already in the guest memory and executes faster.                                                        for future work to extend Squeezy and integrate the concept
+Overall cold start execution is up to 2.35x and on average 1.6x                                                   of temporal segregation of function memory footprints, in-
+faster when we scale up instances by dynamically resizing a                                                       troduced by FaaSMem [78], into the Squeezy partitioning
+N:1 VM compared to using a new 1:1 microVM per instance.                                                          scheme. We will thus be able to extend the Squeezy VM recla-
+Memory consumption. The N:1 model’s state sharing                                                                 mation benefits to function invocations as well as function
+across instances is also depicted when we measure the mem-                                                        instance creations and evictions.
+ory footprint of a new instance in the host. Figure 11b shows                                                     Maximum concurrency. As discussed in Section 4, the
+that instances occupy 2.53x more memory (on average) when                                                         concurrency factor 𝑁 of each N:1 FaaS VM is selected and
+they are deployed on a separate 1:1 microVM. This overhead                                                        configured by the runtime. Squeezy can accommodate any
+stems from replicating the guest OS state and the function                                                        concurrency factor, without affecting performance. 𝑁 ef-
+and FaaS runtime dependencies for every instance. Work-                                                           fectively acts as an upper bound of the maximum number
+loads with larger dependencies (e.g., Bert) suffer the most.                                                      of function instances that can concurrently be scheduled
+                                                                                                                  on the VM. Squeezy partitions start initially empty and are
+7                            Discussion                                                                           only populated via plug events, thus not affecting VM boot
+Going beyond FaaS. While Squeezy mainly targets the                                                               performance. The effective concurrency factor (i.e., the num-
+FaaS use-case, it is also applicable to non-FaaS scenarios.                                                       ber of actually populated Squeezy partitions) fluctuates as
+The key insight behind Squeezy is that FaaS workloads                                                             function instances are created and evicted on the N:1 VM,
+have predictable memory requirements. Each function in-                                                           leading Squeezy to plug and unplug function memory, in
+stance is pre-configured with a maximum amount of mem-                                                            fixed sized chunks. Recent research [56] studies the effect
+ory. Cloud-native applications, designed as a mesh of inter-                                                      of the concurrency factor for the N:1 model and proposes a
+connected microservices, also fulfill the above requirement.
+Squeezy: Rapid VM Memory Reclamation for Serverless Functions                     EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+
+
+hybrid approach, that involves VM cloning. Squeezy could            [40] proposes VM cloning for scaling cloud workloads. Re-
+be seamlessly used with this approach as well.                      cently, microVM snapshotting techniques have been pro-
+                                                                    posed [9, 19, 37, 59, 71] in order to accelerate function cold-
+                                                                    starts in the 1:1 model. Squeezy builds on top of the N:1 model
+8    Related Work                                                   that re-uses VM sandboxes for the instances of the same user
+Memory elasticity. To realize memory elasticity on physi-           to accelerate scale up events. All optimizations accelerating
+cal machines, Infiniswap [29] and FastSwap [6] rely on mem-         container sandboxing are orthogonal to Squeezy and it could
+ory disaggregation implemented via a swapping-based inter-          benefit from them. Recent works investigate combining the
+face over RDMA fabrics. AIFM [63] replaces the kernel-level         N:1 model with snapshots [56]. Squeezy could be used in
+swapping with fine-grained userspace-controlled swapping            such hybrid setups to ensure resource elasticity.
+to remote memory. FluidMem [14] targets VMs instead, and            Resource harvesting. Harvesting of unused resources has
+improves upon the swap-based approach by utilizing the              been studied both in the context of virtual machines [7, 24,
+Linux userfaultfd interface [46]. All of the aforementioned         75, 80] and serverless computing [83]. While these works
+works achieve memory elasticity by targeting disaggregated          focus on harvesting idle compute resources, i.e., CPUs, oth-
+RDMA-accessible memory. By contrast, Squeezy targets FaaS           ers [23, 25, 55, 67, 81] also support harvesting idle memory re-
+microVMs and, by providing reliable and fast memory recla-          sources. More specifically, MHVM [25] evaluates harvesting
+mation, enables the coupling of memory hot-unplugging               memory with serverless workloads by introducing a number
+with function invocation.                                           of optimizations including the preservation of large buffers of
+   Memory ballooning [31, 47, 64, 65, 73, 85] has been the          idle memory, proactive reclamation, and larger reclamation
+state-of-practice interface to implement VM memory elastic-         chunks. We incorporate pre-reclamation and buffering into
+ity. The default interface suffers from severe management           our setup and evaluate in Section 6.2.2. Squeezy manages to
+costs, as it adds and removes memory in the granularity of          achieve comparable or better tail latency while dynamically
+a page [30, 54, 65]. A recent work [25] employs a large set         up and down-sizing VMs, redistributing their memory, while
+of optimizations to work around the method’s high latency,          avoiding the memory overhead of the HarvestVM approach.
+e.g., reserving idle memory buffers to fall back to when bal-       Regarding the reclamation batching, it potentially reduces
+loon memory reclamation is late to secure free blocks of            the VMexit overhead of ballooning (Figure 5). Note though
+memory. We compare Squeezy memory hotunplugging with                that for Squeezy, the VMExit reclaim overhead is only ∼ 3ms
+ballooning in Section 6.                                            per 128MiB chunk. That said, we consider batching as a fu-
+   HyperAlloc [77], a recent work developed concurrently            ture optimization for Squeezy, in order to further reduce
+with Squeezy, presents an efficient mechanism for virtual ma-       the VMexit overheads, when multiple instances need to be
+chine memory elasticity. Compared to our work, HyperAlloc           reclaimed concurrently.
+targets large, long-lived IaaS VMs, while Squeezy focuses on
+short-lived serverless functions. This is reflected in HyperAl-     9   Conclusion
+loc’s design choices: (i) per-page memory reclamation, while        We present Squeezy, a novel memory management frame-
+Squeezy matches FaaS per-instance memory reclamation,               work, that enables the rapid reclamation of hotplugged mem-
+and (ii) the use of 2 MiB large pages for efficiency, which         ory for N:1 FaaS VMs. By segregating hot-plugged from nor-
+are rarely used in FaaS. HyperAlloc also replaces the Linux         mal VM memory, Squeezy bounds the lifetime of allocations
+physical memory allocator, while Squeezy integrates with            on hotplugged memory to the lifetime of the associated func-
+the default Linux buddy allocator.                                  tion, ensuring that hotplugged memory is readily reclaimable
+   Swap-based approaches [8, 82] have also been used to im-         on function exit. Squeezy is able to reclaim memory of ter-
+prove VM memory elasticity by utilizing local (hypervisor)          minated serverless functions an order of magnitude faster
+resources (memory), usually synergistically with memory             than state-of-the-art, eliminating the performance impact of
+ballooning. Previously, transcendent memory [17, 48] also           memory down-sizing on co-located function instances, as it
+used a swap-based interface to enable seamless VM memory            totally obviates the need for page migrations on the reclaim
+scaling via the Frontswap mechanism [45], while others [70]         path.
+have used transcendent memory to drive VM memory elas-
+ticity directly from userspace.                                     Acknowledgments
+Serverless scaling. In order to meet the extreme scalabil-          We thank the anonymous reviewers and the paper’s shep-
+ity and elasticity demands of the FaaS serverless computing         herd, Pierre Olivier, for their valuable comments.
+paradigm, various techniques have been proposed. One line
+of research focuses on accelerating container sandboxing
+for serverless functions [2, 5, 32, 57, 62, 69, 76]. LightVM [49]
+showcases how VM-based sandboxing can outperform contai-
+ner-based sandboxing via lean virtual machines. Snowflock
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk                                                                               Lagkas Nikolos, et al.
+
+
+References                                                                    [18] Docker Reference Documentation.              https://docs.docker.com/
+ [1] Alexandru Agache, Marc Brooker, Alexandra Iordache, Anthony                   reference/.
+     Liguori, Rolf Neugebauer, Phil Piwonka, and Diana-Maria Popa. 2020.      [19] Dong Du, Tianyi Yu, Yubin Xia, Binyu Zang, Guanglu Yan, Chenggang
+     Firecracker: Lightweight Virtualization for Serverless Applications.          Qin, Qixuan Wu, and Haibo Chen. 2020. Catalyzer: Sub-millisecond
+     In 17th USENIX Symposium on Networked Systems Design and Im-                  Startup for Serverless Computing with Initialization-less Booting.
+     plementation (NSDI 20). https://www.usenix.org/conference/nsdi20/             In Proceedings of the Twenty-Fifth International Conference on Archi-
+     presentation/agache                                                           tectural Support for Programming Languages and Operating Systems.
+ [2] Istemi Ekin Akkus, Ruichuan Chen, Ivica Rimac, Manuel Stein, Klaus            https://doi.org/10.1145/3373376.3378512
+     Satzke, Andre Beck, Paarijaat Aditya, and Volker Hilt. 2018. SAND:       [20] Firecracekr Feature Request. Memory-hotplug. https://github.com/
+     Towards High-Performance Serverless Computing. In 2018 Usenix                 firecracker-microvm/firecracker/issues/2890
+     Annual Technical Conference (USENIX ATC 18). https://www.usenix.         [21] Free Page Reporting. https://docs.kernel.org/mm/free_page_reporting.
+     org/system/files/conference/atc18/atc18-akkus.pdf                             html.
+ [3] Alibaba Serverless Application Engine. https://www.aliyun.com/           [22] Megan Frisella, Shirley Loayza Sanchez, and Malte Schwarzkopf. 2023.
+     product/aliware/sae.                                                          Towards Increased Datacenter Efficiency with Soft Memory. In Pro-
+ [4] Chloe Alverti, Stratos Psomadakis, Vasileios Karakostas, Jayneel              ceedings of the 19th Workshop on Hot Topics in Operating Systems.
+     Gandhi, Konstantinos Nikas, Georgios Goumas, and Nectarios Koziris.           https://doi.org/10.1145/3593856.3595902
+     2020. Enhancing and Exploiting Contiguity for Fast Memory Virtu-         [23] Alexander Fuerst, Ahmed Ali-Eldin, Prashant Shenoy, and Prateek
+     alization. In 2020 ACM/IEEE 47th Annual International Symposium on            Sharma. 2020. Cloud-scale VM-deflation for Running Interactive Ap-
+     Computer Architecture (ISCA). https://doi.org/10.1109/ISCA45697.2020.         plications On Transient Servers. In Proceedings of the 29th International
+     00050                                                                         Symposium on High-Performance Parallel and Distributed Computing.
+ [5] Chloe Alverti, Stratos Psomadakis, Burak Ocalan, Shashwat Jaiswal,            https://doi.org/10.1145/3369583.3392675
+     Tianyin Xu, and Josep Torrellas. 2025. CXLfork: Fast Remote Fork over    [24] Alexander Fuerst, Stanko Novaković, Íñigo Goiri, Gohar Irfan
+     CXL Fabrics. In Proceedings of the 30th ACM International Conference          Chaudhry, Prateek Sharma, Kapil Arya, Kevin Broas, Eugene Bak,
+     on Architectural Support for Programming Languages and Operating              Mehmet Iyigun, and Ricardo Bianchini. 2022. Memory-harvesting
+     Systems, Volume 2. https://doi.org/10.1145/3676641.3715988                    VMs in cloud platforms. In Proceedings of the 27th ACM International
+ [6] Emmanuel Amaro, Christopher Branner-Augmon, Zhihong Luo, Amy                  Conference on Architectural Support for Programming Languages and
+     Ousterhout, Marcos K Aguilera, Aurojit Panda, Sylvia Ratnasamy, and           Operating Systems. https://doi.org/10.1145/3503222.3507725
+     Scott Shenker. 2020. Can far memory improve job throughput?. In          [25] Alexander Fuerst, Stanko Novaković, Íñigo Goiri, Gohar Irfan
+     Proceedings of the Fifteenth European Conference on Computer Systems.         Chaudhry, Prateek Sharma, Kapil Arya, Kevin Broas, Eugene Bak,
+     https://doi.org/10.1145/3342195.3387522                                       Mehmet Iyigun, and Ricardo Bianchini. 2022. Memory-Harvesting
+ [7] Pradeep Ambati, Inigo Goiri, Felipe Frujeri, Alper Gun, Ke Wang, Brian        VMs in Cloud Platforms. In Proceedings of the 27th ACM International
+     Dolan, Brian Corell, Sekhar Pasupuleti, Thomas Moscibroda, Sameh              Conference on Architectural Support for Programming Languages and
+     Elnikety, Marcus Fontoura, and Ricardo Bianchini. 2020. Providing             Operating Systems. https://doi.org/10.1145/3503222.3507725
+     SLOs for Resource-Harvesting VMs in Cloud Platforms. In 14th USENIX      [26] Alexander Fuerst and Prateek Sharma. 2021. FaasCache: keeping
+     Symposium on Operating Systems Design and Implementation (OSDI                serverless computing alive with greedy-dual caching. In Proceedings
+     20). https://www.usenix.org/conference/osdi20/presentation/ambati             of the 26th ACM International Conference on Architectural Support for
+ [8] Nadav Amit, Dan Tsafrir, and Assaf Schuster. 2014. Vswapper: A                Programming Languages and Operating Systems. https://doi.org/10.
+     memory swapper for virtualized environments. Acm Sigplan Notices              1145/3445814.3446757
+     49, 4 (2014). 10.1145/2644865.2541969                                    [27] Azure Functions..        https://azure.microsoft.com/en-us/services/
+ [9] Lixiang Ao, George Porter, and Geoffrey M Voelker. 2022. FaaS-                functions/.
+     nap: FaaS Made Fast Using Snapshot-based VMs. In Proceedings of          [28] Google Serverless Computing. https://cloud.google.com/serverless.
+     the Seventeenth European Conference on Computer Systems. https:          [29] Juncheng Gu, Youngmoon Lee, Yiwen Zhang, Mosharaf Chowdhury,
+     //doi.org/10.1145/3492321.3524270                                             and Kang G Shin. 2017. Efficient Memory Disaggregation with In-
+[10] Apache Openwhisk. https://github.com/apache/openwhisk                         finiswap. In 14th USENIX Symposium on Networked Systems Design
+[11] AWS.. Amazon EC2 Spot Instances. https://aws.amazon.com/ec2/                  and Implementation (NSDI 17). https://www.usenix.org/system/files/
+     spot/                                                                         conference/nsdi17/nsdi17-gu.pdf
+[12] AWS Lambda. https://aws.amazon.com/lambda.                               [30] David Hildenbrand and Martin Schulz. 2021. virtio-mem: paravir-
+[13] Paul Barham, Boris Dragovic, Keir Fraser, Steven Hand, Tim Harris,            tualized memory hot(un)plug. In Proceedings of the 17th ACM SIG-
+     Alex Ho, Rolf Neugebauer, Ian Pratt, and Andrew Warfield. 2003. Xen           PLAN/SIGOPS International Conference on Virtual Execution Environ-
+     and the art of virtualization. SIGOPS Oper. Syst. Rev. (2003). https:         ments. https://doi.org/10.1145/3453933.3454010
+     //doi.org/10.1145/1165389.945462                                         [31] Jingyuan Hu, Xiaokuang Bai, Sai Sha, Yingwei Luo, Xiaolin Wang,
+[14] Blake Caldwell, Sepideh Goodarzy, Sangtae Ha, Richard Han, Eric               and Zhenlin Wang. 2018. HUB: hugepage ballooning in kernel-based
+     Keller, Eric Rozner, and Youngbin Im. 2020. FluidMem: Full, Flex-             virtual machines. In Proceedings of the International Symposium on
+     ible, and Fast Memory Disaggregation for the Cloud. In 2020 IEEE              Memory Systems. https://doi.org/10.1145/3240302.3240420
+     40th International Conference on Distributed Computing Systems           [32] Jialiang Huang, MingXing Zhang, Teng Ma, Zheng Liu, Sixing Lin,
+     (ICDCS). https://doi.org/https://doi.ieeecomputersociety.org/10.1109/         Kang Chen, Jinlei Jiang, Xia Liao, Yingdi Shan, Ning Zhang, et al.
+     ICDCS47774.2020.00090                                                         2024. TrEnv: Transparently Share Serverless Execution Environments
+[15] Cloudflare Workers. https://workers.cloudflare.com/.                          Across Different Functions and Nodes. In Proceedings of the ACM
+[16] CONFIG_INIT_ON_ALLOC_DEFAULT_ON: Enable heap memory                           SIGOPS 30th Symposium on Operating Systems Principles. https://doi.
+     zeroing on allocation by default.       https://cateee.net/lkddb/web-         org/10.1145/3694715.3695967
+     lkddb/INIT_ON_ALLOC_DEFAULT_ON.html                                      [33] Huawei Cloud Functions. https://developer.huawei.com/consumer/
+[17] Dan Magenheimer . 2011. Transcendent memory in a nutshell. https:             en/agconnect/cloud-function/.
+     //lwn.net/Articles/454795/                                               [34] Artjom Joosen, Ahmed Hassan, Martin Asenov, Rajkarn Singh, Luke
+                                                                                   Darlow, Jianfeng Wang, and Adam Barker. 2023. How Does It Function?
+Squeezy: Rapid VM Memory Reclamation for Serverless Functions                                    EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+
+
+     Characterizing Long-term Trends in Production Serverless Workloads.         [50] memhog(8) man page. https://man7.org/linux/man-pages/man8/
+     In Proceedings of the 2023 ACM Symposium on Cloud Computing. https:              memhog.8.html
+     //doi.org/10.1145/3620678.3624783                                           [51] Microsoft.. Azure Spot Virtual Machines. https://azure.microsoft.
+[35] Artjom Joosen, Ahmed Hassan, Martin Asenov, Rajkarn Singh, Luke                  com/en-us/products/virtual-machines/spot/#overview
+     Darlow, Jianfeng Wang, Qiwen Deng, and Adam Barker. 2025. Server-           [52] Microsoft. 2025. Azure Functions hosting options. https://learn.
+     less Cold Starts and Where to Find Them. In Proceedings of the Twen-             microsoft.com/en-us/azure/azure-functions/functions-scale
+     tieth European Conference on Computer Systems. https://doi.org/10.          [53] Anup Mohan, Harshad Sane, Kshitij Doshi, Saikrishna Edupuganti,
+     1145/3689031.3696073                                                             Naren Nayak, and Vadim Sukhomlinov. 2019. Agile Cold Starts
+[36] Kata Containers. https://github.com/kata-containers                              for Scalable Serverless. In 11th USENIX Workshop on Hot Topics in
+[37] Christos Katsakioris, Chloe Alverti, Vasileios Karakostas, Konstantinos          Cloud Computing (HotCloud 19). https://www.usenix.org/system/files/
+     Nikas, Georgios Goumas, and Nectarios Koziris. 2022. FaaS in the                 hotcloud19-paper-mohan.pdf
+     Age of (Sub-)Ms I/O: A Performance Analysis of Snapshotting. In             [54] A B M Moniruzzaman. 2014. Analysis of Memory Ballooning Tech-
+     Proceedings of the 15th ACM International Conference on Systems and              nique for Dynamic Memory Management of Virtual Machines (VMs).
+     Storage. https://doi.org/10.1145/3534056.3534938                                 arXiv:1411.7344 [cs.DC] https://arxiv.org/abs/1411.7344
+[38] Jeongchul Kim and Kyungyong Lee. 2019. Practical Cloud Workloads            [55] Djob Mvondo, Mathieu Bacou, Kevin Nguetchouang, Lucien Ngale,
+     for Serverless FaaS. In Proceedings of the ACM Symposium on Cloud                Stéphane Pouget, Josiane Kouam, Renaud Lachaize, Jinho Hwang, Tim
+     Computing. https://doi.org/10.1145/3357223.3365439                               Wood, Daniel Hagimont, et al. 2021. OFC: an opportunistic caching
+[39] Sumer Kohli, Shreyas Kharbanda, Rodrigo Bruno, Joao Carreira, and Pe-            system for FaaS platforms. In Proceedings of the Sixteenth European
+     dro Fonseca. 2024. Pronghorn: Effective Checkpoint Orchestration for             Conference on Computer Systems. https://doi.org/10.1145/3447786.
+     Serverless Hot-Starts. In Proceedings of the 19th European Conference on         3456239
+     Computer Systems (EuroSys). https://doi.org/10.1145/3627703.3629556         [56] Orestis Lagkas Nikolos, Chloe Alverti, Stratos Psomadakis, Georgios
+[40] Horacio Andrés Lagar-Cavilla, Joseph Andrew Whitney, Adin Matthew                Goumas, and Nectarios Koziris. 2025. Scaling Serverless Functions:
+     Scannell, Philip Patchin, Stephen M Rumble, Eyal De Lara, Michael                Horizontal or Vertical? Both!. In Proceedings of the 3rd Workshop on
+     Brudno, and Mahadev Satyanarayanan. 2009. Snowflock: rapid virtual               SErverless Systems, Applications and MEthodologies. https://doi.org/10.
+     machine cloning for cloud computing. In Proceedings of the 4th ACM               1145/3721465.3721865
+     European conference on Computer systems. https://doi.org/10.1145/           [57] Edward Oakes, Leon Yang, Dennis Zhou, Kevin Houck, Tyler Harter,
+     1519065.1519067                                                                  Andrea Arpaci-Dusseau, and Remzi Arpaci-Dusseau. 2018. SOCK:
+[41] Huaicheng Li, Daniel S. Berger, Lisa Hsu, Daniel Ernst, Pantea Zar-              Rapid task provisioning with Serverless-Optimized containers. In 2018
+     doshti, Stanko Novakovic, Monish Shah, Samir Rajadnya, Scott Lee,                USENIX annual technical conference (USENIX ATC 18). https://www.
+     Ishwar Agarwal, Mark D. Hill, Marcus Fontoura, and Ricardo Bian-                 usenix.org/system/files/conference/atc18/atc18-oakes.pdf
+     chini. 2023. Pond: CXL-Based Memory Pooling Systems for Cloud               [58] Ashish Panwar, Aravinda Prasad, and K. Gopinath. 2018. Making Huge
+     Platforms. In Proceedings of the 28th ACM International Conference               Pages Actually Useful. In Proceedings of the Twenty-Third International
+     on Architectural Support for Programming Languages and Operating                 Conference on Architectural Support for Programming Languages and
+     Systems, Volume 2. https://doi.org/10.1145/3575693.3578835                       Operating Systems. https://doi.org/10.1145/3173162.3173203
+[42] Zijun Li, Jiagan Cheng, Quan Chen, Eryu Guan, Zizheng Bian, Yi              [59] Stratos Psomadakis, Dimitrios Siakavaras, Chloe Alverti, Symeon
+     Tao, Bin Zha, Qiang Wang, Weidong Han, and Minyi Guo. 2022.                      Porgiotis, Orestis Lagkas Nikolos, Christos Katsakioris, Konstanti-
+     RunD: A Lightweight Secure Container Runtime for High-density                    nos Nikas, Georgios Goumas, and Nectarios Koziris. 2025. SnapBPF:
+     Deployment and High-concurrency Startup in Serverless Comput-                    Exploiting eBPF for Serverless Snapshot Prefetching. In Proceedings
+     ing. In 2022 USENIX Annual Technical Conference (USENIX ATC 22).                 of the 17th ACM Workshop on Hot Topics in Storage and File Systems.
+     https://www.usenix.org/conference/atc22/presentation/li-zijun-rund               https://doi.org/10.1145/3736548.3737823
+[43] Zijun Li, Linsong Guo, Jiagan Cheng, Quan Chen, Bingsheng He, and           [60] Yifan Qiao, Zhenyuan Ruan, Haoran Ma, Adam Belay, Miryung Kim,
+     Minyi Guo. 2022. The Serverless Computing Survey: A Technical                    and Harry Xu. 2024. Harvesting Idle Memory for Application-managed
+     Primer for Design Architecture. ACM Comput. Surv. (2022). https:                 Soft State with Midas. In 21st USENIX Symposium on Networked Systems
+     //doi.org/10.1145/3508360                                                        Design and Implementation (NSDI 24). https://www.usenix.org/system/
+[44] Linux. Memory Hot(Un)Plug. https://docs.kernel.org/admin-guide/                  files/nsdi24-qiao.pdf
+     mm/memory-hotplug.html                                                      [61] Resource Management for Pods and Containers. https://kubernetes.
+[45] Linux Frontswap.           https://www.kernel.org/doc/html/v5.6/vm/              io/docs/concepts/configuration/manage-resources-containers/
+     frontswap.html                                                              [62] Rohan Basu Roy, Tirthak Patel, and Devesh Tiwari. 2022. Icebreaker:
+[46] Linux Userfaultfd.          https://docs.kernel.org/admin-guide/mm/              Warming serverless functions better with heterogeneity. In Proceedings
+     userfaultfd.html                                                                 of the 27th ACM International Conference on Architectural Support for
+[47] Haikun Liu, Hai Jin, Xiaofei Liao, Wei Deng, Bingsheng He, and Cheng-            Programming Languages and Operating Systems. https://doi.org/10.
+     zhong Xu. 2014. Hotplug or Ballooning: A Comparative Study on                    1145/3503222.3507750
+     Dynamic Memory Management Techniques for Virtual Machines. IEEE             [63] Zhenyuan Ruan, Malte Schwarzkopf, Marcos K Aguilera, and Adam
+     Transactions on parallel and distributed systems 26, 5 (2014), 1350–1363.        Belay. 2020. AIFM: High-Performance, Application-Integrated far
+     https://doi.org/10.1109/TPDS.2014.2320915                                        memory. In 14th USENIX Symposium on Operating Systems Design
+[48] Dan Magenheimer, Chris Mason, Dave McCracken, and Kurt Hackel.                   and Implementation (OSDI 20). https://www.usenix.org/system/files/
+     2009. Transcendent Memory and Linux. In Proceedings of the Linux                 osdi20-ruan.pdf
+     Symposium. https://www.kernel.org/doc/ols/2009/ols2009-pages-191-           [64] Tudor-Ioan Salomie, Gustavo Alonso, Timothy Roscoe, and Kevin
+     200.pdf                                                                          Elphinstone. 2013. Application level ballooning for efficient server
+[49] Filipe Manco, Costin Lupu, Florian Schmidt, Jose Mendes, Simon                   consolidation. In Proceedings of the 8th ACM European Conference on
+     Kuenzer, Sumit Sati, Kenichi Yasukata, Costin Raiciu, and Felipe                 Computer Systems. https://doi.org/10.1145/2465351.2465384
+     Huici. 2017. My VM is Lighter (and Safer) than your Container. In           [65] Joel H Schopp, Keir Fraser, and Martine J Silbermann. 2006. Resizing
+     Proceedings of the 26th Symposium on Operating Systems Principles.               Memory With Balloons and Hotplug. In Proceedings of the Linux Sym-
+     https://doi.org/10.1145/3132747.3132763                                          posium. https://www.landley.net/kdocs/ols/2006/ols2006v2-pages-
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk                                                                              Lagkas Nikolos, et al.
+
+
+     313-320.pdf                                                                    Memory Pool Architecture. In Proceedings of the 29th ACM Interna-
+[66] Mohammad Shahrad, Rodrigo Fonseca, Inigo Goiri, Gohar Chaudhry,                tional Conference on Architectural Support for Programming Languages
+     Paul Batum, Jason Cooke, Eduardo Laureano, Colby Tresness, Mark                and Operating Systems, Volume 3. https://doi.org/10.1145/3620666.
+     Russinovich, and Ricardo Bianchini. 2020. Serverless in the wild:              3651355
+     Characterizing and optimizing the serverless workload at a large cloud    [79] Zi Yan, Daniel Lustig, David Nellans, and Abhishek Bhattacharjee. 2019.
+     provider. In 2020 USENIX annual technical conference (USENIX ATC 20).          Translation ranger: operating system support for contiguity-aware
+     https://www.usenix.org/system/files/atc20-shahrad.pdf                          TLBs. In Proceedings of the 46th International Symposium on Computer
+[67] Prateek Sharma, Ahmed Ali-Eldin, and Prashant Shenoy. 2019. Re-                Architecture (ISCA ’19). https://doi.org/10.1145/3307650.3322223
+     source Deflation: A New Approach For Transient Resource Reclama-          [80] Fangkai Yang, Lu Wang, Zhenyu Xu, Jue Zhang, Liqun Li, Bo Qiao,
+     tion. In Proceedings of the Fourteenth EuroSys Conference 2019 (EuroSys        Camille Couturier, Chetan Bansal, Soumya Ram, Si Qin, et al. 2023.
+     ’19). https://doi.org/10.1145/3302424.3303945                                  Snape: Reliable and low-cost computing with mixture of spot and on-
+[68] Wonseok Shin, Wook-Hee Kim, and Changwoo Min. 2022. Fireworks:                 demand vms. In Proceedings of the 28th ACM International Conference
+     A Fast, Efficient, and Safe Serverless Framework using VM-level post-          on Architectural Support for Programming Languages and Operating
+     JIT Snapshot. In Proceedings of the 17th European Conference on Com-           Systems, Volume 3. https://doi.org/10.1145/3582016.3582028
+     puter Systems (EuroSys). https://doi.org/10.1145/3492321.3519581          [81] Hanfei Yu, Christian Fontenot, Hao Wang, Jian Li, Xu Yuan, and Seung-
+[69] Jovan Stojkovic, Tianyin Xu, Hubertus Franke, and Josep Torrellas.             Jong Park. 2023. Libra: Harvesting idle resources safely and timely in
+     2023. MXFaaS: Resource Sharing in Serverless Environments for                  serverless clusters. In Proceedings of the 32nd International Symposium
+     Parallelism and Efficiency. In Proceedings of the 50th Annual Inter-           on High-Performance Parallel and Distributed Computing. https://doi.
+     national Symposium on Computer Architecture (ISCA ’23). https:                 org/10.1145/3588195.3592996
+     //doi.org/10.1145/3579371.3589069                                         [82] Qi Zhang, Ling Liu, Gong Su, and Arun Iyengar. 2017. Memflex: A
+[70] Aimilios Tsalapatis, Stefanos Gerangelos, Stratos Psomadakis, Kon-             shared memory swapper for high performance vm execution. IEEE
+     stantinos Papazafeiropoulos, and Nectarios Koziris. 2018. utmem:               transactions on Computers 66, 9 (2017). https://doi.org/10.1109/TC.
+     Towards memory elasticity in cloud workloads. In High Performance              2017.2686850
+     Computing: ISC High Performance 2018 International Workshops, Frank-      [83] Yanqi Zhang, Íñigo Goiri, Gohar Irfan Chaudhry, Rodrigo Fonseca,
+     furt/Main, Germany, June 28, 2018, Revised Selected Papers 33. https:          Sameh Elnikety, Christina Delimitrou, and Ricardo Bianchini. 2021.
+     //doi.org/10.1007/978-3-030-02465-9_12                                         Faster and Cheaper Serverless Computing on Harvested Resources. ACM.
+[71] Dmitrii Ustiugov, Plamen Petrov, Marios Kogias, Edouard Bugnion,               https://doi.org/10.1145/3477132.3483580
+     and Boris Grot. 2021. Benchmarking, Analysis, and Optimization            [84] Kaiyang Zhao, Kaiwen Xue, Ziqi Wang, Dan Schatzberg, Leon Yang,
+     of Serverless Function Snapshots. In Proceedings of the 26th ACM               Antonis Manousis, Johannes Weiner, Rik Van Riel, Bikash Sharma,
+     International Conference on Architectural Support for Programming              Chunqiang Tang, and Dimitrios Skarlatos. 2024. Contiguitas: The
+     Languages and Operating Systems (ASPLOS’21). ACM. https://doi.org/             Pursuit of Physical Memory Contiguity in Data Centers. IEEE Micro
+     10.1145/3445814.3446714                                                        (2024). https://doi.org/10.1145/3579371.3589079
+[72] VMware.. Memory Balloon Driver. https://docs.vmware.com/en/               [85] Weiming Zhao, Zhenlin Wang, and Yingwei Luo. 2009. Dynamic
+     VMware-vSphere/7.0/com.vmware.vsphere.resmgmt.doc/GUID-                        memory balancing for virtual machines. ACM SIGOPS Operating
+     5B45CEFA-6CC6-49F4-A3C7-776AAA22C2A2.html                                      Systems Review 43, 3 (2009). https://doi.org/10.1145/1508293.1508297
+[73] Carl A Waldspurger. 2002. Memory resource management in VMware            [86] Ziming Zhao, Mingyu Wu, Haibo Chen, and Binyu Zang. 2024. Char-
+     ESX server. ACM SIGOPS Operating Systems Review 36, SI (2002).                 acterization and Reclamation of Frozen Garbage in Managed FaaS
+     https://doi.org/10.1145/844128.844146                                          Workloads. In Proceedings of the Nineteenth European Conference on
+[74] Liang Wang, Mengyuan Li, Yinqian Zhang, Thomas Ristenpart, and                 Computer Systems. https://doi.org/10.1145/3627703.3629579
+     Michael Swift. 2018. Peeking behind the curtains of serverless plat-
+     forms. In 2018 USENIX annual technical conference (USENIX ATC
+     18). https://www.usenix.org/system/files/conference/atc18/atc18-
+     wang-liang.pdf
+[75] Yawen Wang, Kapil Arya, Marios Kogias, Manohar Vanga, Aditya
+     Bhandari, Neeraja J Yadwadkar, Siddhartha Sen, Sameh Elnikety,
+     Christos Kozyrakis, and Ricardo Bianchini. 2021. Smartharvest: Har-
+     vesting idle cpus safely and efficiently in the cloud. In Proceedings
+     of the Sixteenth European Conference on Computer Systems. https:
+     //doi.org/10.1145/3447786.3456225
+[76] Xingda Wei, Fangming Lu, Tianxia Wang, Jinyu Gu, Yuhan Yang,
+     Rong Chen, and Haibo Chen. 2023. No provisioned concurrency: Fast
+      {RDMA-codesigned} remote fork for serverless computing. In 17th
+     USENIX Symposium on Operating Systems Design and Implementation
+     (OSDI 23). https://www.usenix.org/system/files/osdi23-wei-rdma.pdf
+[77] Lars Wrenger, Kenny Albes, Marco Wurps, Christian Dietrich, and
+     Daniel Lohmann. 2025. HyperAlloc: Efficient VM Memory De/Infla-
+     tion via Hypervisor-Shared Page-Frame Allocators. In Proceedings of
+     the Twentieth European Conference on Computer Systems (Rotterdam,
+     Netherlands) (EuroSys ’25). Association for Computing Machinery,
+     New York, NY, USA, 702–719. https://doi.org/10.1145/3689031.3717484
+[78] Chuhao Xu, Yiyu Liu, Zijun Li, Quan Chen, Han Zhao, Deze Zeng, Qian
+     Peng, Xueqi Wu, Haifeng Zhao, Senbo Fu, and Minyi Guo. 2024. FaaS-
+     Mem: Improving Memory Efficiency of Serverless Computing with
+

@@ -1,0 +1,2331 @@
+XLB: A High Performance Layer-7 Load Balancer for Microservices
+
+using eBPF-based In-kernel Interposition
+Yuejie Wang
+Peking University
+
+Chenchen Shou
+Peking University
+
+Jiaxu Qian
+Peking University
+
+arXiv:2602.09473v1 [cs.NI] 10 Feb 2026
+
+Abstract
+
+microservices deploy LB alongside services within the same
+host, introducing new performance and security challenges;
+3) The invocation of multiple microservices to fulfill a single
+user request creates long service chains, demanding stringent
+performance requirements from each LB hop.
+Given these new characteristics, the primary customer demands for LB are i) high performance with minimal impact on
+application, and ii) strong isolation between different applications and their respective LBs. Unfortunately, existing sidecarbased approaches, such as Istio [33] and Cilium [11], which
+deploy separate containers along with applications for load
+balancing (Figure 1(a) and (b)), incurs significant overhead.
+Our experiments (§2) show a 55.9% reduction in throughput
+and a 2.27x increase in end-to-end latency under even light
+workloads. To mitigate these issues, sidecar-less service mesh,
+such as Istio Ambient, delegates certain Layer-4 networking
+functions to the kernel. However, this approach cannot address HTTP-specific functionalities, which are conventionally
+managed by L7 LBs [60, 64]. Kernel-bypass techniques (Figure 1(c)), such as DPDK [1], fail to shorten communication
+paths and require reimplementation of the network stack for
+L7 LB functionality. Recent work [58] implements LB as a library (Figure 1(d) that runs inside applications, but it exposes
+the application to security risks [50] and requires application
+modification that loses the advantages of flexible deployment.
+Thus, the library-based approach can only be deployed in
+internal trusted environments and cannot serve external customers in the public cloud [58].
+In this work, we re-examine the L7 LB architecture with
+the aim of reducing overhead while maintaining strong isolation. Our comprehensive analysis reveals that the traditional
+sidecar-based model inherently incurs unnecessary overhead.
+Notably, we discovered that only a minor portion–about 20%–
+of this overhead is attributable to essential LB functions such
+as protocol parsing and load balancing. Thus, rather than operating as an independent scheduling entity, we advocate an
+L7 LB should be a synchronous interposition component on
+the data path. Conceptually, LB acts as a logical extension
+of the application, seamlessly integrated within the kernel.
+Practically, we leverage eBPF [20] for modular kernel modifications, messages interception, and executing LB operations
+without incurring additional overheads.
+Employing eBPF to implement L7 LB poses a set of unique
+challenges, particularly due to the existing kernel lacking
+
+L7 load balancers are a fundamental building block in microservices as they enable fine-grained traffic distribution.
+Compared to monolithic applications, microservices demand
+higher performance and stricter isolation from load balancers.
+This is due to the increased number of instances, longer service chains, and the necessity for co-location with services
+on the same host. Traditional sidecar-based load balancers
+are ill-equipped to meet these demands, often resulting in
+significant performance degradation.
+In this work, we present XLB, a novel architecture that reshapes L7 load balancers as in-kernel interposition operating
+on the socket layer. We leverage eBPF to implement the core
+load balancing logic in the kernel, and address the connection
+management and state maintenance challenges through novel
+socket layer redirection and nested eBPF maps designs. XLB
+eliminates the extra overhead of scheduling, communication,
+and data movement, resulting in a more lightweight, scalable, and efficient L7 load balancer architecture. Compared
+to the widely used microservices load balancers (Istio and
+Cilium), over 50 microservice instances, XLB achieves up to
+1.5x higher throughput and 60% lower end-to-end latency.
+
+1
+
+Guyue Liu
+Peking University
+
+Introduction
+
+The microservice architecture has gained widespread adoption in the construction of large-scale cloud applications [2,15,
+26, 43]. By decomposing a monolithic application into multiple manageable microservices, each service can be developed,
+deployed, and scaled independently. This architectural transition leads to a substantial increase in the number of service
+instances and a surge in internal messages. Load balancers
+(LB), acting as the pivotal link that distributes the majority, if
+not all, of these messages among services, have a significant
+impact on end-to-end performance.
+Besides the increasing performance demand, the microservice architecture also introduces additional complexity to the
+operation of LB. Our experience in managing large-scale
+cloud and microservice infrastructures has led us to identify three new unique challenges. 1) The traditional Layer-4
+(L4) LB approach proves too coarse-grained, necessitating
+the adoption of Layer-7 (L7) LB for more granular traffic
+management and enhanced application cooperation; 2) Unlike traditional architectures that host LB on separate servers,
+1
+
+System
+Latency (us)
+Throughput (req/s)
+
+Istio
+1.433
+44652.8
+
+Cilium
+1.197
+53459.9
+
+XLB
+
+• Performance: An exhaustive evaluation under various realistic workloads. XLB gets up to 1.5x higher throughput
+and 60% lower average latency compared to the widely
+used LB (Istio and Cilium).
+
+0.63
+101449.6
+
+Table 1: Performance comparison of different L7 LB.
+the necessary context for L7 traffic and connections. The
+current socket subsystem is designed for basic data sending
+and receiving, but does not support advanced features such
+as connection splicing, which are crucial for load balancing.
+Moreover, L7 LB requires maintaining various application
+states such as user configurations, protocol states, control
+information etc.. These states, which are intricately linked, are
+traditionally managed with complex user space data structures.
+Yet, eBPF, with its limited data structure support and stringent
+memory usage constraints, requires innovative approaches to
+accommodate these needs efficiently.
+To address these challenges, we present XLB, a novel inkernel L7 LB. Our key design decision is offloading LB to
+the socket layer using eBPF programs. Our insight is that the
+proposed interposition layer should be positioned as close to
+applications as possible. This is contrary to recent data plane
+optimization approaches that move processing logic to lower
+layers, such as device drivers or hardware [25, 31, 56, 67].
+Although moving processing to lower layers can optimize
+I/O, it prolongs the execution path and increases complexity
+for L7 LB. Our approach enables a modular extension and fast
+processing for in-kernel LB. XLB intercepts the application
+traffic with no extra cost from separate proxies, yet still, can
+operate on the complete application layer messages without
+the complicated interaction with networking stacks.
+To effectively expand the existing socket with the necessary L7 context, we have two key designs. Firstly, we design
+an efficient socket message redirection mechanism. We enhance the current socket mechanism by associating a list of
+pools containing backend instances with a socket, bypassing
+connection handshake at the client side, and providing more
+flexible message redirection among sockets. Secondly, we
+use nested eBPF maps to build complex data structures to
+maintain states about flows, configurations, and services. This
+makes XLB compatible with existing control plane interfaces
+(e.g., backend discovery and policy configuration) and supports all Envoy rules [52] related to load balancing used by
+Istio. Deploying XLB to serve a financial customer delivers a
+41% latency reduction and 30% service density improvement.
+To the best of our knowledge, XLB is the first eBPF-based L7
+LB production that securely serves external customers within
+a public cloud.
+We make the following contributions :
+• New Architecture: A novel L7 microservices LB architecture that replaces sidecar-based model with in-kernel
+interposition in the socket layer using eBPF.
+• Compatibility and Practicality: XLB is compatible with
+the existing control and management plane and requires no
+application modifications, achieving a drop-in replacement
+of the current L7 microservices LB.
+
+2
+2.1
+
+Motivation and Background
+Overhead Analysis of L7 LB
+
+Sidecar-based LB. There is a variety of L7 LB [11, 27, 33,
+47, 52]. In microservices, current dominant solutions, such as
+Istio [33] and Cilium [11], use the sidecar-based architecture
+shown in Figure 1(a) and (b). A sidecar is an independent
+container attached to a microservice instance. All traffic from
+and to the microservice is redirected into this sidecar that
+distributes the traffic among multiple instances at every hop.
+Existing sidecar-less service mesh, such as Istio Ambient,
+cannot address L7 functionalities [64]. To quantify the overhead introduced by the current L7 LB sidecar, we conduct a
+micro-benchmark to measure the throughput and latency of
+two microservice instances with different LB (details in §6).
+Table 1 shows the performance results of Istio, Cilium,
+and XLB. Cilium improves Istio by avoiding redundant networking stack in the kernel and using a global proxy for all
+services. Despite these optimizations, Istio and Cilium incur
+substantial overhead. Compared with XLB, Istio (Cilium) results in a 55.9% (47.3%) reduction in throughput and 2.27x
+(1.9x) higher latency. We next dissect the overhead to identify
+potential performance optimization opportunities.
+Performance overhead breakdown. We combine code instrumentation and the perf flame graph to profile different
+components along the data path inside Istio. We measure
+the latency between the sidecar receiving a request from the
+service and sending the request out.
+Our profiling focuses on five key components: 1) protocol
+parsing which parses application layer messages; 2) load balancing which distributes the load based on the policy (e.g.,
+weighted round robin, least load); 3) connection-splicing
+which tracks connections of both clients and servers and
+splices data streams among connections [13, 41, 55]; 4) socket
+processing represents the communication cost between an
+application and the sidecar; and 5) kernel stack processing
+is the part spent on the networking stack processing in the
+kernel, including both the application and the sidecar. The rest
+of the overhead is accounted for by others, such as language
+(C++) overhead, event callback, and scheduling preemption.
+Table 2 shows the time spent on each component. From the
+results, we can see the overheads of essential load balancing
+functionalities, such as protocol parsing and load balancing
+algorithm only account for 20%. This shows that it is possible
+to eliminate a majority of L7 LB overhead without sacrificing key functionalities. Two major sources of overhead are
+kernel protocol processing and connection splicing which in
+total account for more than 50%, thus become our target of
+2
+
+Control plane
+
+Control plane
+
+inbound traffic
+outbound traffic
+
+L7 proxies
+
+Microservices
+instances
+HTTP
+gRPC
+
+L7 proxy
+
+Microservices
+instances
+HTTP
+gRPC
+
+routing info baes
+protocol parsing
+
+user space
+
+user space
+
+connection splicing
+
+kernel space
+
+kernel space
+
+socket
+
+socket
+
+socket
+
+TCP/IP
+
+TCP/IP
+
+TCP/IP
+
+socket
+
+socket
+
+socket
+
+load balancing
+
+TCP/IP
+
+sock map
+
+socket redirection
+
+iptables
+
+user-level library
+
+Data plane
+
+Data plane
+
+(a) Istio
+
+(b) Cilium
+
+Control plane
+
+Control plane
+
+L7 proxies
+
+Microservices
+instances
+HTTP
+gRPC
+user space
+
+DPDK-based
+user-level stack
+
+kernel space
+
+socket
+
+socket
+
+socket
+
+TCP/IP
+
+TCP/IP
+
+TCP/IP
+
+iptables
+
+kernel-level component
+
+Microservices
+instances
+HTTP
+gRPC
+
+Control plane
+
+RIB Daemon
+
+LBLib
+
+eBPF
+maps
+
+Microservices
+instances
+HTTP
+gRPC
+
+RIB Daemon
+
+user space
+
+p-socket
+
+kernel space
+
+user space
+kernel space
+
+XLB
+socket
+
+i-socket
+
+TCP/IP
+
+Data plane
+
+Data plane
+
+(c) DPDK
+
+(d) Library
+
+TCP/IP
+
+(e) XLB
+
+Figure 1: Different architectures of various L7 LB designs. (a) represents Istio, which involves redundant networking stack processing and
+has a per-service proxy. (b) illustrates Cilium that optimizes away networking stack and uses a global proxy for all services. (c) implements
+the sidecar with DPDK to bypass the kernel. (d) implements the LB as a library within the application process. (e) is XLB, which offloads
+load-balancing logic into the kernel data path.
+Component
+Protocol-parsing
+Load Balancing
+Connection Splicing
+Socket Processing
+Kernel Protocol
+Others
+
+optimizations. Diving deeper into these two components, we
+can further categorize the overheads into three types:
+Duplicate protocol processing: Currently, both inbound and
+outbound traffic traverse the kernel TCP/IP stack three times
+(Figure 1(a)), resulting in redundant processing.
+System calls: Connection splicing involves numerous system calls, necessary for the creation, management, and termination of network connections, introducing more user-kernel
+switches and constant system call overhead.
+Cross-process overheads: Running sidecar and application
+as separate processes, whether on the same core or different cores, incurs additional overhead from task placement,
+process communication, priority assignment, and event notification. Even worse, these overheads are inevitably introduced
+to the system in one way or another. For instance, if the LB
+and the service are placed on the same core, switching the
+context between them back and forth is necessary. When they
+are placed on different cores, cross-core cache coherence then
+becomes unavoidable. Another example is determining the
+scheduling priority of the LB. Higher priority will block the
+application service, while lower priority will cause preemption from other unimportant tasks.
+Next, we discuss possible approaches to eliminating the
+identified overheads. The summary is shown in Table 3.
+
+Sidecar-based
+4.5us (5.11%)
+13us (14.78%)
+22us (25%)
+3.83us (4.35%)
+26.9us (30.62%)
+17.7us (20.12%)
+
+XLB
+
+—
+—
+↓
+↓
+↓
+↓
+
+Table 2: Latency of different Istio data path components.
+Kernel-bypass approaches. One method to mitigate kernelrelated overhead is through kernel-bypass techniques, such as
+using DPDK [1]. By implementing the sidecar with DPDK
+(Figure 1(c)), we can bypass the kernel, thereby eliminating
+the overhead associated with user-kernel switches and system
+calls. However, this method bypasses the standard kernel protocol stack, necessitating a custom TCP/IP stack to enable L7
+load balancing functionalities. To optimize this custom stack
+further, particularly to minimize duplicate protocol processing by reusing results between the sidecar and the application,
+significant modifications to the application will be required.
+Moreover, even when using DPDK, the sidecar and the application process still function as two distinct scheduling entities,
+leading to cross-process overhead.
+Library-based approaches. Alternatively, implementing the
+LB as a library within the application (Figure 1(d)) can elim3
+
+Overhead
+Dup processing
+System calls
+Cross-process
+Isolation
+Compatibility
+
+Sidecar
+H
+H
+H
+H
+H
+
+Kernel bypass
+H
+L
+H
+H
+L
+
+Library
+L
+H
+L
+L
+L
+
+XLB
+
+processing to avoid overhead beyond its essential functionalities (e.g., protocol parsing and load balancing).
+Service isolation and security. XLB must effectively maintain
+isolation between multiple services running on the same host
+as well as protect itself from malicious users.
+Operational compatibility. For XLB to be seamlessly integrated on a production scale, it must be compatible with
+existing control and management systems and transparent to
+users, requiring minimal effort for adoption.
+
+L
+L
+L
+H
+H
+
+Table 3: Summary of LB optimization approaches.
+inate duplicate protocol processing and cross-process overhead [58]. Furthermore, this library-based approach comes
+with two new issues. Firstly, it compromises the security
+model that isolates the application from the LB. On the one
+hand, any vulnerabilities in the LB library could potentially
+expose the entire application to security risks, which is unacceptable to external customers. On the other hand, malicious
+customers can change load balancing strategies to affect others. Secondly, it requires application modifications and lost
+the advantages of easy deployment. Thus, the library-based approach can only be deployed in internal trusted environments
+and cannot serve external customers in the public cloud [58].
+
+2.2
+
+3.2
+
+Modifying the kernel in a blind and intrusive manner to implement L7 LB not only falls short of meeting the above goals but
+can also increase risks and maintenance costs. While eBPF
+allows for modular and non-intrusive modifications to kernel
+functions, the implementation of L7 LB using eBPF poses
+unique challenges, primarily because the existing kernel lacks
+the necessary context for L7 traffic and connections.
+Challenge 1: insufficient and inflexible connection management in the kernel. L7 LB frequently migrates and splice
+application flows among multiple backend connections. Traditional proxy implementations maintain connection pools
+and invoke ordinary socket operations on individual sockets, which incurs extra system call overhead. The kernel is
+not aware that these sockets work together for the same application flow, thus XLB has the opportunity to integrate the
+management operations into the kernel to eliminate extra overhead. However, the current socket subsystem in the kernel
+is not designed to support LB, lacking the appropriate data
+structures and workflow for load balancing.
+Challenge 2: complex application layer states maintenance
+in the kernel. L7 LB maintains a large number of internal
+application states, including user configurations, control information, traffic statistics, protocol states, and flow mappings.
+These states are interrelated and coupled, requiring complex
+data structures to represent and maintain. While XLB operates as an independent kernel layer, it still faces the challenge
+of managing states in applications and LB. This aspect of
+state management in XLB is particularly challenging, since
+limited data structures are available and the kernel has stricter
+requirements in terms of memory consumption and safety.
+XLB adopts a novel approach driven by two fundamental
+rationales: 1) operating L7 LB as independent scheduling
+entities (such as processes, containers) introduces unavoidable
+cross-process overhead; 2) running the LB in user space leads
+to either costly user-kernel switches or duplicated processing
+that could be efficiently handled within the kernel.
+Observation 1: LB should be a logical extension of the
+application. XLB conceptualizes the LB not as a separate
+entity, but as a logical extension of the application, managed
+within the kernel’s datapath. As illustrated in Figure 1(e),
+XLB allows applications to use sockets for communication
+as normal, while the load-balancing logic seamlessly inte-
+
+eBPF Background and Current Practice
+
+eBPF enhances the kernel’s programmability, configurability, and flexibility by offloading customized logic to the kernel. This approach avoids data movement and user-kernel
+switches, leading to considerable acceleration of user applications. A typical eBPF program contains three types of elements: 1) Kernel Hooks serve as execution points where the
+program runs within the kernel; 2) eBPF Code implements the
+logic of offloaded functions and requires verification for kernel safety. It uses eBPF Maps - simple kernel data structures
+- for persistent memory and communication with user applications; and 3) Helper Functions support eBPF programs by
+providing additional functionalities that are not subject to verification, such as basic libraries or existing kernel functions,
+enhancing the programs’ capabilities.
+Currently, eBPF is used to optimize networking in two
+primary ways. Firstly, eBPF can improve network measurements [45, 59], but these approaches cannot modify packet
+content which is necessary for LB. The second type of work
+uses eBPF to achieve simple packet forwarding with L4 information [31, 44, 53]. For example, SPRIGHT [53] forwards
+packets within a service chain in the same node. These works
+cannot interpret application message semantics and states to
+achieve richer routing and load-balancing logic.
+
+3 XLB Overview
+3.1
+
+Design Challenges and Insights
+
+Design Goals
+
+We desire to offload L7 LB into the kernel, where XLB is safely
+and efficiently integrated as part of applications. XLB needs
+to satisfy the following goals to be efficient and practical.
+Near-zero unnecessary overhead. XLB should eliminate unnecessary data movement, process scheduling, and redundant
+4
+
+grates into the kernel. This integration significantly reduces
+the overheads associated with cross-process communication
+and frequent transitions between user and kernel space.
+Observation 2: offloading LB to the socket layer with
+eBPF programs is the key. To effectively address these challenges using eBPF, the foremost design decision is identifying
+the most suitable the eBPF hook location. This decision is
+influenced by the depth of the fast code path and the availability of kernel context around the hook points. Recent work
+prefers hooking eBPF programs at lower levels, such as device
+drivers or hardware [25, 31, 56, 67] to optimize I/O performance because of the immediate I/O data access. However,
+this approach results in significant overhead for functions operating at the application layer since user data are generated
+from applications instead of I/O devices.
+In-kernel L7 load balancing should be able to manipulate
+application-level messages efficiently while trying to avoid
+involving other kernel functionality to minimize intrusive
+modification and extra overhead. So we choose to offload
+LB exclusively to the socket layer, which is closest to the
+application layer. This design decision brings several benefits:
+• Complete message contents. Operating at the socket layer
+can intercept the complete application messages without
+complicated packet reassembly in the TCP layer.
+• Fast message process. Some unnecessary overhead in the
+networking stack or other kernel functionality at a lower
+level can be avoided in case sockets are able to process the
+message immediately, such as no route drop.
+• Flexible message rewriting. Modifying messages at the
+socket layer is more flexible, because lower levels, such
+as device drivers, lack enough context to perform these
+modifications and incurs repeated operations.
+• Modular extension. Socket layer offloading decouples XLB
+from the networking stack with better modularity. In this
+way, XLB does not need to maintain TCP states, but can still
+cooperate with other mechanisms in the lower levels, such
+as iptable and XDP [31].
+
+carefully optimizing their memory usage to ensure efficiency
+and effectiveness in state management.
+Figure 1(e) shows the overall architecture of XLB incorporating these key designs. The L7 LB is a collection of
+eBPF programs of different functionalities hooked into the
+socket layer to intercept service messages. In addition, service
+messages are also inspected with the application context of
+each request. XLB forwards different requests to appropriate
+backends based on load-balancing algorithms. Flow states
+and backend information are stored in eBPF maps, ensuring
+configurations are compatible with the existing control plane.
+
+4 XLB Design
+Similar to the existing LB, the main workflow in XLB includes
+connection establishment, load balancing, and message forwarding. The client’s TCP connection is bypassed because
+no backend can be determined at this point without L7 messages. During load balancing, XLB determines the destination
+service with content-based routing and chooses one instance
+according to the load balancing algorithm. Message forwarding is performed between two sockets in the kernel using the
+socket relay mechanism (§4.1).
+
+4.1
+
+Socket Proxy and Redirection
+
+Redirecting data between connections is the basic ability of
+load balancing. Figure 2 compares XLB socket enhancements
+with conventional socket usage in existing LB. As shown in
+Figure 2(a), the current LB involves multiple independent
+sockets, incurring redundant computation and message redirection. Some Linux improvements (e.g., sockmap in Figure 1(b)) are usually used together with L4 information but
+are still not sufficient to support L7 processing. Figure 2(b)
+illustrates the improved socket subsystem in XLB.
+New socket type. XLB extends Linux sockets with two extra
+types: proxy socket (p-sock) and instance socket (i-sock).
+A p-sock is created by the client during connection establishment, holding the core logic of load balancing. i-socks are
+created by XLB to communicate with servers, which are preestablished with the backends before any client connections.
+XLB manages message redirection between these two types of
+sockets, and this socket relay is much more lightweight than
+connection tracking in existing proxies.
+Expanded data structure with connection pool. A p-sock
+is associated with an i-sock connection pool. Choosing the
+granularity of connection pools needs to consider various
+trade-offs. A larger capacity will cause more contention from
+concurrent connections, while a smaller capacity brings too
+many pools and constant overhead. So currently, XLB shares
+a connection pool within each cgroup, therefore preserving
+the resource isolation guarantee in the container subsystem.
+Items in the connection pool save the tuple of IP and port,
+which is used to look up the corresponding i-sock.
+
+3.3 XLB Architecture Overview
+Design 1: Enhanced Socket Redirection (§4.1). To maintain the relay relationship effectively, XLB introduces two
+new socket types, expanding the socket data structure with a
+connection pool and a request map. XLB extends the socket
+operation flows using eBPF programs, which involves breaking down operations into smaller, more manageable steps
+crossing the connected socket pair. This approach ensures
+more efficient and precise socket operations.
+Design 2: Efficient Application State Management (§4.2).
+It is important for XLB to be compatible with existing LB
+control and management operations, thus XLB cannot simplify
+or discard some application states. To address this, we utilize
+nested eBPF maps to build complex data structures, while
+5
+
+App
+send
+recv
+
+App
+send
+recv
+
+Permission Validation
+
+P-sock
+Sock
+Pool
+
+LoadBalancer
+S1
+Conn
+S2
+Pool
+S3
+
+(a)
+
+associated eBPF maps. Another is load-balancing states. Different algorithms may require different sets of states. For
+example, to support the least request policy, XLB tracks the
+number of requests forwarded to each connection or instance.
+While these states may be updated concurrently, the eBPF
+map handles synchronization internally. The third type of
+state collects traffic metrics for each flow, such as TX/RX
+bytes, request counts, and no_route_match. As they bind to
+each flow, updating them causes no concurrency issues.
+eBPF map conversion. Envoy configurations are designed
+as tree hierarchies (Figure 3(a)). Thus, XLB needs to define C
+structures and maintain the hierarchy in eBPF maps accordingly while minimizing the memory cost. eBPF maps do not
+support direct pointers and require key-value style reference to
+represent a hierarchical relationship in the tree. Additionally,
+extra metadata and statically allocated map entries increase
+memory consumption. We leverage the map-in-map to create references between maps. We replace pointers with map
+ids and indexes. Outer maps translate a map id to an inner
+map saving actual values. Some global named maps serve as
+the root entrance. Figure 3(c) demonstrates the relationships
+among different maps. However, verification requires statically defining and allocating eBPF maps, which may cause
+large memory consumption. We make two optimizations to
+compress the size of the value and the map capacity. 1) These
+maps save the actual structures, thus a large structure (e.g., a
+structure containing an array or nested structures) takes lots
+of space. We lift these nested members to separate maps and
+use map-in-map to reference them. As a result, the size of a
+nested member is reduced to the fixed size of map indexes.
+2) The map capacity is statically defined and determines the
+total map size. To avoid wasting memory on a huge map,
+we limit the map capacity to 10K. All these eBPF-related
+operations are implemented using ebpf-go library [12].
+Delta refresh. When updating configurations, XLB only deals
+with the changed items. However, to maintain the tree structure, we have to carefully modify these interconnected eBPF
+maps. To add an item, we follow the bottom-up order. We add
+a new item in the lowest level map first and then modify its
+parent all the way up to the top level configuration. Deleting
+items uses a top-down approach instead. In this way, configuration updates do not disturb the kernel data path accessing
+configuration rules.
+
+Socket
+Process Wakeup
+Data Transfer
+Buffer Management
+
+eBPF LoadBalancing
+S1
+S4
+S2
+S3
+I-sock
+Req
+map
+
+I
+
+Protocol Processing
+Sendmsg
+Recvmsg
+S1
+
+MSG Routing
+
+S2
+
+Backend Selection
+
+S3
+
+MSG Forwarding
+
+S4
+
+P-sock Lookup
+
+(b)
+
+Figure 2: Comparison of socket subsystem between the current
+kernel and XLB.
+
+Expanded data structure with request map. There is more
+involved when multiple requests from different p-sock are
+distributed to the same i-sock. If the L7 protocol requires
+in-order response (e.g., HTTP/1.1), XLB maintains only one
+outstanding request and holds other requests until the previous response is received. If the L7 protocol allows concurrent requests (e.g., HTTP/2.0), XLB has to correctly return
+a response to its request. Fortunately, L7 protocols always
+include some request identifiers in such cases (e.g., stream
+id of HTTP/2.0). Thus, XLB attaches a request map to each
+i-sock, internally allocates request identifiers, and maps the
+internal identifier to the original one.
+eBPF interposition. Similar to existing LB, XLB first decides
+the destination service and then selects one instance from
+the service cluster. But XLB implements all these logic with
+eBPF and executes them synchronously in the kernel. XLB
+combines message contents with IP addresses to locate the
+actual service, then matches requests with routing rules sequentially, and the last matched rule resolves the destination
+service. To select an instance from the service cluster, XLB
+supports conventional loading balancing algorithms, such as
+round-robin, random, and the least request.
+Socket relay. The p-sock relays L7 messages to the i-sock
+determined above. In contrast to sockmap used by Cilium
+which forwards outgoing requests to the RX queue of the
+user-level proxy’s socket (Figure 1(b)), XLB relays them to
+the TX queue of the i-sock. Similarly, incoming messages
+are redirected from the i-sock’s RX queue to the p-sock’s
+RX queue. The i-sock modifies requests and responses using proper identifiers. More implementation details of kernel
+modifications to the socket will be discussed in §5.1.
+
+4.2
+
+4.3
+
+Deployment Practice
+
+Customer usecase. We deploy XLB to serve a banking customer whose service processes online payments to support
+mobile banking transactions. The payment processing system
+is constructed using micro-services and consists of dozens
+of services. The customer has extremely high latency and
+security requirements, and each transaction of online payment must be finished with guaranteed low latency and high
+security. Therefore, neither sidecar-based nor library-based
+
+State Management
+
+XLB maintains three types of states with eBPF maps. The
+
+first is user configurations, including service management,
+routing rules, and cluster setup. The control plane distributes
+and updates these states to XLB. They are read-only on the
+data path and modified by user user-level control daemon.
+Figure 3 gives a concrete example of configurations and their
+6
+
+traffic governance
+|_ listener
+|_ filterChain
+|_ FilterChainMatch
+|_ Filters
+|_ HttpConnectionManager
+| |_ routeConfigure
+| |_ VirtualHost
+|
+|_ domains
+|
+|_ route
+|
+|_ RouteMatch
+|
+|_ RouteAction
+|
+|_ Clusters
+|
+|_ LbPolicy
+|
+|_ Endpoints
+|
+|_ CircuitBreakers
+|_ TcpProxy
+|_ ......
+(a) configuration
+
+struct Listener__Listener {
+char *name;
+Core__SocketAddress *address;
+size_t n_filter_chains;
+Listener__FilterChain **filter_chains;
+.....
+};
+
+route map
+
+listener map
+
+idx
+…
+idx
+
+structure
+
+…
+structure
+
+struct Route__RouteConfiguration {
+char *name;
+size_t n_virtual_hosts;
+Route__VirtualHost **virtual_hosts;
+....
+};
+
+idx
+…
+idx
+
+cluster map
+
+structure
+
+…
+structure
+
+outer map
+
+idx
+…
+idx
+
+struct Cluster__Cluster {
+char *name;
+uint32_t connect_timeout;
+Cluster__Cluster__LbPolicy lb_policy;
+....
+};
+
+map
+
+…
+map
+
+(b) C structures
+
+structure
+
+…
+structure
+
+structure
+
+…
+structure
+
+outer map
+
+idx
+…
+idx
+
+inner map
+
+idx
+…
+idx
+
+idx
+…
+idx
+
+map
+
+…
+map
+inner map
+
+idx
+…
+idx
+
+structure
+
+…
+structure
+
+(c) eBPF maps
+
+Figure 3: A simplified example of converting Envoy configurations to C structures and eBPF maps. Configurations are in a tree hierarchy, and
+eBPF maps are organized using map-in-map structures.
+
+L7 LBs satisfy the requirement, XLB is the most appropriate
+solution available for commercial customers.
+XLB usage and effect. Our customer deploys XLB in a cluster
+comprising over 100 nodes, and each node is an ARM server
+with Kunpeng-920 CPU. There are tens of service instances
+running on each node. Since XLB offloads load balancing
+into the kernel to avoid extra packet redirection between sidecars, XLB optimizes the transaction processing latency by
+41.8%. Thanks to the eliminated sidecar and its associated
+CPU overhead, XLB reduces the CPU consumption by an order of magnitude. Moreover, the saved CPU and resource can
+be allocated to execute more instances within each node to
+enhance the elasticity and scalability, which is crucial for bank
+payment processing to support burst transactions in holiday
+sale (e.g., black friday). XLB delivers a 30% improvement of
+the service instance density to the customer.
+
+formance, thus offloading them into the kernel has little performance benefit. Improving XLB for better flexibility and
+extensibility is ongoing work.
+Summary. We summarize how XLB satisfies the design goals
+listed in §3.1. By moving the load balancing into the kernel, XLB avoids irrelevant performance costs of scheduling,
+communication, and data transfer. Furthermore, in-kernel processing protects XLB from malicious user services. XLB runs
+synchronously as the service execution, thus it avoids timing interference from other concurrent services. As resource
+allocation adheres to cgroup, XLB also minimizes resource
+contention. Lastly, XLB focuses on the data plane and converts
+control plane configurations into eBPF maps (§4.2), thus XLB
+is compatible with the current microservice configurations
+and transparent to end users.
+
+5 XLB Implementation
+4.4
+
+Discussion and Summary
+
+The XLB implementation consists of three main parts: the
+modified socket mechanism inside the kernel, eBPF programs
+with auxiliary helper functions, and a control plane daemon.
+Our current version has around 26K lines of code in total,
+including 3000 lines for kernel modification, 8000 lines for
+eBPF-related code, and 15K lines for the control plane.
+To be compatible with the Envoy control plane, XLB has a
+daemon running on each node. This daemon is implemented
+in Go, and receives control information (e.g., configurations
+and instance states) from cluster management using gRPC.
+As shown in Figure 3(b), XLB needs to define C structures
+and maintain the configuration hierarchy in eBPF maps accordingly. All data are transmitted in protobuf, which is then
+converted to C structures in Figure 3(b) using protoc-c.
+
+Development. One concern about XLB is its development
+effort due to eBPF programming. Based on our experience,
+the development effort is acceptable because it is not hard for
+senior kernel developers to master common tricks in eBPF
+programming, such as tail calls and bounded memory access.
+Moreover, eBPF-based solution is more stable after going online. In contrast, our other services that use kernel-bypass and
+DPDK, occasionally crash due to undiscovered bugs, causing
+more maintenance costs and customer complaints.
+Practicability. The viability of XLB in production stems from
+three design advantages. 1) It is compatible with control plane,
+ensuring seamless integration into existing operational workflows. 2) It requires no modifications to user applications.
+3) Kernel modifications are implemented via eBPF and kernel
+modules, which is common practice employed by OS vendors.
+Extensibility. Some computation-intensive operations (e.g.,
+TLS handshake, authentication, and authorization) are difficult to implement with eBPF. They also dominate the per-
+
+5.1
+
+Kernel Modifications
+
+XLB augments the socket subsystem with p-sock and
+
+i-sock. The service IP for creating a p-sock is usually a
+7
+
+virtual IP, so multiple services can sit behind the same IP.
+For example, in canary testing, multiple versions of a service
+share the same IP, but different users are routed to different
+versions (e.g., internal users go to the newer version). XLB
+matches a request with each of the routing rules organized as
+a chain by the control plane. First, XLB parses the application
+protocol to extract and save target fields (e.g., URL or username). A field with its key specified in the rules is retrieved
+and compared with the user-configured value.
+The connect and send path in p-sock have an eBPF hook.
+During a connect system call, XLB uses the destination IP and
+port to check whether this connection needs L7 load balancing based on the user configuration. If not, XLB sets a flag
+to bypass the rest of the procedure. If the L7 load balancing is desired, XLB invokes the modified sendmsg operation
+of p-sock, which first triggers the eBPF hook to determine
+the destination i-sock, and then directly calls the i-sock’s
+sendmsg to relay the message.
+XLB replaces both send and receive paths in i-sock. On
+the send path, XLB maps requests to p-sock and potentially
+rewrites the request id (§4.1). For the receive path, we modify
+the sk_data_ready operation called by tcp_data_ready
+from the networking stack. The original implementation notifies the process of waiting for a message. For example, a
+process may block on epoll or receive. However, i-sock
+needs to skip this notification and passes the message to the
+corresponding p-sock identified by the request id. p-sock
+completes the final receiving process.
+
+5.2
+
+1
+
+int filter_manager ( ctx_buff_t * ctx)
+
+2 {
+
+for (unsigned int i = 0; i < FILTER_MAX_NUM; i++) {
+// retrieve pointer value from eBPF map
+filter = get_ptr_val ( ctx−> filters + i ) ;
+if ( filter −>config_type == FILTER_CONFIG_HTTP) {
+// extract value from L7 packet header
+if (bpf_get_msg_element(proto)== PROTO_HTTP_1_1) {
+match = 1; break;
+}
+}
+}
+// invoke next layer in the configuration hierarchy
+if (match) tail_call (route_manager);
+
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15 }
+17
+
+int route_manager( ctx_buff_t * ctx)
+
+18 {
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+
+for (unsigned int i = 0; i < ROUTE_MAX_NUM; i++) {
+route = get_ptr_val ( ctx−>routes + i ) ;
+ele = route−>match_filed;
+exp_val = route−>match_value;
+msg_val = bpf_get_msg_element(ele);
+// compare packet filed with route configuration
+if (bpf_strcmp(exp_val, msg_val) == 0) {
+match = 1; break;
+}
+}
+if (match) tail_call ( load_balancer ) ;
+
+30 }
+
+Figure 4: Simplified eBPF code for filter and route layer in Envoy
+configuration hierarchies (§4.2).
+
+iterate all user configured items in a bounded loop (line 3)
+and check if the packet matches the configuration (line 6). If
+matched, we invoke the next hierarchy layer using tail-calls.
+Function filter_manager shows a L7 filter which matches
+the HTTP/1.1 protocol. Function route_manager is a simplified content-based routing procedure. User-configured routes
+include matching filed and expected value. Line 23 retrieves
+the actual value, compares it against the expected value, and
+decides the destination service host.
+Helper functions. We either implement helper functions according to existing ones in the kernel or use them to provide very basic library functions. 1) Message modification.
+XLB needs to allocate new memory when expanding messages (e.g., insert headers). We utilize the existing helper
+bpf_msg_push_data in sockmap for dynamic memory allocation. 2) HTTP parsing. While parsing HTTP protocol is
+complex, we find it ultimately relies on basic string operations,
+which cannot be verified due to non-constant loop bounds.
+Thus, we wrap primary string operations (e.g., strcmp
+and strstr) in helpers. 3) Regular expressions. Contentbased routing matches routing rules using regular expressions,
+which cannot be verified. Fortunately, open source community provides practical kernel helper functions for processing
+regular expressions [38]. We reuse their implementation [24].
+
+eBPF Programs
+
+We split the core functional logic of XLB into multiple small
+eBPF programs based on socket operations and the hierarchy
+of configuration rules as shown in Figure 3(a), and chain them
+via tail call. The key challenges of eBPF programming are
+passing verification under constraints of bounded memory
+and limited instruction count.
+eBPF verification. There are three considerations about the
+verification. (1) Bounded loop. Infinite loops are forbidden,
+as they can stuck the kernel. Fortunately, all the configurable
+parameters have constant predefined maximal values, e.g., the
+number of instances, routing rules and connections. (2) Memory safety. Similar to the XDP program [31], to ensure memory safety at verification, we pass both the start and the end
+address of the accessed buffer as eBPF arguments, and explicitly check every memory access falls within the specified
+range. (3) Unsupported functions. Due to the limited capability, eBPF cannot support arbitrary functions and requires
+helper functions. Helper functions will not be verified, thus
+they are more powerful, but for the same reason, we have to
+choose the granularity of helper functions carefully.
+eBPF functions. Figure 4 gives the eBPF code for filter and
+route layer in Envoy configuration hierarchies (§4.2) as examples. Each hierarchy layer has similar processing logic. We
+
+6
+
+Evaluation
+
+Our experiments use x86 servers with two 20-core NUMA
+nodes (80 hyperthreads in total). Some experiments use virtual machines with 16 cores of the same CPU. All the nodes
+8
+
+4
+
+80
+Ratio
+
+Ratio
+
+Istio
+Cilium
+XLB
+
+3
+
+60
+40
+
+2
+
+6
+
+1
+
+0
+
+2
+4
+8 16 32 64 128
+Concurrent Connections
+
+(c) Normalized P99 Tail Latency
+
+4.5
+
+1
+
+20
+0
+
+(b) Normalized Average Latency
+
+Ratio
+
+(a) Normalized Throughput
+
+100
+
+3
+1.5
+
+1
+
+0
+
+2
+4
+8 16 32 64 128
+Concurrent Connections
+
+1
+
+2
+4
+8 16 32 64 128
+Concurrent Connections
+
+Figure 5: Micro-benchmark results of various number of concurrent connections with zero size HTTP payload. All data are normalized to
+Istio single connection result.
+
+1.5
+
+Ratio
+
+Ratio
+
+3
+2
+
+1.6
+
+0.9
+
+1.2
+
+0.6
+0.3
+
+0
+
+0
+
+0.5K 1K 2K 3K 4K
+HTTP Message Size (byte)
+
+5K
+
+2
+
+1.2
+
+1
+0
+
+(b) Normalized Average Latency
+
+Ratio
+
+(a) Normalized Throughput
+
+4
+
+(c) Normalized P99 Tail Latency
+Istio
+Cilium
+XLB
+
+0.8
+0.4
+
+0
+
+0.5K 1K 2K 3K 4K 5K
+HTTP Message Size (byte)
+
+0
+
+0
+
+0.5K 1K 2K 3K 4K 5K
+HTTP Message Size (byte)
+
+Figure 6: Micro-benchmark results of increasing message (HTTP payload) size with 200 connections. All data are normalized to Istio zero
+size message result.
+
+are in the production environment and share networking
+with other internal production traffic. All experiments use
+openEuler 22.03 [49] operating system based on Linux 5.10
+kernel. We use Fortio v1.50.0 to issue HTTP/1.1 requests
+using the persistent connection in a closed loop. Service instances run in Kubernetes pods. We compare XLB with industry LB, Istio v1.15.3 and Cilium v1.12.2. We configure
+Istio to use per-core worker, and Cilium uses its internal fixed
+configuration of proxy workers. As XLB supports the Envoy
+control plane, all studied systems use the same service and
+Kubernetes configurations, and they all use the least requests
+load balancing policy.
+
+6.1
+
+higher throughput than Istio and Cilium, respectively. With
+more concurrency, both the average and tail latency increase,
+but XLB always has the lowest latency because of the proxyless data path. As shown in Figure 5(c), XLB considerably
+reduces the tail latency by eliminating unpredictable system
+overhead such as scheduling and cache coherence. In the
+case of 128 connections, XLB reduces the tail latency by 51%
+(45%) compared to Istio (Cilium).
+Message size. Figure 6 depicts the performance with various
+message sizes. Similar to the above experiment, the efficiency
+of XLB is seen from the improved throughput, reduced average latency, and smaller tail latency. XLB again achieves
+the highest throughput of all message sizes. After the size exceeds 4K, XLB saturates the NIC, thus its throughput begins to
+drop (Figure 6(a)), while Istio and Cilium never saturate the
+NIC due to low throughput. Ideally, the message size has less
+impact on the latency since most processing logic operates
+on message headers, not payload. However, the proxy model
+introduces more data copying, thus resulting in more latency
+increases. For example, the tail latency of Istio (Cilium) increases by 27.5% (8.3%), while XLB only increases by 0.24%
+before saturating the NIC. On the other hand, XLB has a large
+growth in the tail latency after it saturates the NIC due to
+much queuing delay as shown in Figure 6(c).
+
+Micro-benchmarks
+
+The micro-benchmark has one client and one server service,
+and the two services run on separate machines. The server includes two instance pods and configures a single URL prefix
+matching routing rule. We study different parameters and report the aggregate throughput across all requests, the average
+latency, and the 99th percentile tail latency.
+Concurrent connections. Figure 5 reports the normalized result under different numbers of concurrent connections. Each
+client thread creates one connection, thus the connection count
+is also the number of threads. Since this experiment does not
+have an HTTP payload, the throughput of all systems gets
+higher with more connections. Cilium is better than Istio because Cilium avoids unnecessary networking stack overhead
+as shown in Figure 1(b). However, XLB outperforms both
+of them as it completely avoids the user-level proxy process.
+For example, with 128 connections, XLB has 2.18x and 1.83x
+
+CPU usage. We measure the CPU utilization under different
+workloads. Figure 7(a) shows that the CPU utilization grows
+with the increased connection count when the CPU is not
+fully utilized. XLB achieves the highest throughput and surprisingly uses less CPU. For instance, with 128 connections,
+XLB uses 58.3% (61.3% ) less CPU than Istio (Cilium). This
+confirms that a majority of overhead in the existing L7 LB can
+9
+
+XLB (CPU)
+Throughput (K req/s)
+
+80%
+CPU Usage
+
+Istio (CPU)
+
+(a) CPU Usage vs Connections
+
+60%
+40%
+20%
+0%
+
+1
+
+Istio (RPS)
+
+Cilium (RPS)
+
+XLB (RPS)
+
+(b) CPU Usage vs Throughput
+
+300
+
+100%
+
+250
+
+80%
+
+200
+
+60%
+
+150
+
+40%
+
+100
+
+2
+4
+8 16 32 64 128
+Concurrent Connections
+
+20%
+
+50
+0
+
+1
+
+3
+
+6
+10
+20
+30
+Request Rate (10K req/s)
+
+40
+
+50
+
+CPU Usage
+
+Cilium (CPU)
+
+0%
+
+Figure 7: Aggregated CPU utilization of all services. (a) shows CPU usage of an increasing number of connections. (b) shows CPU usage
+
+(a) Normalized Throughput
+
+12
+
+(b) Normalized Average Latency
+Istio
+Cilium
+XLB
+
+9
+
+3
+
+5
+7
+Chain Length
+
+9
+
+6
+
+0
+
+(c) Normalized P99 Tail Latency
+
+6
+
+3
+1
+
+8
+
+Ratio
+
+7
+6
+5
+4
+3
+2
+1
+0
+
+Ratio
+
+Ratio
+
+under fixed throughput with 200 connections.
+
+4
+2
+
+1
+
+3
+
+5
+7
+Chain Length
+
+9
+
+0
+
+1
+
+3
+
+5
+7
+Chain Length
+
+9
+
+Figure 8: Performance of different chain length with zero size payload and 50 connections. All data are normalized to Istio one length result.
+be eliminated with the in-kernel load balancing. We further
+increase the connection count to 200 and fix the message rate,
+then plot the throughput and CPU utilization in Figure 7(b).
+When the rate is slower than 60K req/s, all systems achieve
+the configured rate, but XLB requires the least CPU, because
+XLB avoids wasting CPU in unnecessary communication and
+data movement. XLB continues to get higher throughput using
+more CPU. Compared to Istio (Cilium), XLB reduces 75.2%
+(76.4%) CPU utilization with a 60K req/s message rate. When
+the message rate continues to increase, the throughput of Cilium becomes flat. This is because its global proxy reaches
+its CPU quota, which is fixed internally by Cilium. Unlike
+Cilium, Istio can get a throughput of around 100K req/s. At
+this point, Istio achieves almost 100% CPU utilization since
+its proxy has expensive per-core workers. As a result, Istio
+cannot push higher throughput. The highest throughput of
+XLB is close to 300K req/s, which reaches to highest sending
+rate of 200 connections. This is confirmed by that XLB at
+most uses 75% CPU. To validate this, we keep adding more
+connections, and XLB can support thousands of connections
+and achieve up to 600K req/s.
+
+6.2
+
+as they impact each hop. Figure 8 depicts the performance
+results of running an increasing number of services in a chain.
+As expected, the latency of a request grows linearly with the
+chain length in all systems. XLB has the lowest latency in all
+cases since it avoids per-hop proxy overhead. For example,
+when the chain length is 9, XLB has 93.1% and 92.9% lower
+latency than Istio and Cilium, respectively. Because HTTP/1.1
+does not allow concurrent requests, each client connection has
+to issue requests sequentially. As a result, as the chain length
+and latency increase, the sending rate of each connection gets
+slower. This is why the throughput of systems goes down.
+Again, XLB always maintains the highest throughput.
+Service density. It is common that a single microservice application contains a large number of services because this
+provides great modularity, maintainability, and flexibility. Additionally, cloud vendors also desire to consolidate as many
+as possible services on one host [17, 42, 54]. However, the
+proxies in existing LB can be a bottleneck. We study this
+impact by booting up lots of client services in one VM and
+fixing the server to have 40 services running in another VM.
+The results are shown in Figure 9. As the number of clients
+increases, the throughput goes up, but the latency also increases. Around 100 services, Istio saturates the CPU, so its
+throughput becomes flat. However, because Istio instantiates
+a per-service proxy, proxies quickly use up all resources of the
+VM. Therefore, Istio can provision at most 300 services. With
+300 services, the execution of Istio is already unstable, and its
+reported results fluctuate greatly as shown in Figure 9(b). On
+the other hand, Cilium only has one global proxy, thus it can
+boot up more services. However, the throughput of Cilium
+is again limited by its proxy capacity, and it achieves lower
+
+Scalability and Interference
+
+Large scale microservices can hit many different scalability
+bottlenecks and suffer interference from concurrent services
+on the same host. This section evaluates how XLB helps scale
+out microservices while avoiding performance interference.
+Chain length. As pointed out by prior research, the performance of service chains is critical [39,40,53,54]. As discussed
+in §1, the service chain imposes more challenges on L7 LB
+10
+
+(b) Normalized Average Latency
+
+25
+
+Cilium
+Istio
+XLB
+
+20
+15
+
+50
+
+10
+
+30
+20
+
+5
+0
+
+100 200 300 400
+Service Density
+
+10
+
+0
+
+500
+
+(c) Normalized P99 Tail Latency
+
+40
+Ratio
+
+(a) Normalized Throughput
+
+Ratio
+
+Ratio
+
+280
+240
+200
+160
+120
+80
+40
+0
+
+0
+
+100 200 300 400
+Service Density
+
+0
+
+500
+
+0
+
+100 200 300 400
+Service Density
+
+500
+
+Figure 9: Performance results on an increasing number of services. Each service runs in a pod and has one connection. All data are normalized
+to Istio single service result.
+
+5
+
+Ratio
+
+0.6
+
+3
+1
+
+0
+
+0
+
+20
+40
+60
+80 100
+Interference Connections
+
+(c) Normalized P99 Tail Latency
+
+8
+
+2
+
+0.3
+0
+
+10
+
+Cilium
+Istio
+XLB
+
+4
+
+0.9
+Ratio
+
+(b) Normalized Average Latency
+
+Ratio
+
+(a) Normalized Throughput
+
+1.2
+
+6
+4
+2
+
+0
+
+20
+40
+60
+80
+Interference Connections
+
+0
+
+100
+
+0
+
+20
+40
+60
+80
+100
+Interference Connections
+
+Figure 10: Performance results under increasing interference degree. The monitored service issues 5 connections with a fixed throughput of
+5000 reqs/s. All data are normalized to Istio zero interference result.
+
+4
+
+2
+
+3
+
+1.5
+
+Ratio
+
+Ratio
+
+2.5
+
+2
+
+0.5
+
+0
+
+0
+
+4 6 8 10 12 14 16 18 20
+Concurrent Connections (× 10)
+
+2
+
+Istio
+Cilium
+XLB
+
+(c) Normalized P99 Tail Latency
+
+1.6
+
+1
+
+1
+2
+
+(b) Normalized Average Latency
+
+Ratio
+
+(a) Normalized Throughput
+
+5
+
+1.2
+0.8
+0.4
+
+2 4 6 8 10 12 14 16 18 20
+Concurrent Connections (× 10)
+
+0
+
+2 4 6 8 10 12 14 16 18 20
+Concurrent Connections (× 10)
+
+Figure 11: Bookinfo performance results. All data are normalized to Istio 20 connections result.
+peak throughput than Istio. Finally, XLB outperforms the other
+systems. XLB saturates the CPU with around 200 services. It
+still boots up more services, but the latency begins to go up
+due to queuing delay.
+
+has the worst performance. In Istio, each service has a separate proxy, thus Istio gets less interference and performs
+better than Cilium. However, proxies in Istio take lots of CPU,
+which compete with the monitored client. As a consequence,
+Istio gets worse performance as the interference increases.
+XLB is almost unaffected by the interference leading to the
+best performance. XLB handles every request efficiently and
+reserves enough CPU for the monitored client. Furthermore,
+XLB embeds the load-balancing logic into the in-kernel data
+path which exclusively processes the calling connection, thus
+avoiding contention with others. Therefore, the only source
+of interference comes from the other client. As shown in Figure 10, when the other client issues many connections, the
+performance of XLB begins to drop.
+
+Performance interference. QoS guarantee is extremely important for customers. However, it is challenging to strictly
+ensure QoS in microservices due to the huge difference in
+traffic volume of each service. For a specific service, there
+are three sources of interference. (1) Concurrent services will
+compete it with computing resources. (2) Proxies will also
+cause resource contention. (3) If the service shares a proxy
+with others, processing other services inside the proxy will
+disturb it as well. To evaluate the degree of interference, we
+co-locate two client services on the same host. The monitored
+client issues requests at a fixed rate, while the other client increases connections to generate interference. Figure 10 shows
+the performance degradation of the monitored client under increasing interference. Since Cilium has a single proxy shared
+by both clients, all the interference sources listed above apply to it. Therefore, Cilium suffers the most interference and
+
+6.3
+
+Microservice Application
+
+To assess the practicability and applicability of XLB, we evaluate XLB under complicated microservice applications. The
+first application is bookinfo [57], a sample application from
+11
+
+Go
+Python
+product
+page
+
+Ruby
+Details
+
+Java
+Reviews-v1
+
+All data are normalized to
+Istio 5 users result
+
+Python
+loadgen
+
+fortio
+
+Python
+frontend
+
+system
+
+Istio
+
+Java
+Reviews-v2
+Node.js
+Ratings
+
+(a) Bookinfo architecture
+
+Java
+Reviews-v3
+
+Python
+user
+service
+
+Java
+ledger
+writer
+
+Python
+contracts
+
+Java
+balance
+reader
+
+PostgreSQL
+accounts
+db
+
+Java
+transaction
+history
+
+PostgreSQL
+ledger
+db
+
+Cilium
+XLB
+
+(b) BoA architecture
+
+users
+
+throughput
+
+latency
+
+tail atency
+
+5
+
+1.0
+
+1.0
+
+1.0
+
+500
+
+13.11
+
+7.59
+
+4.79
+
+5
+
+0.96
+
+1.02
+
+0.98
+
+500
+
+13.27
+
+7.52
+
+3.94
+
+5
+
+1.26
+
+0.79
+
+0.84
+
+500
+
+14.47
+
+6.73
+
+3.66
+
+(c) BoA performance
+
+Figure 12: Microservice application architectures and performance results.
+Istio. Figure 12(a) shows its architecture. We deploy it on
+two physical servers, and scale productpage to 50 instances
+while other services have 5 instances. Figure 11 depicts the
+performance results of running an increasing number of client
+connections. Since more time is spent in the service processing than previous micro-benchmarks, L7 LB have less impact
+on the performance. However, XLB still performs the best. For
+instance, with 10 connections, XLB has 43.2% higher throughput, 33.2% lower latency, and 39.6% lower tail latency than
+Istio. Similarly, XLB has 10.2% higher throughput, 13.3%
+lower latency, and 21.2% lower tail latency than Cilium. Another application is Bank of Anthos (BoA) from Google [48]
+(Figure 12(b)). We run it using a 6 VM nods cluster. We
+deploy 30 frontend instances, 50 userservice instances,
+and 5 instances for other services. Figure 12(c) reports the
+normalized results. With 500 useres, XLB has 10.4% higher
+throughput, 11.3% lower latency and 23.5% lower tail latency
+than Istio, 9.1% higher throughput, 10.6% lower latency and
+7.1% lower tail latency than Cilium. In summary, XLB is
+more scalable than the current LB and can support large-scale
+microservice applications efficiently.
+
+7
+
+ing [3, 7, 16, 45, 59]. XDP [31] hooks eBPF programs in the
+NIC driver to accelerate networking I/O, and hXDP [8] further enables XDP programs to run on FPGA NICs. BMC [25]
+exploits eBPF to create an in-kernel memcached cache. Electrode [69] leverages eBPF to implement in-kernel acceleration
+of distributed consensus protocols. Packet steering is another
+use case that benefits from eBPF [19]. DINT [70] offloads
+frequent-path transaction operations into eBPF to optimize
+distributed transaction systems. bpf-iptables [44] is an
+eBPF-based alternative to iptables. [62] surveys challenges
+and applications of eBPF-based packet processing. XLB illustrates that in-kernel eBPF program is an efficient way to
+redesign application-level networking components, and as far
+as we know, XLB is the first eBPF-based L7 LB.
+Serverless and microservice. Multiple projects optimize
+different aspects of serverless [4, 61] and microservice frameworks [34, 66]. XLB particularly optimizes load balancing for
+microservices. SPRIGHT [53] combines eBPF-based eventdriven processing and shared memory to improve the data
+plane of serverless function chains. XLB differentiates from
+SPRIGHT in two aspects. First, SPRIGHT only optimizes the
+data path between functions in the same node, while XLB accelerates message distribution between services that can cross
+multiple nodes. Second, eBPF in SPRIGHT is simply used
+for basic message redirection without complex processing
+policies, but XLB uses eBPF to implement richer routing and
+load balancing logic. The eBPF design in SPRIGHT cannot
+be directly applied to implement and accelerate L7 redirection without the socket subtype system to parse and use L7
+information or remove the overhead.
+
+Related Work
+
+Load balancers. LB can operate on different network layers.
+There is a variety of research improving L4 LB [5, 18, 21, 23,
+30,36,37,46,51,65] that are orthogonal to XLB which focuses
+on L7. Most of the existing research about L7 LB optimizes
+in-network LB that runs in a separate node. For example,
+Yoda [22] achieves high availability of L7 LB. Prism [28, 29]
+utilizes connection hand-off to accelerate content-routing
+proxies. QDSR [63] enables backend server instance to send
+data directly to the client to avoid extra message relaying.
+Canal mesh [60] deploys side-cars in a centralized mesh gateway, but still requires L7 traffic redirection to remote LBs.
+Some works offload LB to smart hardware for better performance [10, 14]. Different from the above works, XLB targets
+microservices where LB is co-located with services in the
+same node, thus we can replace the sidecar-based architecture
+with in-kernel interposition.
+eBPF usage. eBPF is adopted in various Linux subsystems,
+such as scheduling [32, 35], memory prefetching [9], and
+storage [6, 67, 68], but is the most widely used in network-
+
+8
+
+Conclusions
+
+The ubiquitous microservices present new challenges to efficient L7 LB. The sidecar-based model becomes the main
+performance bottleneck due to its unavoidable overhead of
+system scheduling, process communication, and data movement. This paper has described XLB, an in-kernel L7 LB
+architecture that utilizes eBPF and extends socket to support
+load balancing, thus avoiding interweaving with underneath
+networking stacks. XLB is compatible with the Envoy control
+plane and load balancing rules. Our evaluation shows XLB
+achieves superior performance than Istio and Cilium. With
+12
+
+request-level load balancing over an application of 50+ instances, XLB provides up to 1.5× (23%) throughput increase,
+60% (12%) reduction in average latency, and 70% (30%)
+lower tail latency than Istio (Cilium). Furthermore,XLB supports 66% more service pods running on a host and achieves
+13.6× higher throughput in a 9-services chain than Istio.
+
+[9] Xuechun Cao, Shaurya Patel, Soo Yee Lim, Xueyuan
+Han, and Thomas Pasquier. FetchBPF: Customizable prefetching policies in linux with eBPF. In
+2024 USENIX Annual Technical Conference (USENIX
+ATC’24), 2024.
+[10] Eyal Cidon, Sean Choi, Sachin Katti, and Nick McKeown. Appswitch: Application-layer load balancing
+within a software switch. In Proceedings of the
+First Asia-Pacific Workshop on Networking (APNet’17),
+2017.
+
+References
+[1] Data Plane Development Kit (DPDK). http://www.
+dpdk.org/.
+
+[11] Cilium. https://cilium.io/.
+[2] GLUCK A. Introducing domain-oriented microservice architecture https://www.uber.com/blog/
+microservice-architecture/, 2020.
+
+ebpf-go https://github.com/cilium/
+[12] Cilium.
+ebpf, 2022.
+
+[3] Zaafar Ahmed, Muhammad Hamad Alizai, and Affan A.
+Syed. Inkev: in-kernel distributed network virtualization
+for dcn. SIGCOMM Comput. Commun. Rev., 46(3),
+2018.
+
+[13] Ariel Cohen, Sampath Rangarajan, and J. Hamilton Slye.
+On the performance of TCP splicing for url-aware redirection. In 2nd USENIX Symposium on Internet Technologies and Systems (USITS’99), 1999.
+
+[4] Istemi Ekin Akkus, Ruichuan Chen, Ivica Rimac,
+Manuel Stein, Klaus Satzke, Andre Beck, Paarijaat
+Aditya, and Volker Hilt.
+Sand: Towards highperformance serverless computing. In Proceedings of
+the 2018 USENIX Conference on Usenix Annual Technical Conference (USENIX ATC’18), 2018.
+
+[14] Tianyi Cui, Wei Zhang, Kaiyuan Zhang, and Arvind Krishnamurthy. Offloading load balancers onto smartnics.
+In Proceedings of the 12th ACM SIGOPS Asia-Pacific
+Workshop on Systems (APSys’21), 2021.
+[15] TC Currie.
+Airbnb’s 10 takeaways from moving to microservices https://thenewstack.io/
+airbnbs-10-takeaways-moving-microservices/,
+2017.
+
+[5] Tom Barbette, Chen Tang, Haoran Yao, Dejan Kostić,
+Gerald Q. Maguire, Panagiotis Papadimitratos, and
+Marco Chiesa. A high-speed load-balancer design with
+guaranteed per-connection-consistency. In Proceedings
+of the 17th Usenix Conference on Networked Systems
+Design and Implementation (NSDI’20), 2020.
+
+[16] Abhishek Dhamija, Balasubramanian Madhavan,
+Hechao Li, Jie Meng, Shrikrishna Khare, Madhavi
+Rao, Lawrence Brakmo, Neil Spring, Prashanth
+Kannan, Srikanth Sundaresan, and Soudeh Ghorbani. A large-scale deployment of DCTCP. In 21st
+USENIX Symposium on Networked Systems Design and
+Implementation (NSDI’24), 2024.
+
+[6] Ashish Bijlani and Umakishore Ramachandran. Extension framework for file systems in user space. In
+2019 USENIX Annual Technical Conference (USENIX
+ATC‘’19), 2019.
+
+[17] Dong Du, Tianyi Yu, Yubin Xia, Binyu Zang, Guanglu
+Yan, Chenggang Qin, Qixuan Wu, and Haibo Chen. Catalyzer: Sub-millisecond startup for serverless computing
+with initialization-less booting. In Proceedings of the
+Twenty-Fifth International Conference on Architectural
+Support for Programming Languages and Operating
+Systems (ASPLOS’20), 2020.
+
+[7] Henry Birge-Lee, Sophia Yoo, Benjamin Herber, Jennifer Rexford, and Maria Apostolaki. TANGO: Secure
+collaborative route control across the public internet. In
+21st USENIX Symposium on Networked Systems Design
+and Implementation (NSDI’24), 2024.
+[8] Marco Spaziani Brunella, Giacomo Belocchi, Marco
+Bonola, Salvatore Pontarelli, Giuseppe Siracusano,
+Giuseppe Bianchi, Aniello Cammarano, Alessandro
+Palumbo, Luca Petrucci, and Roberto Bifulco. Hxdp:
+Efficient software packet processing on fpga nics. In
+Proceedings of the 14th USENIX Conference on Operating Systems Design and Implementation (OSDI’20),
+2020.
+
+[18] Daniel E. Eisenbud, Cheng Yi, Carlo Contavalli, Cody
+Smith, Roman Kononov, Eric Mann-Hielscher, Ardas
+Cilingiroglu, Bin Cheyney, Wentao Shang, and Jinnah Dylan Hosein. Maglev: A fast and reliable software network load balancer. In Proceedings of the 13th
+Usenix Conference on Networked Systems Design and
+Implementation (NSDI’16), 2016.
+13
+
+[19] Pekka Enberg, Ashwin Rao, and Sasu Tarkoma.
+Partition-aware packet steering using xdp and ebpf for
+improving application-level parallelism. In Proceedings of the 1st ACM CoNEXT Workshop on Emerging
+In-Network Computing Paradigms (ENCP’19), 2019.
+[20] The Linux Foundation.
+2023.
+
+[31] Toke Høiland-Jørgensen, Jesper Dangaard Brouer,
+Daniel Borkmann, John Fastabend, Tom Herbert, David
+Ahern, and David Miller. The express data path: Fast
+programmable packet processing in the operating system kernel. In Proceedings of the 14th International
+Conference on Emerging Networking EXperiments and
+Technologies (CoNEXT’18), 2018.
+
+ebpf https://ebpf.io/,
+
+[32] Jack Tigar Humphries, Neel Natu, Ashwin Chaugule,
+Ofir Weisse, Barret Rhoden, Josh Don, Luigi Rizzo, Oleg
+Rombakh, Paul Turner, and Christos Kozyrakis. Ghost:
+Fast & flexible user-space delegation of linux scheduling. In Proceedings of the ACM SIGOPS 28th Symposium on Operating Systems Principles (SOSP’21),
+2021.
+
+[21] Rohan Gandhi, Y. Charlie Hu, Cheng-Kok Koh,
+Hongqiang Liu, and Ming Zhang. Rubik: Unlocking the
+power of locality and end-point flexibility in cloud scale
+load balancing. In Proceedings of the 2015 USENIX
+Conference on Usenix Annual Technical Conference
+(USENIX ATC’15), 2015.
+[22] Rohan Gandhi, Y. Charlie Hu, and Ming Zhang. Yoda:
+A highly available layer-7 load balancer. In Proceedings of the Eleventh European Conference on Computer
+Systems (EuroSys’16), 2016.
+
+[33] Istio. https://istio.io/latest/.
+[34] Zhipeng Jia and Emmett Witchel. Nightcore: Efficient
+and scalable serverless computing for latency-sensitive,
+interactive microservices. In Proceedings of the 26th
+ACM International Conference on Architectural Support
+for Programming Languages and Operating Systems
+(ASPLOS’21), 2021.
+
+[23] Rohan Gandhi, Hongqiang Harry Liu, Y. Charlie Hu,
+Guohan Lu, Jitendra Padhye, Lihua Yuan, and Ming
+Zhang. Duet: Cloud scale load balancing with hardware
+and software. In Proceedings of the 2014 Conference of
+the ACM Special Interest Group on Data Communication (SIGCOMM’14), 2014.
+
+[35] Kostis Kaffes, Jack Tigar Humphries, David Mazières,
+and Christos Kozyrakis. Syrup: User-defined scheduling across the stack. In Proceedings of the ACM
+SIGOPS 28th Symposium on Operating Systems Principles (SOSP’21), 2021.
+
+[24] Gcore. ebpf regex helper https://github.com/
+G-Core/linux-regex-module, 2022.
+[25] Yoann Ghigoff, Julien Sopena, Kahina Lazri, Antoine
+Blin, and Gilles Muller. BMC: Accelerating memcached
+using safe in-kernel caching and pre-stack processing. In
+18th USENIX Symposium on Networked Systems Design
+and Implementation (NSDI’21).
+
+[36] Naga Katta, Aditi Ghag, Mukesh Hira, Isaac Keslassy,
+Aran Bergman, Changhoon Kim, and Jennifer Rexford.
+Clove: Congestion-aware load balancing at the virtual
+edge. In Proceedings of the 13th International Conference on Emerging Networking EXperiments and Technologies (CoNEXT’17), 2017.
+
+[26] Jeremy H. 4 microservices examples: Amazon, netflix,
+uber, and etsy https://blog.dreamfactory.com/
+microservices-examples/, 2022.
+[27] HAProxy. The reliable, high performance tcp/http load
+balancer http://www.haproxy.org/.
+
+[37] Marios Kogias, Rishabh Iyer, and Edouard Bugnion. Bypassing the load balancer without regrets. In Proceedings of the 11th ACM Symposium on Cloud Computing
+(SoCC’20), 2020.
+
+[28] Yutaro Hayakawa, Lars Eggert, Michio Honda, and Douglas Santry. Prism: A proxy architecture for datacenter
+networks. In Proceedings of the 2017 Symposium on
+Cloud Computing (SoCC’17), 2017.
+
+[38] Ivan Koveshnikov and Sergey Nizovtsev. When regular
+expressions meet xdp. In Netdev 0x16, THE Technical
+Conference on Linux Networking, 2022.
+[39] Sameer G. Kulkarni, Wei Zhang, Jinho Hwang, Shriram Rajagopalan, K. K. Ramakrishnan, Timothy Wood,
+Mayutan Arumaithurai, and Xiaoming Fu. Nfvnice:
+Dynamic backpressure and scheduling for nfv service
+chains. In Proceedings of the Conference of the ACM
+Special Interest Group on Data Communication (SIGCOMM’17), 2017.
+
+[29] Yutaro Hayakawa, Michio Honda, Douglas Santry, and
+Lars Eggert. Prism: Proxies without the pain. In 18th
+USENIX Symposium on Networked Systems Design and
+Implementation (NSDI’21), 2021.
+[30] Keqiang He, Eric Rozner, Kanak Agarwal, Wes Felter,
+John Carter, and Aditya Akella. Presto: Edge-based load
+balancing for fast datacenter networks. In Proceedings
+of the 2015 Conference of the ACM Special Interest
+Group on Data Communication (SIGCOMM’15), 2015.
+
+[40] Guyue Liu, Hugo Sadok, Anne Kohlbrenner, Bryan
+Parno, Vyas Sekar, and Justine Sherry. Don’t yank my
+14
+
+chain: Auditable NF service chaining. In 18th USENIX
+Symposium on Networked Systems Design and Implementation (NSDI’21), 2021.
+
+[52] Envoy proxy. https://www.envoyproxy.io/.
+[53] Shixiong Qi, Leslie Monis, Ziteng Zeng, Ian-chin Wang,
+and K. K. Ramakrishnan. Spright: Extracting the server
+from serverless computing! high-performance ebpfbased event-driven, shared-memory processing. In Proceedings of the 2022 Conference of the ACM Special Interest Group on Data Communication (SIGCOMM’22),
+2022.
+
+[41] David A. Maltz and Pravin Bhagwat. TCP splice for
+application layer proxy performance. J. High Speed
+Networks, 8(3):225–240, 1999.
+[42] Filipe Manco, Costin Lupu, Florian Schmidt, Jose
+Mendes, Simon Kuenzer, Sumit Sati, Kenichi Yasukata,
+Costin Raiciu, and Felipe Huici. My vm is lighter (and
+safer) than your container. In Proceedings of the 26th
+Symposium on Operating Systems Principles (SOSP’17),
+2017.
+
+[54] Yuxin Ren, Guyue Liu, Vlad Nitu, Wenyuan Shao, Riley Kennedy, Gabriel Parmer, Timothy Wood, and Alain
+Tchana. Fine-grained isolation for scalable, dynamic,
+multi-tenant edge clouds. In Proceedings of the 2020
+USENIX Conference on Usenix Annual Technical Conference (USENIX ATC’20), 2020.
+
+[43] Tony Mauro.
+Adopting microservices
+at netflix:
+Lessons
+for architectural design
+https://www.nginx.com/blog/
+microservices-at-netflix-architectural-best-practices/,
+[55] Marcel-Catalin Rosu and Daniela Rosu. Kernel sup2015.
+port for faster web proxies. In Proceedings of the 2003
+USENIX Conference on Usenix Annual Technical Con[44] Sebastiano Miano, Matteo Bertrone, Fulvio Risso,
+ference (USENIX ATC’03), 2003.
+Mauricio Vásquez Bernal, Yunsong Lu, and Jianwen
+Pi. Securing linux with a faster and scalable iptables.
+[56] Hugo Sadok, Zhipeng Zhao, Valerie Choung, Nirav Atre,
+SIGCOMM Comput. Commun. Rev., 49(3):2–17, nov
+Daniel S. Berger, James C. Hoe, Aurojit Panda, and
+2019.
+Justine Sherry. We need kernel interposition over the
+network dataplane. In Proceedings of the Workshop on
+Hot Topics in Operating Systems (HotOS’21), 2021.
+
+[45] Sebastiano Miano, Xiaoqi Chen, Ran Ben Basat, and
+Gianni Antichi. Fast in-kernel traffic sketching in ebpf.
+SIGCOMM Comput. Commun. Rev., 53(1), 2023.
+
+[57] Bookinfo Sample. https://github.com/istio/
+istio/tree/master/samples/bookinfo.
+
+[46] Rui Miao, Hongyi Zeng, Changhoon Kim, Jeongkeun
+Lee, and Minlan Yu. Silkroad: Making stateful layer4 load balancing fast and cheap using switching asics.
+In Proceedings of the 2017 Conference of the ACM
+Special Interest Group on Data Communication (SIGCOMM’17), 2017.
+
+[58] Harshit Saokar, Soteris Demetriou, Nick Magerko, Max
+Kontorovich, Josh Kirstein, Margot Leibold, Dimitrios
+Skarlatos, Hitesh Khandelwal, and Chunqiang Tang. ServiceRouter: Hyperscale and minimal cost service mesh
+at meta. In 17th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI’23), 2023.
+
+[47] NGINX. high performace load balancer https://www.
+nginx.com/.
+
+[59] Junxian Shen, Han Zhang, Yang Xiang, Xingang Shi,
+Xinrui Li, Yunxi Shen, Zijian Zhang, Yongxiang Wu,
+Xia Yin, Jilong Wang, Mingwei Xu, Yahui Li, Jiping Yin,
+Jianchang Song, Zhuofeng Li, and Runjie Nie. Networkcentric distributed tracing with deepflow: Troubleshooting your microservices in zero code. In Proceedings of
+the ACM SIGCOMM 2023 Conference (SIGCOMM’23),
+2023.
+
+https://github.com/
+[48] Bank of Anthos.
+GoogleCloudPlatform/bank-of-anthos.
+[49] openEuler. https://openeuler.org.
+[50] Federico Parola, Shixiong Qi, Anvaya B. Narappa, K. K.
+Ramakrishnan, and Fulvio Risso. Sure: Secure unikernels make serverless computing rapid and efficient. In
+Proceedings of the 2024 ACM Symposium on Cloud
+Computing (SoCC’24), 2024.
+
+[60] Enge Song, Yang Song, Chengyun Lu, Tian Pan,
+Shaokai Zhang, Jianyuan Lu, Jiangu Zhao, Xining Wang,
+Xiaomin Wu, Minglan Gao, Zongquan Li, Ziyang Fang,
+Biao Lyu, Pengyu Zhang, Rong Wen, Li Yi, Zhigang
+Zong, and Shunmin Zhu. Canal mesh: A cloud-scale
+sidecar-free multi-tenant service mesh architecture. In
+Proceedings of the ACM SIGCOMM 2024 Conference
+(SIGCOMM’24), 2024.
+
+[51] Parveen Patel, Deepak Bansal, Lihua Yuan, Ashwin
+Murthy, Albert Greenberg, David A. Maltz, Randy Kern,
+Hemant Kumar, Marios Zikos, Hongyu Wu, Changhoon
+Kim, and Naveen Karri. Ananta: Cloud scale load balancing. In Proceedings of the 2013 Conference of the
+ACM Special Interest Group on Data Communication
+(SIGCOMM’13), 2013.
+15
+
+[61] Ali Tariq, Austin Pahl, Sharat Nimmagadda, Eric Rozner,
+and Siddharth Lanka. Sequoia: Enabling quality-ofservice in serverless computing. In Proceedings of the
+11th ACM Symposium on Cloud Computing (SoCC’20),
+2020.
+
+worked Systems Design and Implementation (NSDI’23),
+2023.
+[70] Yang Zhou, Xingyu Xiang, Matthew Kiley, Sowmya
+Dharanipragada, and Minlan Yu. DINT: Fast In-Kernel
+distributed transactions with eBPF. In 21st USENIX
+Symposium on Networked Systems Design and Implementation (NSDI’24), 2024.
+
+[62] Marcos A. M. Vieira, Matheus S. Castanho, Racyus
+D. G. Pacífico, Elerson R. S. Santos, Eduardo P. M. Câmara Júnior, and Luiz F. M. Vieira. Fast packet processing with ebpf and xdp: Concepts, code, challenges, and
+applications. ACM ACM Computing Surveys, 53(1), feb
+2020.
+[63] Ziqi Wei, Zhiqiang Wang, Qing Li, Yuan Yang, Cheng
+Luo, Fuyu Wang, Yong Jiang, Sijie Yang, and Zhenhui
+Yuan. QDSR: Accelerating layer-7 load balancing by
+direct server return with QUIC. In 2024 USENIX Annual
+Technical Conference (USENIX ATC’24), 2024.
+
+[64] Manuel Zapf.
+From sidecars to sidecarless:
+Tracing the evolution of service mesh technologies with istio and cilium https://www.
+codecentric.de/en/knowledge-hub/blog/
+sidecars-sidecarless-evolution-service-mesh-technologies-istio-cilium.
+[65] Chaoliang Zeng, Layong Luo, Teng Zhang, Zilong
+Wang, Luyang Li, Wenchen Han, Nan Chen, Lebing
+Wan, Lichao Liu, Zhipeng Ding, Xiongfei Geng, Tao
+Feng, Feng Ning, Kai Chen, and Chuanxiong Guo. Tiara:
+A scalable and efficient hardware acceleration architecture for stateful layer-4 load balancing. In Proceedings
+of the 19th USENIX Conference on Networked Systems
+Design and Implementation (NSDI’22), 2022.
+[66] Zhizhou Zhang, Murali Krishna Ramanathan, Prithvi
+Raj, Abhishek Parwal, Timothy Sherwood, and Milind
+Chabbi. CRISP: Critical path analysis of Large-Scale
+microservice architectures. In Proceedings of the 2022
+USENIX Conference on Usenix Annual Technical Conference (USENIX ATC’22), 2022.
+[67] Yuhong Zhong, Haoyu Li, Yu Jian Wu, Ioannis Zarkadas,
+Jeffrey Tao, Evan Mesterhazy, Michael Makris, Junfeng
+Yang, Amy Tai, Ryan Stutsman, and Asaf Cidon. XRP:
+In-Kernel storage functions with eBPF. In 16th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI’22), 2022.
+[68] Yuhong Zhong, Hongyi Wang, Yu Jian Wu, Asaf Cidon,
+Ryan Stutsman, Amy Tai, and Junfeng Yang. Bpf for
+storage: An exokernel-inspired approach. In Proceedings of the Workshop on Hot Topics in Operating Systems (HotOS’21), 2021.
+[69] Yang Zhou, Zezhou Wang, Sowmya Dharanipragada,
+and Minlan Yu. Electrode: Accelerating distributed protocols with eBPF. In 20th USENIX Symposium on Net16
+

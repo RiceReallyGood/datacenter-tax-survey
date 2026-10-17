@@ -1,0 +1,1324 @@
+                                         IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                           1
+
+
+
+
+                                                     NANO Z ONE: Scalable, Efficient, and Secure
+                                                        Memory Protection on Arm CCA
+                                                                             Shiqi Liu, Yongpeng Gao, Mingyang Zhang, and Jie Wang
+
+
+
+
+                                            Abstract—Arm Confidential Compute Architecture (CCA) pro-                   exceeding 40M lines of code (LoCs), this design creates a
+                                         vides hardware primitives for confidential computing, but its                  massive attack surface where privilege-escalation bugs [4],
+                                         standard CVM-based deployment model still isolates software                    [5] allow an adversary to compromise the entire CVM. (2)
+                                         only at the VM granularity. This leaves two critical gaps:
+                                         the guest OS remains in the Trusted Computing Base, and                        Unmitigated Intra-Process Risks. While CCA shields the
+arXiv:2506.07034v2 [cs.CR] 24 Sep 2026
+
+
+
+
+                                         applications lack any intra-process isolation boundary, exposing               VM from the host, it lacks primitives for fine-grained pro-
+                                         secrets to vulnerabilities such as Heartbleed. While intra-address-            tection within the application itself. Complex software like
+                                         space isolation offers a theoretical solution, realizing it under an           OpenSSL (900K+ LoCs) handles secrets in only a fraction of
+                                         adversarial OS faces a fundamental scalability-efficiency trade-               its code base. Without intra-address-space boundaries, a single
+                                         off: existing hardware primitives are either strictly limited in
+                                         domain capacity or incur prohibitive privileged-switching latency.             memory safety bug like Heartbleed [6] can leak secrets from
+                                            To bridge this gap, we propose N ANO Z ONE, a novel isolation               non-critical code paths.
+                                         architecture built on Arm CCA primitives. Rather than extending                   In response to the threat of an adversarial kernel, prior
+                                         the realm-world software stack, N ANO Z ONE protects normal-                   research has focused on TCB reduction. Gramine-TDX [7]
+                                         world processes and enforces fine-grained intra-process isolation              replaces the monolithic kernel with a leaner LibOS (∼57K
+                                         from a minimal root-world monitor. N ANO Z ONE unifies the
+                                         speed of user-space permission switching with the capacity of                  LoCs), while RContainer [8] minimizes the trusted computing
+                                         physical address space isolation to achieve effectively unlimited              base via a mini-OS (<5K LoCs) on the CCA platform.
+                                         domain scalability. To mask the latency of privileged transitions,             Shelter [9] goes further by completely removing the OS from
+                                         it employs a locality-aware scheduling policy that maximizes                   the trust boundary, enforcing process-level isolation. While
+                                         execution residency within the fast user-level tier. To defeat                 Shelter effectively shields the application from the kernel, it
+                                         an adversarial OS, N ANO Z ONE anchors its root of trust in
+                                         the root world, offloading critical isolation enforcement away                 fails to mitigate the internal attack surface described above.
+                                         from the untrusted kernel. Against intra-process adversaries, it                  Intra-address-space isolation is not a new concept in TEEs.
+                                         further leverages hardware-assisted Code-Pointer Integrity (CPI)               For instance, in the context of Intel SGX [10], Nested En-
+                                         to prevent domain-switching abuse. We prototyped N ANO Z ONE                   clave [11] partitions an enclave into outer and inner layers
+                                         on Arm’s official emulator and on physical hardware. Evalu-                    through hardware modifications. However, the switching time
+                                         ation on real-world server applications shows that, compared
+                                         to process-level isolation systems, our fine-grained protection                between these layers (1.1 µs, comparable to native ecall/ocall
+                                         preserves about 95% of their throughput.                                       latency) makes it impractical for high-frequency domain tran-
+                                                                                                                        sitions. To further optimize performance, LightEnclave [12]
+                                           Index Terms—Arm CCA, Confidential computing, Trusted
+                                         execution environments, Intra-process isolation.                               employs Memory Protection Keys (MPK) [13] to partition an
+                                                                                                                        enclave into multiple domains. The performance gain stems
+                                                                                                                        from complete user-space domain switches that require only
+                                                                   I. I NTRODUCTION                                     about 20 cycles. However, applying these established concepts
+                                            Confidential Computing protects tenant assets using                         to Arm CCA presents unique challenges. The CVM-style
+                                         hardware-based Trusted Execution Environments (TEEs) such                      isolation in CCA and enclave-style isolation in SGX differ sub-
+                                         as AMD SEV [1] and Intel TDX [2]. In the Arm ecosystem,                        stantially in their architectural abstractions and hardware prim-
+                                         the recently introduced Confidential Compute Architecture                      itives. Furthermore, although solutions like NestedSGX [14],
+                                         (CCA) [3] adds a realm world to Armv9-A to host Confidential                   Veil [15], and CAP-VMs [16] have demonstrated intra-CVM
+                                         Virtual Machines (CVMs). However, this coarse-grained iso-                     isolation, adapting them to the standard Armv9 architecture
+                                         lation model leaves CCA exposed to two critical vectors. (1)                   is impractical. These approaches rely on either experimental
+                                         The Threat of an Adversarial Kernel. Current architectures                     hardware extensions (e.g., CHERI capabilities [17] in CAP-
+                                         implicitly trust the guest OS, forcing it into the Trusted                     VMs) or vendor-specific features (e.g., AMD VMPLs in Veil)
+                                         Computing Base (TCB). With monolithic kernels (e.g., Linux)                    that are absent in the Arm CCA specification. Consequently,
+                                                                                                                        porting them to Arm would incur prohibitive overheads from
+                                           This work was supported in part by the National Natural Science Foundation   complex hypervisor emulation.
+                                         of China under Grant 62202194 and in part by the CCF-Ant Research Fund.           For multi-tenant servers that hold secrets for mutually
+                                         (Corresponding author: Jie Wang.)
+                                           Shiqi Liu, Yongpeng Gao, Mingyang Zhang, and Jie Wang are with               distrusting clients within a single process, such as per-client
+                                         Hubei Key Laboratory of Distributed System Security, Hubei Engineer-           TLS keys in Nginx, these limitations call for a deployable Arm
+                                         ing Research Center on Big Data Security, School of Cyber Science and          CCA design that combines intra-process isolation with a root
+                                         Engineering, Huazhong University of Science and Technology, Wuhan,
+                                         430074, China (e-mail: shiqiliu@hust.edu.cn; sternen hust@hust.edu.cn;         of trust outside the OS.
+                                         zoneshiyi@hust.edu.cn; wangjie s@hust.edu.cn).                                    This paper introduces NANO Z ONE, a hardware-assisted
+IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                         2
+
+
+
+intra-process isolation system built on Arm CCA primitives.
+NANO Z ONE aims to provide fine-grained isolation under an
+adversarial OS while minimizing the trusted software stack. To
+this end, NANO Z ONE places protected processes in the normal
+world and anchors security enforcement in a minimal root-
+world monitor at EL3, rather than extending the Realm/CVM
+software stack and trusting the additional Realm Management
+Monitor (RMM, 46K LoCs) at Realm EL2.
+   Efficient fine-grained isolation also requires fast domain        Fig. 1. Domain-switching scenarios for 1,000 Memcached requests in
+                                                                     NANO Z ONE (green: POE switches; yellow: PIE switches; red: PAS switches).
+switching. Intel MPK is a promising model because it supports
+user-space permission changes without costly kernel traps
+or TLB flushes, but it is unavailable on Arm. Although
+                                                                     switching. We exploit request locality to mask the latency of
+Armv7 previously provided a similar feature through mem-
+                                                                     privileged traps, strategically scheduling requests to maximize
+ory domains [18], [19], its Domain Access Control Register
+                                                                     residency within the currently active low-latency POE layer.
+is inaccessible from user space, and the feature has been
+                                                                     As shown in Figure 1, this approach maintains a 96.72%
+deprecated in AArch64. Fortunately, Arm recently introduced
+                                                                     hit rate in the fastest tier, effectively restricting expensive
+the Permission Overlay Extension (POE) [20] in Armv8.9-
+                                                                     transitions to the bare minimum. Consequently, NANO Z ONE
+A, making efficient user-space domain switching feasible on
+                                                                     amortizes the heavy hardware isolation costs, reducing the
+Arm. NANO Z ONE partitions memory pages into isolation do-
+                                                                     average domain-switch latency to near-native speeds (only
+mains by encoding POE indices, analogous to MPK protection
+                                                                     4.87% of a raw privileged switch).
+keys, in Page Table Entries (PTEs). On authorized domain
+                                                                     Security Challenge: Enforcing Integrity against an Adver-
+switches, NANO Z ONE temporarily grants access to sensitive
+                                                                     sarial Kernel. Standard Control-Flow Integrity (CFI) relies
+memory by updating POE permission registers in user space,
+                                                                     on the critical premise that the OS enforces memory isolation
+keeping the access window short. Because POE permissions
+                                                                     to prevent code and pointer corruption. In our threat model,
+are maintained per core, other cores remain restricted by their
+                                                                     however, this assumption is invalidated. An adversarial OS
+own permission-register state.
+                                                                     can subvert isolation boundaries by manipulating page tables,
+   While the high-level design of NANO Z ONE may seem
+                                                                     rendering user-space CFI mechanisms ineffective. The chal-
+straightforward, it faces challenges spanning scalability, ef-
+                                                                     lenge, therefore, is to restore the integrity of the isolation layer
+ficiency, and security. The core contribution of this paper lies
+                                                                     as a prerequisite for robust CFI. NANO Z ONE addresses this
+in balancing the trade-offs across these three dimensions.
+                                                                     dependency by re-anchoring the root of trust in the monitor.
+Scalability Challenge: Expanding Domains beyond Hard-
+                                                                     First, to restore isolation, we incorporate a security module
+ware Limits. POE is strictly limited to 7 usable domains,
+                                                                     (§IV-C) that validates page table updates and protects sensitive
+which is insufficient for multi-tenant server workloads. While
+                                                                     registers, precluding the OS from remapping or tampering with
+Arm CCA’s GPT mechanism supports unlimited domains,
+                                                                     domain memory. With isolation secured, we then enforce CFI
+relying solely on it necessitates frequent privileged interven-
+                                                                     by combining the Guarded Control Stack (GCS) [24] with
+tions, which undermines the lightweight nature of user-space
+                                                                     a monitor-managed Pointer-Integrity Memory (PIM) (§IV-B),
+isolation [21]. The core challenge is to architect a mechanism
+                                                                     ensuring execution flow remains tamper-resistant even against
+that achieves infinite scalability within the rigid constraints of
+                                                                     kernel-level interference.
+hardware resources. NANO Z ONE overcomes this by integrat-
+ing complementary hardware features into a cohesive three-              Since no commercial hardware yet supports the required
+tier zone design (§IV-A). First, it combines POE with the            Arm features, we built two prototypes: a functional version
+Permission Indirection Extension (PIE) [20], mapping unused          on Arm’s official Fixed Virtual Platform and a performance
+PIE indexes to existing POE indexes to expand user-level             version on a hardware SoC. Security evaluations confirm that
+domains from 7 to 28. Second, to break the hard limit, it            NANO Z ONE effectively mitigates both intra-process vulner-
+exploits Granule Protection Tables (GPT) [22] and GPC3               abilities and privileged attacks via surface analysis (§VI-B)
+bypass windows [23] to reuse these indexes across distinct           and CVE reproduction (§VI-C). Performance assessments
+Physical Address Spaces (PAS). This hierarchical approach            on micro-benchmarks (§VII-B) and real-world applications
+enables it to scale to an unlimited number of domains.               (§VII-C) show that NANO Z ONE incurs only moderate over-
+Efficiency Challenge: Amortizing the Cost of Hierarchical            head. For instance, while Nginx exhibits a 21.84% average
+Isolation. The hierarchical scalability established above in-        throughput overhead, the marginal cost of our fine-grained
+troduces a fundamental trade-off: accessing deeper tiers (PIE        protection remains small: compared to the state-of-the-art
+or PAS) incurs prohibitively higher switching costs. Unlike          Shelter [9] (which lacks intra-process isolation), NANO Z ONE
+lightweight POE switches, crossing these boundaries requires         introduces only a 5.15% relative drop.
+trapping into higher privilege levels, resulting in ∼80× higher         In summary, we make the following contributions:
+latency. The challenge is to sustain high throughput when               •   We propose a hierarchical model to resolve the
+the underlying isolation mechanism is inherently expensive.                 scalability-efficiency trade-off in Arm hardware. It unifies
+NANO Z ONE addresses this by enforcing a tier-aware execution               the speed of POE with the scale of GPT, enabling un-
+model that accounts for the heterogeneous costs of domain                   limited isolation domains without sacrificing user-space
+IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                                                                               3
+
+
+
+                                                             TABLE I
+                                           ACRONYMS AND KEY REGISTERS USED IN THIS PAPER .
+
+ Abbrev.   Full Name                           Abbrev.   Full Name                                  Register                             Full Name
+ CCA       Confidential Compute Architecture   GPC       Granule Protection Check                   POR_EL0                              POE permission register
+ RME       Realm Management Extension          GPC3      Granule Protection Check 3                 PIRE0_EL1                            PIE permission register
+ CVM       Confidential Virtual Machine        GPF       Granule Protection Fault                   GPCBW_EL3                            GPC bypass-window register
+ PAS       Physical Address Space              GCS       Guarded Control Stack                      GCSPR_EL0                            GCS pointer register
+ GPT       Granule Protection Table            CPI       Code-Pointer Integrity                     TPIDRRO_EL0                          Read-only thread pointer register
+ POE       Permission Overlay Extension        PIM       Pointer-Integrity Memory
+ PIE       Permission Indirection Extension    PTE       Page Table Entry
+
+
+                                                                                              Upper Attributes                         Page Table Entry             Lower Attributes
+    performance.
+  • We redesign protection mechanisms for the threat model           63 62                 60 59 55 54                 53 52        51       50 49 48 47        12 11 7       6         52 1       0
+
+                                                                           POIndex[2:0]              PIIndex[3:2]              PIIndex[1]             Address             PIIndex[0]         1 1
+    where the OS is adversarial. Anchoring trust in the moni-                    110                         11                     1                                         1
+    tor, NANO Z ONE enforces control-flow integrity (via GCS
+    and CPI) independent of kernel-managed page tables.                    Perm15                    Perm6                         Perm0                   Perm15                  Perm0
+
+  • We show that our locality-aware scheduling effectively             0     0     0   0    … 0          0   0     1    …      0   1     1   1        0     1   0    1 … 0          0    0     0
+    masks the latency of privileged transitions. Evaluation                                       Read Only
+                                                                                             (Overlay Permission)
+                                                                                                                                                       Read, Write
+                                                                                                                                                    (Base Permission)
+                                                                           POR_EL0                                                                                                PIRE0_EL1
+    confirms that it retains about 95% of the throughput of
+    process-level isolation, proving the practicality of fine-                                                   Read Only (Combined Permission)
+
+    grained isolation.
+                                                                     Fig. 2. Combination of permission indirection and overlay.
+
+            II. BACKGROUND AND M OTIVATION
+A. Hardware Background                                               64-bit POR_EL0 register, which do not need to be cached in
+   For ease of reference, Table I summarizes the main archi-         the TLB. During runtime, the MMU transparently combines
+tectural acronyms and key registers used in the paper.               and checks both base and overlay permissions. POE uses three
+Permission Indirection Extension (PIE). Arm previously               unused bits [62:60] in the PTE as the index, supporting up to 8
+used a direct memory permission model, where permissions             POE domains1 . However, the POE index defaults to 0, where
+for each memory page were determined by the permission               perm0 is fixed with full permissions (i.e., 0b0111, read,
+bits in the PTE. In this model, modifying the permissions of         write, and execute) to ensure that default base permissions are
+a domain requires updating the PTEs of all pages associated,         not overridden. As a result, only 7 POE domains are available
+making it inefficient for domain-based isolation. Additionally,      for general use.
+the limited number of PTE bits restricts scalability for sup-        Guarded Control Stack (GCS). Arm introduced GCS [24]
+porting new permissions. To address these limitations, Arm           in Armv9.4-A to defend against ROP [25], similar to the x86
+introduced an indirect permission model [20] in Armv8.9-             Shadow Stack [26]. GCS leverages a new permission (i.e.,
+A. This model manages user-space permissions using the               perm11 in PIRE0_EL1) introduced by PIE, allowing non-
+64-bit PIRE0_EL1 register, where each 4 bits specify the             privileged read operations while disallowing writes, except
+permissions for a domain, supporting up to 16 domains. The           through the specific GCSSTR instruction. Notably, POE does
+original PTE permission bits (i.e., bit 54 UXN, bit 53 PXN,          not apply to GCS. When enabled, GCS allocates a protected
+bit 51 WRITE/DBM, and bit 6 USER/AP[1]) are repurposed               stack for each thread in PIE domain11, pointed to by the
+as indexes to indicate a page’s domain. Notably, the direct          GCS pointer register (GCSPR_EL0). During branch instruc-
+and indirect permission models are compatible. As shown in           tions with a link (e.g., BL, BLR), the CPU saves the return
+Figure 2, in the direct model, a user-space memory page with         address in the link register (LR) and transparently pushes it
+read-write permissions has the bits UXN = 1, PXN = 1, WRITE          onto the protected stack. Similarly, during a RET instruction,
+= 1, and USER = 1 set. In the indirect model, these bits instead     the CPU verifies the LR against the top of the protected stack
+serve as an index in PIRE0_EL1 (i.e., perm15), which is              to ensure return address integrity.
+pre-configured with read-write permissions (i.e., 0b0101).           Confidential Compute Architecture (CCA). In the Armv9.2-
+Among the 16 domains supported by PIRE0_EL1, 12 are                  A, Arm introduced the Confidential Compute Architecture
+pre-configured with fixed permissions to cover common use            (CCA) [3] with a hardware primitive called the Realm Man-
+cases.                                                               agement Extension (RME) [22]. CCA introduces a new exe-
+Permission Overlay Extension (POE). Although PIE can                 cution environment called the realm world and separates the
+configure base permissions, permission switching requires            entire Exception Level 3 (EL3) into a distinct root world.
+trapping to privileged mode and flushing the TLB, leading            Confidential Virtual Machines (CVMs), originally created by
+to inefficiencies. To address this, Arm also introduced the          the normal-world hypervisor, are executed in the realm world,
+POE [20] in Armv8.9-A, delegating part of permission man-               1 In Armv9.4-A, the 128-bit translation tables [24] extend support for a 4-bit
+agement to user-space. As shown in Figure 2, base permissions        POE index, enabling all 16 POE domains. However, software stack support
+can be further restricted by overlay permissions stored in the       for the 128-bit translation tables is still under development.
+IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                                                               4
+
+
+
+      Realm World           Normal World          Secure World                Security State
+                                                                                                                               TABLE II
+                                                                              N   S     Rl   Rt            C OMPARISON OF INTRA - PROCESS / ENCLAVE ISOLATION .
+EL0                             APP         APP      S-APP
+                                                                              √   √     √    √
+
+
+                    Realm
+        Realm
+                                                                        N
+
+
+
+                     VM
+         VM
+                                                                        S     X   √     X    √                                                           Security3
+EL1                                    OS            S-OS                                         System                  Efficiency1    Scalability2                  Platform
+                                                                        Rl    X   X     √    √
+
+
+
+
+                                                                 PAS
+                                                                                                                                                         PA     SA
+EL2     RMM            Hypervisor (HV)               S-HV               Rt    X   X     X    √
+                                                                                                  lwC [27]                   Slow           Many          ✗      ✗      Portable
+                                                                       Full   √   √     √    √
+                                                                                                  MPK [13]                   Fast             16          ✗      ✗       Intel
+EL3 Root World                Monitor                                  None   X   X     X    X    Donky [29]                 Fast            1,024        ✗      †      RISC-V
+                                 (a)                                              (b)             libmpk [30]                Slow           Many          ✗      ✗       Intel
+                                                                                                  EPK [31]                   Fast           7,680         ✗      †       Intel
+Fig. 3. The architecture of CCA and its PAS access permissions.                                   LightZone [32]             Fast           65,536        ✗      †       Arm
+                                                                                                  Nested Enclave [11]        Slow           Many          ✓      †       Intel
+                                                                                                  LightEnclave [12]          Fast             16          ✓      †       Intel
+                                                                                                  HiveTEE [33]               Slow           Many          ✓      †       Arm
+as shown in Figure 3(a). RME achieves fine-grained physical
+memory access control by leveraging two main steps: con-                                          N ANO Z ONE                Fast4          Many          ✓      ✓       Arm
+                                                                                                   1 Efficiency refers to domain-switching performance. We classify efficiency
+figuring Physical Address Spaces (PAS) through the Granule
+                                                                                                   as “Fast” if domain switching can be performed primarily in user space
+Protection Table (GPT) and enforcing PAS access checks with                                        (e.g., in the low hundreds of cycles).
+the Granule Protection Check (GPC). Specifically, the GPT                                          2 Scalability refers to the maximum number of supported domains.
+                                                                                                   3 Security refers to the ability to resist the PA (Privilege Attack) from the
+maps each physical memory page (at a 4KB granularity)
+                                                                                                   OS or the internal SA (Switch Abuse). † indicates incomplete defense.
+to one of several PAS: normal, secure, realm, root,                                                4 Due to NANO Z ONE ’s hierarchical design, we consider the amortized
+full-access, or no-access. During memory accesses,                                                 switching cost here.
+the MMU consults the GPT to retrieve PAS of the target mem-
+ory page and performs a GPC to validate access permissions
+based on the current security state, as illustrated in Figure 3(b).
+                                                                                                  leverages Intel’s Extended Page Table (EPT) to reuse MPK
+If an access is invalid, a Granule Protection Fault (GPF) is
+                                                                                                  domain IDs. Since the VMFUNC instruction used for EPT
+triggered immediately. The most privileged root world ensures
+                                                                                                  switching is also non-privileged, domain switching can be
+that other worlds cannot modify the GPT or GPC’s registers.
+                                                                                                  efficiently performed in user space. LightZone [32], like lwC,
+Granule Protection Check 3 (GPC3). Armv9.6-A introduced
+                                                                                                  creates separate memory mappings for domains to enhance
+GPC3, an upgraded GPC that lets designated memory regions
+                                                                                                  scalability, theoretically supporting up to 65,536 domains. The
+bypass the check by configuring the GPC bypass window
+                                                                                                  key difference is that LightZone runs processes in kernel space
+register (GPCBW_EL3) [23]. Bypass windows are configurable
+                                                                                                  to avoid trapping overhead of domain switching. Crucially,
+from 1GB to 64GB. Each core has its own GPCBW_EL3. A
+                                                                                                  however, both EPK and LightZone depend on a trusted OS
+core can directly access its configured bypass windows, while
+                                                                                                  or hypervisor to manage these isolation structures. This de-
+other cores must undergo GPC.
+                                                                                                  pendency not only inflates the TCB but also renders them
+                                                                                                  insecure under the adversarial kernel threat model addressed
+B. Limitations of Existing Solutions                                                              by NANO Z ONE.
+   Intra-process isolation is the leading technique for enforcing                                    While intra-enclave isolation effectively mitigates threats
+the principle of least privilege. Existing mechanisms (see                                        posed by privileged adversaries, it struggles with efficiency
+Table II) partition memory into distinct domains within a                                         and scalability. Nested Enclave [11] incurs substantial over-
+single address space and use specialized hardware instructions                                    head during switches between outer and inner enclaves,
+to switch between them. For example, lwC [27] builds contexts                                     whereas MPK-based solutions such as LightEnclave [12]
+by assigning each a separate virtual memory mapping via page                                      inherently restrict the number of isolation domains to 16.
+tables. Context switches require updating the page-table base,                                    The concurrent HiveTEE [33] lifts this limit on Arm CCA
+and even with PCID support to avoid global TLB flushes,                                           by reusing MTE tags across GPTs, but every entry into
+the transition still traps into privileged mode, incurring non-                                   its domains still traps to the Monitor. On the other hand,
+negligible overhead.                                                                              domain-switching abuse creates internal attack vectors that
+   Unlike page-table-based approaches, Intel MPK [13] en-                                         are often overlooked. lwC [27] and libmpk [30] ignore these
+ables unprivileged domain switching, achieving < 2% over-                                         threats entirely. More advanced designs like Donky [29],
+head when isolating SSL keys in Nginx [28]. However, MPK                                          EPK [31], LightEnclave [12], Nested Enclave [11], Light-
+supports only 16 domains, which hampers scalability in multi-                                     Zone [32], and HiveTEE [33] implement gate-centric defenses.
+tenant workloads, prompting new designs that lift this limit.                                     By authenticating the caller’s identity, execution state, or entry
+For instance, Donky [29] leverages the 10 reserved bits of the                                    target, they effectively prevent unauthorized entry (arbitrary
+PTE to support up to 1,024 domains but requires substantial                                       jumps or returns to the trampoline entry). Furthermore, they
+hardware modifications. libmpk [30] employs an LRU-based                                          mitigate mid-trampoline injection either through hardware
+algorithm to evict inactive domains, reusing their domain                                         enforcement (Donky, Nested Enclave) or by verifying post-
+IDs without hardware changes. However, evicting a domain                                          switch execution states, such as random nonces (EPK, Ligh-
+involves modifying the PTEs of all associated memory pages.                                       tEnclave) or call-site allowlists (LightZone). However, these
+As the number of pages or domains grows, eviction costs                                           defenses remain fundamentally vulnerable to borrowed-gate
+and rates increase, leading to significant overhead. EPK [31]                                     attacks (or confused-deputy attacks). In this scenario, an intra-
+IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                                                  5
+
+
+
+process adversary exploits memory corruption to overwrite                         15            2     1       0         15            2     1     0
+                                                                                  n/a     …    n/a   r/w     r/w/x      n/a    …    r/w    n/a   r/w/x
+                                                                                                                                                          NANOZONE
+control-flow data (e.g., return addresses or function pointers)                                                                                            Process
+                                                                                          POR_EL0 (Core A)                     POR_EL0 (Core B)
+in untrusted code, redirecting execution to a legitimate call
+                                                                                              L1-Zone #0                           L1-Zone #1               L1-Zone
+site that invokes the trampoline. Since the domain switch is
+
+
+
+
+                                                                   Normal World
+                                                                                                                  L2-Zone                                   L2-Zone
+triggered from a valid location, gate-centric checks approve
+                                                                                                                            L3-Zone
+the transition, unaware that the control flow leading to it has
+been hijacked. Addressing this threat requires moving beyond
+gate verification to enforcing Control-Flow Integrity (CFI) on                                            NANOZONE Driver
+                                                                                                                                                          Untrusted
+                                                                                       Lifecycle Management           Memory Management
+the path to the switch, as implemented in NANO Z ONE.                                                                                                        OS
+
+
+
+                  III. S YSTEM OVERVIEW                                                                        NANOZONE Monitor (TCB)
+
+
+
+
+                                                                   Root World
+                                                                                        Memory Delegation via GPTs                  PIE, POE, and GCS Configuration
+   Existing intra-process isolation mechanisms face an isola-
+                                                                                              Zone ID Allocation                      L2-Zone and L3-Zone Switching
+tion trilemma, forcing a trade-off between Scalability, Effi-
+ciency, and Security. Software-based approaches scale well but                             Interrupt Interception                         Page Table Protection
+suffer from high overhead or weak security, while hardware-
+assisted ones (like MPK) are efficient but capacity-limited.       Fig. 4. The architecture of NANO Z ONE.
+NANO Z ONE addresses this by synthesizing complementary
+hardware capabilities into a hybrid architecture.
+Breaking the Scalability Limit. To overcome the capac-             Specifically, we introduce a driver to the OS that manages the
+ity constraints of single hardware primitives (e.g., POE’s         lifecycle of protected processes and memory allocation. While
+7 domains), NANO Z ONE adopts a hierarchical composition           the OS can create, schedule, and destroy protected processes,
+strategy. It combines user-space POE, kernel-level PIE, and        it cannot access their data, code, page tables, or register states
+firmware-level GPC3 to instantiate domains across three tiers.     once the processes are delegated.
+By leveraging GPT’s ability to map multiple physical address          During compilation, we modify the LLVM compiler to
+spaces (PAS), we effectively decouple the logical domain           identify all code pointers (e.g., function pointers, return ad-
+count from hardware limits, achieving unlimited scalability.       dresses) for instrumentation protection, combined with post-
+Preserving Efficiency via Locality. Hierarchical isolation         compilation binary scanning to eliminate unsafe pre-inlined
+introduces latency heterogeneity: switching deep tiers (PAS) is    domain-switch or GCS store instructions (§IV-B).
+significantly costlier than user-level tiers (POE). We mitigate       In the setup phase, the OS first loads the instrumented and
+this by exploiting request locality. NANO Z ONE’s scheduler        scanned binaries and then invokes the driver to pre-allocate
+employs an affinity-based allocation algorithm that groups         and map memory for isolation domains, along with their
+sequential requests from the same connection into contiguous       security control structures (e.g., page table and control-flow
+domains mapped to the same PAS. This maximizes execution           backups). The driver requests the Monitor to audit the loading
+residency in the fast L1-Zone (POE), masking the latency of        procedure and delegates the pre-allocated physical memory to
+rare privileged transitions.                                       the protected process by configuring the OS’s GPT, ensuring
+Enforcing Security under Adversarial Kernels. To counter           that the OS cannot access these memory regions. The Monitor
+domain-switching abuse without relying on a trusted OS,            then configures the protected process’s GPT to isolate all
+NANO Z ONE anchors its root of trust in the minimal root-          L3-Zones from intra-process adversaries (§IV-C). Next, the
+world Monitor. We enforce Code-Pointer Integrity (CPI) to          Monitor partitions the L3-Zone into L2-Zones and L1-Zones
+secure the entire control-flow path leading to the switching       through PTE configurations (i.e., PIE and POE indexes) and
+trampoline, preventing borrowed-gate attacks. Furthermore,         marks the control-flow-backup pages with the GCS attribute
+the Monitor offloads critical configuration tasks (e.g., PIE/POE   (§IV-A). Finally, the Monitor initializes all registers associated
+setup) from the OS, ensuring isolation integrity even against      with these features.
+a compromised kernel.                                                 During runtime, the Monitor assigns isolation domain IDs
+System Architecture. The architecture of NANO Z ONE is             for the current execution context. The user space facilitates
+illustrated in Figure 4. In our design, Arm CCA serves as          L1-Zone context switching alongside CPI enforcement, which
+the hardware substrate rather than the software deployment         mitigates borrowed-gate attacks, without requiring privileged
+environment: NANO Z ONE repurposes CCA’s GPT, GPC, and             transitions to the Monitor. However, switching between L2-
+GPC3 primitives for isolation, but protected processes run in      Zones and L3-Zones requires the Monitor to update the GPC3
+the normal world and never enter the realm world or use            and PIE registers (§IV-A). Throughout process execution, the
+CVM-based isolation. NANO Z ONE divides the address spaces         Monitor intercepts each interrupt to enforce memory isolation
+of protected processes into developer-defined domains across       and protect the register state. Before resuming the process,
+three tiers: POE domains (L1-Zone), PIE domains (L2-Zone),         the Monitor verifies and synchronizes page table updates to
+and GPT PASs (L3-Zone). The security of these domains              prevent unauthorized modifications to PIE, POE, and GCS
+is enforced by the Monitor in the root world. To further           configurations (§IV-C).
+minimize the trusted software stack, NANO Z ONE adopts a           Threat Model and Assumptions. NANO Z ONE’s TCB is
+delegation-based design that separates control from ownership.     confined to the native root-world firmware and the security
+IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                                               6
+
+
+
+                                                                     0   1   2   3    4   5   6   7   8     9 10 11 12 13 14 15
+modules it adds. This firmware is loaded through CCA Se-                                                                               PIIndex   POIndex   #Zone
+
+                                                                                                                                         1         1-7      0-6
+cure Boot, so its integrity can be verified with the vendor’s       PIRE0_EL1                     L1-Zone                                2         1-7     7-13
+signature. We trust the underlying hardware to implement the        POR_EL0                                                 Reserved
+                                                                                                                                         3         1-7     14-20
+required features (e.g., RME, PIE/POE, and GCS) correctly                                                                                6         1-7     21-27
+
+and assume a clean toolchain, meaning the application is built       0   1   2   3    4   5   6   7   8     9 10 11 12 13 14 15                      L2-Zone
+
+on a secure host. The normal-world OS (including our driver)                                                     (a)
+                                                                                       Virtual address space of the protected application
+and the software stacks in the realm and secure worlds are                                …                                        …                        …
+                                                                             Zone 0            Zone 27                  Zone 28            Zone 55
+treated as untrusted.
+   NANO Z ONE protects against both privileged and intra-                            L3-Zone 0 PAS                            L3-Zone 1 PAS                 …
+process adversaries. Privileged attackers may control the OS                                              Physical Memory
+to remap domain memory, alter domain configurations, tamper                                                      (b)
+with permission registers, inject malicious interrupts, forge
+domain-switch requests, or exploit DMA devices. NANO Z ONE          Fig. 5. Structure of the domain extension: (a) shows the extension via PIE,
+                                                                    while (b) depicts the extension via multi-PAS.
+also accounts for Iago [34] attacks that return malicious
+memory mappings. In parallel, intra-process adversaries may
+exploit memory bugs [6] within the untrusted code to breach
+domain boundaries or hijack control flow [35], [25], en-            permission register (PIRE0_EL1). However, their overlay
+abling domain-switching abuse (e.g., mid-trampoline injec-          permissions differ in the POE permission register (POR_EL0).
+tion, unauthorized entry, and borrowed-gate attacks). Finally,      When executing in Domain-A, overlay perm1 is enabled
+NANO Z ONE enforces mutual isolation so that a compromised          and overlay perm2 is forced to 0 (overriding base
+domain cannot target other domains or escalate privilege to         perm6), which blocks any access to Domain-B. (2) Domains
+higher-level software.                                              across different L2-Zones with a shared POE index. Consider
+   NANO Z ONE excludes scenarios where isolation domains            Domain-A (PI:6, PO:1) and Domain-C (PI:3, PO:1).
+intentionally leak sensitive data or contain internal vulnera-      Both domains enable overlay perm1, but Domain-C’s
+bilities. Physical attacks [36], [37], [38], microarchitectural     base permission (index 3) remains disabled. As a result, even
+side channels [39], [40], denial-of-service (DoS) attacks, and      though they share the same POE index, no lateral access is
+Iago attacks beyond memory mapping are outside our threat           allowed from Domain-A into Domain-C. Notably, PIE indexes
+model.                                                              with fixed semantics (for example, the default index 4) are
+                                                                    never reused, since their base permissions cannot be masked.
+                                                                       The 28 POE-PIE domains still fall short of the scalability
+                  IV. NANO Z ONE D ESIGN
+                                                                    needed for multi-tenant servers; therefore, NANO Z ONE turns
+A. Isolation Domain Extension                                       to another CCA feature, the GPT, which partitions physical
+   NANO Z ONE employs a standard code-centric work-                 memory into multiple PASs beyond the page-table layer. A
+flow [41], [42]: developers mark sensitive code, allocate           simple idea is to map each POE-PIE domain to its own
+domain memory, and insert call gates to thwart memory-              PAS, so a domain is identified by 〈PAS, PIE, POE〉; see
+safety exploits [6]. Targeting server workloads, it also supports   Figure 5(b). This raises a new problem: the requesting core
+a data-centric model [43] that isolates per-request contexts        must gain exclusive access to its target PAS while all other
+on demand. Fundamentally, NANO Z ONE redesigns the core             cores are blocked. Existing schemes give every PAS a private
+mechanisms of memory configuration and permission switch-           access-control table (e.g., EPK [31] maintains extra EPTs),
+ing, enabling unlimited domain scalability while strategically      but this per-PAS-per-table model inflates memory and in-
+allocating IDs to minimize expensive privileged transitions.        curs creation latency (both detailed in §VII-B), while being
+Extended Domain Configuration. With POE alone, the 3-bit            constrained by hardware limits such as 512 EPTs per VM.
+POE index (value 0 being reserved) limits the system to seven       NANO Z ONE keeps all PASs inside a single process’s GPT
+addressable domains. NANO Z ONE breaks past this cap in two         and uses the GPC3 bypass-window feature. During setup each
+ways: (1) it taps the remaining unused index encodings, and         PAS is marked no-access. When a core needs to access a
+(2) it reuses the same encoding concurrently for separate,          particular PAS, the Monitor programs that core’s GPCBW_EL3
+non-overlapping physical memory regions.                            register to disable the GPC only for the required range; other
+   PTEs carry a 4-bit PIE field for base permissions in addition    cores still fail the check. Since the Monitor pre-defines every
+to the 3-bit POE field for overlay permissions. While most          legal window, attackers cannot open arbitrary ones.
+PIE index encodings are already in use (six for common                 Keeping a single GPT also strengthens isolation under an
+permissions, two for GCS, and four for kernel), we observe          untrusted OS. Per-PAS-per-GPT schemes grant a core access
+that there remain four unused encodings. As shown in Fig-           by rewriting a region’s attribute to an accessible state. The cor-
+ure 5(a), NANO Z ONE combines PIE and POE indexes to                rectness of such a scheme then depends on validating, at every
+form the domain ID, expanding the addressable domains to            rewrite, that the region is not cross-world memory; a single
+28. Isolation between these expanded domains is enforced            omitted check exposes another world’s memory to a protected
+in two cases. (1) Domains within the same L2-Zone. For              application. We observed a concrete instance of this risk in
+example, Domain-A (PI:6, PO:1) and Domain-B (PI:6,                  the implementation of Shelter [9], which we have reported to
+PO:2) share the same base permission (index 6) in the PIE           its authors. In NANO Z ONE, by contrast, a protected PAS is
+IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                                           7
+
+
+
+                               CPU Core Execution
+                                                                                    1 .macro backup_ptr, x1: address of the function to be stored
+  Domain   #0        #1        #26       #27       #28        #54         #55       2                    x2: memory address where the pointer resides
+                                                                                    3 ## 1) fetch next idle slot address from PIM[0]
+POE Perm   P1        2
+                     P2        P6         P7       P1          P6           P7      4 mrs       x3, TPIDRRO_EL0          ## x3 ← PIM base
+                                                                                    5 ldr       x0, [x3]                 ## x0 ← *PIM[0] (idle slot)
+PIE Perm        Perm1                Perm4         Perm1            Perm4           6 ## 2) compute slot index & bounds check
+                                                                                    7 sub       x4, x0, x3               ## offset = slot − base
+ GPC BW                   PAS0                               PAS1                   8 lsr       x4, x4, #3               ## index = offset / 8
+   Untrusted code     All POE perms are disabled   Privilege transition by traps    9 cmp       x4, #PIM_SIZE
+                                                                                   10 b.hs      .Lpim_oob                ## abort if PIM is full
+                                                                                   11 ## 3) store function pointer to that slot (GCSSTR)
+Fig. 6. Intra-process permission switching in the NANO Z ONE lifecycle.
+                                                                                   12 .inst     0xD91F0C01               ## GCSSTR x1, [x0]
+                                                                                   13 ## 4) advance idle pointer and write it back to PIM[0]
+                                                                                   14 add       x0, x0, #8               ## next_free += 8
+                                                                                   15 .inst     0xD91F0C60               ## GCSSTR x0, [x3]
+never rewritten and remains no-access throughout; access                           16 ## 5) encode slot index into high-order bits (except bit 55)
+is determined solely by the Monitor-exclusive GPCBW_EL3                            17 and       x5, x1, #PTR_MASK        ## clear old high bits
+register.                                                                          18 bfi       x5, x4, #48, #7          ## index[0:6] → bits 48-54
+                                                                                   19 lsr       x4, x4, #7
+Domain Switching. Like prior works [29], [31], [32], [12],                         20 bfi       x5, x4, #56, #8          ## index[7:14] → bits 56-63
+NANO Z ONE packages its domain-switching code into a dedi-                         21 str       x5, [x2]                 ## publish encoded pointer
+                                                                                   22 .endm
+cated trampoline that orchestrates transitions across the three                    23
+isolation levels. Permission grants are usually trap-free; each                    24 .macro check_call, x1: The function pointer to be called
+                                                                                   25 ## 1) duplicate encoded pointer and then strip high bits
+involves enabling the corresponding overlay permission by                          26 mov       x2, x1                   ## x2 ← encoded
+writing POR_EL0, but only transitions that cross L2- or L3-                        27 and       x1, x1, #PTR_MASK        ## x1 ← original
+Zone boundaries require a privileged trap. To revoke access,                       28 ## 2) extract 15-bit index and check bounds
+                                                                                   29 ubfx      x4, x2, #48, #7          ## low 7 bits → x4[6:0]
+user code simply clears all overlay permissions; even if the                       30 ubfx      x7, x2, #56, #8          ## high 8 bits → x7[7:0]
+PIE base permission or bypass window stays active, the                             31 lsl       x7, x7, #7
+                                                                                   32 orr       x4, x4, x7               ## x4 ← full index
+cleared overlay ensures untrusted code cannot reach isolation                      33 cmp       x4, #PIM_SIZE
+domains (see Figure 6). For an L2 switch, the Monitor writes                       34 b.hs      .Lpim_oob                ## abort if OOB
+                                                                                   35 ## 3) fetch golden copy from PIM and compare integrity
+PIRE0_EL1 to disable the old base permission and enable                            36 mrs       x5, TPIDRRO_EL0          ## PIM base
+the new one. For domains within an L2-Zone that require                            37 add       x5, x5, x4, lsl #3       ## slot addr = base + idx*8
+special privileges, we set their base permission to full R/W/X                     38 ldr       x6, [x5]                 ## golden pointer
+                                                                                   39 cmp       x1, x6
+and use POE overlays for fine-grained access control, avoid-                       40 b.ne      .Lcorrupt                ## abort if mismatch
+ing unnecessary traps. Switching between L3-Zones updates                          41 .endm
+GPCBW_EL3 to point the bypass window at the new PAS.
+Domain ID Allocation Optimization. L2 and L3 switches                              Fig. 7. Instrumentation code for pointer backup and call verification (type-ID
+                                                                                   handling omitted).
+trigger privileged traps, so NANO Z ONE lowers their frequency
+by redesigning domain allocation. First, it follows a per-
+connection-per-domain policy, keeping consecutive requests
+                                                                                   these attacks, NANO Z ONE first performs binary scanning to
+from the same connection in the same domain and limiting
+                                                                                   eliminate pre-inlined switching instructions (e.g., unauthorized
+them to inexpensive L1 switches. Second, servers like Mem-
+                                                                                   POR_EL0 updates), ensuring that only the mapped tram-
+cached hand connections to worker threads in round-robin
+                                                                                   poline can change permissions. Second, NANO Z ONE blocks
+fashion; if domains were allocated in that same order, each
+                                                                                   switching reuse by enforcing CPI on return addresses and
+thread would own a scattered set spanning many L2 and L3
+                                                                                   function pointers, thereby protecting the entire control-flow
+zones, sharply raising the trap rate. NANO Z ONE instead grants
+                                                                                   path leading to a domain switch.
+each thread a block of 28 consecutive domains that all map to
+the same PAS. Threads still process connections sequentially,                      Return Address Protection. NANO Z ONE employs the off-
+but each one lands in a locally contiguous domain. Thus only                       the-shelf GCS feature to secure return addresses. On each
+a small share of requests must perform L2 and L3 switches                          branch-with-link, the CPU pushes the return address to the
+(see §VII-B for hit-rate details).                                                 protected GCS region and, on return, checks it against the
+                                                                                   value popped from that stack. The enabling and configuration
+                                                                                   of GCS, such as setting the stack pointer to a securely pre-
+B. Code-Pointer Integrity                                                          delegated memory area, are managed by the Monitor.
+   The root cause of domain-switching abuse lies in two                            Function Pointer Protection. The core idea behind our
+vectors. (1) pre-inlined switching instructions embedded in                        function pointer protection is to create a set of legitimate
+the binary, and (2) control-flow hijacking attacks that exploit                    landing pads (indirect jump targets), back them up into the
+existing switching logic, whether via returns/jumps to the                         PIM region (a NANO Z ONE-managed read-only memory area
+trampoline or direct mid-trampoline execution of switching                         with GCS attributes) and enforce pre-jump integrity checks.
+instructions. Notably, merely validating that an indirect branch                   Despite conceptual simplicity, it faces three critical challenges:
+reaches a legitimate landing pad is insufficient in our threat                     (1) ensuring threads securely acquire their PIM base address,
+model. An adversary may still corrupt control-flow data in                         (2) optimizing the efficiency of backup storage and lookup
+untrusted code and redirect execution to an otherwise legit-                       during checks, and (3) preventing reuse attacks that exploit
+imate switch site, i.e., a borrowed-gate attack. To counter                        previously backed-up legitimate targets.
+IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                       8
+
+
+
+   We observe that TPIDRRO_EL0 is a read-only, user-                OS GPT                                    Process Memory
+                                                                       VectorTab   PageTab     Code     GCS      L3-Zone 0   L3-Zone 1 …
+accessible per-thread register. The OS commonly uses this
+                                                                    Proc GPT
+zero-latency path to expose values that must remain con-               VectorTab   PageTab     Code     GCS     L3-Zone 0      L3-Zone 1   …
+stant for a thread’s lifetime. Following the same practice,                                                           Normal       No-Access
+NANO Z ONE stores the PIM base address in TPIDRRO_EL0,
+                                                                    Fig. 8. A dual-GPT design blocking OS access to secure memory.
+shielding it from intra-process tampering.
+   For efficient backups (Figure 7, backup_ptr), the first
+PIM entry holds the address of the next free slot, so user-         back to a concrete function-pointer type, and that cast exposes
+mode code stores the backup with one non-privileged gcsstr          the type we need. Further propagations (even nested ones)
+and advances the slot address with another. Note that during        need no extra handling because the pointer has already been
+binary scanning we also strip out any pre-inlined gcsstr            recorded.
+so that only our instrumentation can invoke it. This does
+not affect the GCS protection of ordinary applications. The
+return-address shadow stack is maintained by hardware on            C. OS Privilege Reduction
+BL and RET with no explicit store, so a normally compiled              To prevent the OS from breaking the established isolation,
+application contains no gcsstr; the instruction performs            NANO Z ONE restricts its privileges in three ways: (1) it denies
+an explicit GCS write, a capability disabled by default and         the kernel access to secure memory regions, (2) it blocks any
+used only by low-level components such as checkpoint/restore.       kernel changes to sensitive interrupt context, and (3) it forbids
+Stripping it therefore removes an abuse path through which          unauthorized updates to page-table mappings or permission
+untrusted code could forge PIM entries, without affecting any       configurations of POE, PIE, and GCS pages.
+application’s return-address integrity. Lookup is also constant-    Memory Isolation. Managing access at the virtual memory
+time (Figure 7, check_call): NANO Z ONE embeds the slot             layer, such as hooking page tables for the kernel and all
+index into the unused high-order bits of the pointer during         other processes to block alias attacks, is both complex and
+backup. This index travels with the pointer as it is copied,        heavyweight. Prior works [9], [8] shift control to the physical
+avoiding extra memory or propagation tracking. To eliminate         memory layer with GPTs, delivering a simpler and more
+redundant storage during pointer propagation, NANO Z ONE            efficient solution. NANO Z ONE therefore maintains two distinct
+checks the high-order bits: if they already contain a valid         GPTs: an OS GPT and a proc GPT (see Figure 8). The
+index, the pointer has been backed up previously and the            OS GPT denies the kernel any access to process memory,
+operation is skipped. NANO Z ONE retrieves the backup directly      including domain pages, the GCS and PIM regions, and
+from the PIM using the base address and index for comparison        executable code, and also revokes access to interrupt-vector
+with the target. Before utilizing the index, range checks ensure    tables and page tables. Once the driver allocates these regions,
+accesses stay within the PIM boundaries, preventing attackers       the Monitor marks them no-access before handing them
+from retrieving forged backups via out-of-bounds indexes (see       to the process. The proc GPT, by contrast, leaves everything
+§VII-B for detailed CPI costs).                                     accessible except the PASs that make up L3-Zones, which
+   Attackers could try to reuse legitimate landing pads. To mit-    stay blocked until a bypass-window switch occurs (§IV-A).
+igate this, we introduce pointer-type tags for function pointers.   Other sensitive areas (e.g., read-exec code) remain protected
+During compilation, we extract each function signature at the       by ordinary page-table permissions. To ensure both GPTs
+LLVM IR level, generate a truncated 64-bit hash (serving            coexist safely, the Monitor checks that delegated memory
+as a unique type ID), and embed this ID directly into IR            never overlaps existing regions and, when the realm world or
+instructions to preserve type context across the compilation        secure world requests pages, updates the proc GPT to prevent
+pipeline. When backing up function pointers, the ID is stored       isolation domains from reaching them. For system calls that
+as metadata alongside the pointer in the PIM. At call sites,        pass arguments through a process buffer, the Monitor allocates
+both the pointer and its associated ID are retrieved, and the ID    and maintains shared memory to keep the OS from touching
+is validated against the expected type hash, thereby hindering      process memory directly.
+gadget chaining.                                                    Interrupt Interception. To isolate process state from the
+   NANO Z ONE also needs to handle some corner cases. Global        OS, NANO Z ONE intercepts all user-to-kernel transitions (see
+function pointers are initialized at compile time, bypassing        §VII-B for detailed costs). A pre-delegated interrupt vector
+the runtime backup. We modify the linker script to place all        (see Figure 8) ensures that control first enters EL3 before
+initialized global function pointers into a dedicated segment.      reaching the kernel. The Monitor swaps the proc GPT for
+During binary loading, this segment is copied into the PIM,         the OS GPT, saves and sanitizes sensitive context (POE/PIE
+and each pointer is stamped with its corresponding PIM index        permission registers and GCS/PIM pointer registers), and, just
+in the high-order bits. Additionally, to address backup omis-       before handing control back, restores this context while re-
+sions from assignments to universal pointers (e.g., void*),         enabling PIE, POE, and GCS so the OS cannot silently disable
+we insert extra checks to detect whether the source address is      them. However, we observe that domain switches occur far
+a function pointer that has been typecast (i.e., via bitcast).      more often than interrupts, so forwarding each L2- or L3-
+If so, the pointer is backed up, and the type ID is derived from    Zone transition through a two-stage trap (first to the vector
+the original source type. LLVM IR’s strong typing guarantees        table, then to the Monitor) would be too expensive. Capturing
+that any later call through the universal pointer must cast it      PIE register accesses from EL3 (i.e., via SCR_EL3) is also
+IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                             9
+
+
+
+impractical due to overly coarse control; once enabled, all           Since GPC3 supports only contiguous bypass windows, the
+POE register accesses would likewise trap to the Monitor,          NANO Z ONE kernel driver leverages the Contiguous Memory
+undermining our efficiency goal (§III). Instead, NANO Z ONE        Allocator (CMA) to allocate a contiguous block of PAS for
+exploits the Armv8.5-A RNG TRAP feature: any user-space            the L3-Zone and remaps it into the process’s address space.
+read of RNDR or RNDRRS traps directly to the Monitor.              To support application development, NANO Z ONE exposes
+NANO Z ONE co-opts these registers as lightweight triggers for     a minimal API including zone_alloc/zone_free,
+L2 and L3 switches, entirely bypassing kernel mode. Since          zone_begin/zone_end, and memory management via
+RNG trapping also applies to the OS, the Monitor validates         zone_mmap/zone_munmap. Existing domains can request
+each request by checking the current GPT base, blocking            the Monitor (Trusted Firmware-A 2.9.0) to allocate the
+domain-switching abuse.                                            pre-mapped memory using these interfaces. Notably, to
+Page Table Protection. As noted earlier, NANO Z ONE config-        ensure high performance without burdening the developer,
+ures the OS GPT to deny the OS access to process page tables       zone_alloc implements the affinity-based allocation
+(see Figure 8). When a page fault occurs, the OS forwards the      strategy: it automatically assigns a domain ID that maps
+mapping request to the Monitor, which performs the actual          to the requesting thread’s local PAS, thereby defaulting
+page table updates. The Monitor enforces strict checks to          subsequent accesses to efficient L1-Zone switches. Each
+ensure that: (1) newly mapped pages are non-executable, and        interface call is wrapped in an svc instruction, which traps
+(2) existing secure memory mappings and their configurations       into a protected vector table that immediately issues an
+(i.e., PIE/POE indexes in PTEs) are not modified. Rule (1)         smc to enter the Monitor. Regular interrupt traps follow
+is deliberately absolute. All code pages, including shared li-     a similar path to reach the Monitor. Before the exception
+braries resolved by the dynamic linker, are mapped and audited     returns to the process, the Monitor re-enables PIE and POE
+during the setup phase. After delegation, the Monitor denies       in TCR2_EL1, GCS in GCSCRE0_EL1, and RNDR trapping
+any transition of a page to executable. Runtime code loading       in SCR_EL3, ensuring these features stay active in user
+such as dlopen is therefore unsupported by design. This            space. During our development, the latest available Linux
+closes the runtime code-injection surface entirely. We note this   kernel (v6.7.0) officially supported only the PIE. Support
+restriction in §VIII. Additionally, NANO Z ONE defends against     for POE and GCS had not yet been upstreamed, so we
+memory-mapping Iago attacks [34], such as malicious mmap,          applied patches for these features from Patchwork [46],
+by verifying that new mappings do not overlap with existing        which were still under review at the time. It is worth
+ones.                                                              noting that starting from v6.13-rc1, these features have
+                                                                   been merged into the mainline. To enable these features
+                     V. I MPLEMENTATION                            in the FVP, the required boot parameters must be enabled:
+   At the time of writing, no commercial SoC, including the        has_rndr_trap,           has_permission_overlay_s1,
+Cortex-X925 [44], supports the Arm extensions our work             rme_support_level, has_rme_gpc3, has_gcs, and
+depends on. Therefore, we implemented: (1) a functional            has_permission_indirection_s1.
+prototype on the Arm Fixed Virtual Platform (FVP) [45],
+which natively supports these features, to evaluate security
+properties; and (2) a performance prototype on physical Arm        Performance Prototype. We built the performance proto-
+SoCs, where the missing features are emulated, to assess           type on a Rockchip RK3399 (Armv8) board [47]. Its im-
+execution overhead.                                                plementation mirrors the functional prototype, except that
+Functional Prototype. NANO Z ONE instruments source code           the required hardware features are emulated as follows: For
+with LLVM 16.0.0 to secure function pointers. To locate            L1-Zone switches we emulate accesses to POR_EL0 with
+where a function pointer is stored, it iterates over ev-           TPIDR_EL0. Since both are unprivileged system registers,
+ery StoreInst and MemCpyInst, since the latter of-                 the emulation latency closely mirrors real hardware behavior.
+ten initializes struct fields that are function pointers. With     L2-Zone switches repurpose AFSR0_EL1 as PIRE0_EL1,
+getPointerElementType, it checks the pointee type: if              while L3-Zone bypass windows substitute ACTLR_EL3 for
+the destination is a function pointer, or the source was a         GPCBW_EL3. Since the hardware RNG-trap is absent, L2
+function pointer before a BitCastInst, it inserts backup-          and L3 transitions are also driven by svc and smc; ac-
+protection code. NANO Z ONE then analyzes each CallInst            tual hardware overhead will therefore be lower than our
+to identify call sites. When the callee is a runtime Value         emulation. We also map AFSR0_EL3 and AFSR1_EL3 to
+(e.g., from a LoadInst or BitCastInst), it inserts code            GPCCR_EL3 (GPC control) and GPTBR_EL3 (GPT base) to
+that verifies the pointer against its backup. Both backup and      measure GPC-setup and GPT-switching costs. PIE domains
+verification derive a function-type ID by hashing the type         are emulated by reusing available PTE bits in the direct-
+with SHAKE-128, mitigating reuse attacks. While requiring          memory model, while POE domains use reserved PTE fields.
+recompilation, this toolchain is essential for intra-process       The gcsstr instruction is replaced by a standard str, and
+security; it automates CFI insertion and strips unsafe instruc-    tlbi paallos, which normally flushes only cached GPT
+tions, eliminating manual refactoring. This workflow integrates    entries, is conservatively replaced by a full TLB invalidation.
+seamlessly into “Secure DevOps” pipelines, enabling tenants        Since GPTs are memory-mapped, their creation, maintenance,
+to transparently harden workloads (e.g., Nginx) during the         and teardown overhead is modeled identically in both the
+build process.                                                     functional and performance prototypes.
+IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                 10
+
+
+
+                VI. S ECURITY E VALUATION                                                      TABLE III
+                                                                                  CVE S USED FOR MITIGATION ANALYSIS .
+A. TCB Analysis
+   NANO Z ONE’s TCB is confined exclusively to the Monitor         CVE-*        Description
+module residing in the root world (EL3), totaling approxi-         Memory-Safety Vulnerabilities
+mately 3K LoCs. The kernel driver (∼1K LoCs) operates              2014-0160    Out-of-bounds read in OpenSSL’s TLS heartbeat.
+outside the trust boundary and is treated as untrusted, as its     2017-2800    Off-by-one overwrite in wolfSSL’s X.509 parser.
+                                                                   2017-18922 Heap overflow in LibVNCServer’s WebSocket decoder.
+compromise does not violate the core isolation guarantees          2022-24834 Heap overflow in Redis’s cjson library.
+enforced by the Monitor. The compile-time toolchain (∼500          2023-3138    Out-of-bounds write in libX11’s InitExt.
+LoCs) is trusted but limited to the build phase, as discussed      Control-Flow Hijacking
+in the threat model (§III).                                        2013-2028    Return-address overwrite in Nginx’s chunked parser.
+TCB Scope and Functional Breakdown. The Monitor mod-               2015-7805    Function-pointer overwrite in libsndfile’s AIFF parser.
+ule’s 3K LoCs encompass six well-scoped responsibilities:          2016-5314    Function-pointer overwrite in LibTIFF’s PixarLogDecode.
+                                                                   2021-44486 Function-pointer overwrite in YottaDB’s op_write.
+(1) GPT memory delegation and lifecycle management, (2)            2024-22857 Function-pointer overwrite in zlog’s zlog_rule_new.
+PIE/POE/GCS register configuration, (3) domain ID allo-
+cation, (4) L2/L3-Zone switching, (5) interrupt interception
+and context sanitization, and (6) page table protection. Each      its interrupt interception, GPT memory control, or change EL3
+component has a narrow, verifiable interface, making the TCB       settings (e.g., GPT base or L3-Zone bypass windows). Finally,
+small enough to be a realistic target for manual auditing or       since GPT entries and bypass windows can reside in the TLB,
+formal verification. Crucially, by anchoring all security logic    the Monitor flushes the TLB on each interrupt or L3 switch and
+in EL3, NANO Z ONE eliminates the need to trust the OS,            configures the TTBR CnP bit to prevent cross-core sharing.
+the RMM, or any realm-world software, which is a critical             Peripheral-side attacks deserve equal caution. Following
+property given that all of these are treated as adversarial in     prior CCA systems [9], [48], [49], [33], we configure the
+our threat model (§III).                                           SMMU’s GPT to enforce GPC for devices, blocking DMA
+                                                                   access to protected memory. Additionally, we flush its trans-
+B. Theoretical Security Analysis                                   lation caches, mirroring CPU-side hardening, to prevent TLB
+   We analyze security by listing attack vectors from the threat   leaks through stale entries or bypass windows.
+model and detailing how NANO Z ONE mitigates them.                 Intra-process Adversaries. Memory isolation for each do-
+Untrusted OS. At startup, the OS might tamper with a pro-          main is enforced via a three-tier regime (POE/PIE/GPC3),
+gram’s image or map several binaries onto overlapping pages.       thwarting even arbitrary out-of-bounds reads/writes by un-
+The Monitor counters this by validating the load address, re-      trusted code (§IV-A). Backed-up return addresses and func-
+jecting overlapping mappings, and auditing code pages before       tion pointers stop control-flow hijacks such as ROP [25] or
+locking them against further modification. Additionally, veri-     JOP [35], blocking any attempt to abuse domain switches;
+fying the image content against the tenant’s intended binary       reuse attacks invoking legitimate targets are limited to same-
+requires a trusted reference measurement, whose integration        type targets by type ID validation at call sites (§IV-B).
+we discuss in §VIII. To prevent races between concurrent           Malicious Domains. A domain runs at EL0 in the normal
+delegation requests, all GPT operations are synchronized with      world, so although it can access its own private memory, it
+a spinlock.                                                        lacks the privilege to access the other worlds or the normal-
+   At runtime, the OS GPT blocks the kernel from touching          world kernel. Note that the OS page table can still prevent
+a protected process’s page tables; every mapping request is        lateral escalation into other user processes. To address poten-
+vetted by the Monitor. The kernel therefore cannot place           tial collusion with the OS, the Monitor checks that each OS-
+an isolation-domain or GCS/PIM page outside the assigned           supplied L3-Zone region does not overlap existing memory
+L3-Zones or change a page’s L1- or L2-Zone assignment              and synchronously updates any memory delegations requested
+by editing its PTE indexes. From EL1, the kernel might             by other worlds in the proc GPT (§IV-C).
+still try to (1) tweak POE/PIE permission registers to force
+an L1/L2 switch, (2) redirect the GCS stack pointer, (3)           C. CVE Mitigation Analysis
+forge an interrupt-return address, or (4) disable the isolation       Beyond theoretical analysis, we evaluated NANO Z ONE’s
+features. All attempts fail because control always returns to      practical defenses against known CVEs. On Arm FVP,
+EL3 first, where the Monitor restores the registers and re-        NANO Z ONE blocks all vulnerabilities in Table III, including
+enables the features (§IV-C). Any effort to trigger an L2 or       five memory-safety flaws and five control-flow hijacks.
+L3 switch by touching the RNG TRAP register under the                 Memory bugs typically involve out-of-bounds reads (e.g.,
+OS GPT is likewise rejected; the Monitor allows access only        CVE-2014-0160) or writes (e.g., CVE-2023-3138) targeting
+when execution is under the proc GPT. Iago attacks [34] that       sensitive data. NANO Z ONE places secret pages in dedicated
+manipulate the return values of memory-mapping calls such as       isolation domains, ensuring any unauthorized access triggers
+mmap are thwarted because the Monitor refuses overlapping          a POE/PIE fault. For instance, in Heartbleed (CVE-2014-
+mappings, and GCS/PIM make a follow-on control-flow hijack         0160), OpenSSL’s tls1_process_heartbeat fails to
+even harder. Running in the highest-privilege root world, the      validate payload length, allowing a 64 KB over-read. Under
+Monitor is beyond the kernel’s reach: the OS cannot bypass         NANO Z ONE, since private keys reside in a protected domain,
+IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                            11
+
+
+
+this over-read provokes a hardware fault rather than leaking                                     TABLE IV
+secrets.                                                                           C OST OF BASIC NANO Z ONE OPERATIONS .
+   Control-flow hijacks exploit corruption to overwrite return                  L1        L2          L3         Ptr.      Ptr.            Hooked
+                                                                   Operation                                                      getpid
+addresses (e.g., CVE-2013-2028) or function pointers (e.g.,                    Switch    Switch      Switch     Backup    Check            getpid
+CVE-2021-44486). Consider CVE-2024-22857: a heap over-             Cycles       74.13    6,169.47   6,173.36     18.02    11.07   725.36   6,533.63
+flow in zlog’s zlog_rule_new allows a crafted configura-
+tion to overflow the record_name buffer and clobber the                                          TABLE V
+adjacent record_func pointer. NANO Z ONE prevents this                      AVERAGE DOMAIN - SWITCHING OVERHEAD ( CYCLES ) AND
+by validating function pointers against PIM-stored backups                            SWITCHING - LEVEL HIT RATES .
+
+on every indirect call, immediately terminating execution if       Domain Num.1            7          14         28       112      168       224
+tampering is detected.
+                                                                   Avg. Switch Cost      86.00      198.42     255.88    300.63   303.06   303.43
+   We designed two attacks to evaluate NANO Z ONE’s re-            L1-Zone Hit Rate2    100.00%     98.21%     97.32%    96.65%   96.58%   96.52%
+silience to privileged adversaries, and its defenses blocked       L2-Zone Hit Rate2     0.00%       1.79%      2.68%     2.68%    2.68%    2.68%
+                                                                   L3-Zone Hit Rate2     0.00%       0.00%      0.00%     0.67%    0.74%    0.78%
+both attempts. (1) We mapped the process page tables into
+                                                                    1 Domain Number refers to the number of domains assigned per core.
+kernel space and altered the domain’s PTEs, changing the            2 Hit Rate refers to the proportion of switches whose highest switching
+POE and PIE indexes so that the pages would lie in a region         level is L1, L2, or L3.
+with ordinary read/write permissions. The change immediately
+triggered a GPF. (2) While handling getpid, we modified
+the POE and PIE permission registers in the kernel to grant        can be reused and each PAS is referenced by a single block
+read access to a domain that should have been private. When        descriptor in the Level 0 (L0) table, only the L0 table needs
+control returned to user mode, code outside the domain still       to be duplicated per zone. In contrast, NANO Z ONE always
+could not access its memory because the Monitor had already        reuses the original two GPTs; each core simply programs
+restored the correct register values.                              its bypass-window register to open the PAS. Under a 25-
+                                                                   zone workload, this saves 100 KB of DRAM compared to
+             VII. P ERFORMANCE E VALUATION                         the baseline, while the performance overhead of L0-table
+A. Experimental Setup                                              duplication in the baseline is negligible (0.02%).
+                                                                   Domain Switching Cost. To quantify base overheads, we used
+   We evaluate NANO Z ONE on a Rockchip RK3399 board
+                                                                   the PMU to measure CPU cycles over one million iterations
+(Armv8-A) with two Cortex-A72 cores (1.8 GHz) and four
+                                                                   (Table IV). The results highlight a stark contrast: a lightweight
+Cortex-A53 cores (1.4 GHz), a standard configuration in prior
+                                                                   L1 switch consumes only 74.13 cycles, whereas privileged
+works [9], [8], [48]. To eliminate variability from the SoC’s
+                                                                   L2 and L3 transitions exceed 6,100 cycles. This disparity
+big.LITTLE design, we lock the Cortex-A72 cores at 1.8 GHz
+                                                                   motivates our locality-aware allocation strategy to maximize
+and disable the little cores. Note that core pinning is employed
+                                                                   inexpensive L1 transitions. We evaluated switching overhead
+strictly for benchmarking stability; NANO Z ONE naturally sup-
+                                                                   using twemperf [52] and varied the number of isolation
+ports standard OS scheduling, as the Monitor transparently
+                                                                   domains while maintaining a constant request rate. Domain
+manages hierarchical isolation states during context switches.
+                                                                   switches were strictly determined based on our allocation
+Our evaluation covers two vectors:
+                                                                   strategy. With up to 7 domains, the system maintains a 100%
+Micro-benchmarks. We first evaluate the efficiency of our
+                                                                   L1 hit rate, incurring just 86 cycles per switch (Table V).
+bypass-window optimization against per-PAS baselines. Sub-
+                                                                   As we scale to 28 domains, L2 transitions become necessary
+sequently, we dissect the overheads of domain switching, CPI
+                                                                   but remain infrequent; the L1 hit rate stays high at 98.21%,
+enforcement, and OS monitoring. Specifically, we measure the
+                                                                   keeping the average cost to 256 cycles. Even at a massive
+latency and hit rate of our three-tier switching logic, quantify
+                                                                   scale of 224 domains, L3 switches occur only 0.78% of the
+CPI costs using SPEC CPU2017 [50], and assess OS privilege
+                                                                   time. Consequently, the average switching overhead stabilizes
+de-escalation impact via lmbench [51].
+                                                                   at roughly 300 cycles, which is less than half the cost of a
+Real-world Applications. We validate NANO Z ONE’s practi-
+                                                                   standard getpid system call. We capped the evaluation at
+cality by hardening three systems: (1) Nginx (isolating SSL
+                                                                   224 domains because the performance trend stabilizes beyond
+keys), (2) Memcached (partitioning K-V pairs), and (3) a
+                                                                   this point, and this scale already exceeds the empirical evalu-
+persistent NVM data store.
+                                                                   ation of prior solutions: LightZone [32] evaluated a maximum
+                                                                   of 128 domains despite its higher theoretical limit.
+B. Evaluation on Micro-benchmarks                                  CPI Enforcement Overhead. Table IV confirms the efficiency
+Initialization Optimization. To quantify the benefits of our       of our CPI primitives (§IV-B): both backup and verification
+bypass-window design during setup, we reimplemented the            operations complete in under 20 cycles, benefiting from purely
+state-of-the-art per-PAS-per-GPT scheme from CAGE [48] as          user-space memory accesses. To assess the impact on high-
+a baseline. Both approaches construct the same OS GPT and          stress workloads, we utilized SPEC CPU2017 [50]. Due to the
+proc GPT (Figure 8), but diverge thereafter. In the baseline,      board’s 4 GB RAM constraint, we restricted our evaluation to
+each new L3-Zone requires cloning the proc GPT, marking            the C benchmarks from the SPEC rate2017 suite. We tested
+its PAS as normal (i.e., accessible), and assigning the copy to    three configurations: (1) GCS protection for return addresses,
+that zone. Note that the Level 1 (L1) tables in the proc GPT       (2) PIM backup for function pointers, and (3) integrated
+   IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                                                                    12
+
+
+
+                                                                                                              Native             NanoZone                          Hook+lwC (simulated)
+           25     Return Address Protection                                                                   Shelter (coarse-grained)
+Overhead (%)
+                  Function Pointer Protection
+                                                                                                                                                                   Hook+Bypass Window
+           20     Both
+           15                                                                                        8000                                             8000
+           10
+
+
+
+
+                                                                                  Throughput (req/sec)
+
+
+
+
+                                                                                                                                   Throughput (req/sec)
+            5                                                                                                                                         6000
+            0                                                                                        6000
+                 500.p 502.g 505.m 519.l 525.x 538.i 544.n 557.x
+                      erlbe cc
+                           nch    cf bm       264 magic ab       z
+                                                       k                                             4000                                             4000
+
+   Fig. 9. Performance overhead on the SPEC CPU2017 C benchmarks.                                    2000                                             2000
+
+                                                                                                         0 100 200 300 400 500                            0   1    2     4     8    16
+   protection for both.                                                                   (a) X-axis: number of concurrent clients                            (b) X-axis: file size (KB)
+      As illustrated in Figure 9, protecting return addresses (GCS)
+   incurs a moderate average overhead of 4.83%. Benchmarks                             Fig. 10. Comparison of Throughput Overhead on Nginx.
+   with small code footprints, such as 505.mcf (∼3K LoCs) and
+   519.lbm (∼1K LoCs), exhibit negligible impact. The highest
+   overhead is observed in 525.x264, attributed to its video en-                       total startup time is 74 ms under NANO Z ONE against 31 ms
+   coding workload which involves deeply nested loops and high-                        natively.
+   frequency function invocations during macroblock processing.
+   Protecting function pointers (PIM) results in a lower average
+                                                                                       C. Evaluation on Real-world Applications
+   overhead of 2.37% due to their relative infrequency. While
+   benchmarks like 538.imagick and 557.xz show minimal                                 Comparison Systems. We benchmark against native execution
+   impact, perlbench experiences a higher 7.52% overhead                               and three alternative schemes: (1) Shelter [9], representing
+   as its interpreter core relies heavily on function pointers for                     process-level isolation where all requests share a single address
+   opcode dispatch. Overall, the integrated protection introduces                      space; (2) Bypass-window-only, our baseline that maps each
+   an average overhead of 7.13%. We also tested Nginx and found                        domain to a bypass window and traps to the Monitor on
+   that CPI alone reduced throughput by just 1.61%, confirming                         every switch; and (3) lwC [27], adapted from FreeBSD with
+   its practicality in production settings.                                            overheads estimated for privileged emulation [53], [31]. We
+   Runtime Monitoring Impact. NANO Z ONE intercepts the                                use these case studies primarily to characterize performance
+   control flow between a protected process and the OS, in-                            and switching behavior under realistic workloads. We do
+   troducing additional overhead to kernel services the process                        not claim they provide complete end-to-end security against
+   relies on. Hooking the trivial getpid call adds about 5,808                         CIVs [54] without additional interface hardening.
+   cycles (Table IV), reflecting only the cost of trap entry/exit,                     Case Study 1: Server Application Protection. We inte-
+   context save-and-restore, and GPT switching that the Monitor                        grated NANO Z ONE into Nginx v1.26.3 linked with OpenSSL
+   performs (§IV-C). More complex syscalls demand extra work                           v3.3.4 [55], isolating each client’s SSL session key in a
+   from the Monitor, so we used lmbench v3.0-a9 [51] to profile                        separate domain [30] while enforcing strict domain-switch
+   the overall impact. As Table VI shows, monitoring adds less                         validations. The server was configured with two worker pro-
+   than 10 µs to most operations. The most expensive one is                            cesses and keep-alive enabled on our dual-core board to handle
+   mmap, at 36.6 ms; this reflects the Monitor validating and                          traffic from a remote ab [56] client. We evaluated throughput
+   updating page tables for the large region that this benchmark                       across two dimensions: (1) concurrency, varying clients from
+   repeatedly maps and unmaps, rather than a fixed per-call cost.                      100 to 500 (80 concurrent requests, 22 B payload); and (2)
+   To characterize the overhead on the path more relevant to                           payload size, ranging from 1 KB to 16 KB (300 clients).
+   application startup, which is dominated by anonymous map-                           Reported results represent the average of 50 repetitions under
+   pings, we further profiled an allocation-intensive workload that                    CPU saturation, where any instrumentation overhead directly
+   maps 64 MB of anonymous memory split across N mappings                              degrades throughput.
+   (N from 1 to 8,192) and write-touches every page. On the                               Figure 10(a) presents the results of the concurrency test.
+   mapping path, NANO Z ONE adds about 5.3 µs per call, with                           Overall, NANO Z ONE incurs a 21.84% average throughput
+   the average per-call cost being 2.1 µs natively and 7.4 µs under                    overhead. Compared to Shelter [9], which provides only priv-
+   NANO Z ONE. On the first-touch path, NANO Z ONE adds about                          ileged isolation, our finer-grained protection adds just 5.15%
+   0.09 µs per page. Even at the extreme of 8,192 mappings, the                        overhead, validating the efficiency of our three-tier zone de-
+                                                                                       sign. Further comparisons reinforce this advantage: relative to
+                                                                                       the bypass-window-only scheme, NANO Z ONE achieves 1.00%
+                                       TABLE VI
+                     LMBENCH PERFORMANCE OVERHEAD (µ S ).
+                                                                                       higher throughput, and it outperforms lwC [27] by 20.93%.
+                                                                                       These improvements stem from the fact that both of those
+                    null null      open/ select sig sig fork mmap page                 schemes trap to higher privilege levels on each domain switch.
+        System                stat
+                    call I/O       close TCP inst hndl proc   lat. fault               Figure 10(b) shows the file-size test results, which mirror the
+        Native      0.47 0.52 1.72 2.82         6.95 0.63 2.47 1.1K 13.2K 0.81         concurrency findings. Here, the overall average overhead is
+        N ANO Z ONE 3.70 4.85 8.17 11.4         11.5 3.94 7.88 12.0K 49.8K 1.14
+                                                                                       21.59%. Against Shelter, performance drops by 5.12%, while
+     IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                                        13
+
+
+
+                                   Native         NanoZone    Hook+lwC (simulated)                            Native         NanoZone     Hook+lwC (simulated)
+                                   Shelter (coarse-grained)   Hook+Bypass Window                              Shelter (coarse-grained)    Hook+Bypass Window
+                                                                                                    70
+                                                                                                    60
+Throughput (req/sec)
+
+
+
+                       24000                                                                        50
+
+
+
+
+                                                                                     Latency (ms)
+                       18000                                                                        40
+                                                                                                    30
+                       12000
+                                                                                                    20
+                        6000                                                                        10
+                           0                                                                         0    100 200 300 400 500 600 700 800 900 1000
+                               100 200 300 400 500 600 700 800 900 1000
+                                          Number of concurrent clients                                               Number of concurrent clients
+     Fig. 11. Comparison of Throughput Overhead on Memcached.                           Fig. 13. P95 latency on Memcached across concurrency levels.
+
+
+                                   Native         NanoZone    Hook+lwC (simulated)                             Native         NanoZone    Hook+lwC (simulated)
+                                   Shelter (coarse-grained)   Hook+Bypass Window                               Shelter (coarse-grained)   Hook+Bypass Window
+                                                                                                    130
+                                                                                                    120
+                                                                                                    110
+                                                                                                    100
+Throughput (req/sec)
+
+
+
+
+                       24000                                                                         90
+                                                                                     Latency (ms)    80
+                                                                                                     70
+                       18000
+                                                                                                     60
+                                                                                                     50
+                       12000                                                                         40
+                                                                                                     30
+                        6000                                                                         20
+                                                                                                     10
+                           0                                                                          0   100 200 300 400 500 600 700 800 900 1000
+                               100 200 300 400 500 600 700 800 900 1000                                               Number of concurrent clients
+                                          Number of concurrent clients
+                                                                                        Fig. 14. P99 latency on Memcached across concurrency levels.
+     Fig. 12. Throughput on Memcached under round-robin domain allocation.
+
+
+
+     throughput improves by 1.76% and 17.70% over the bypass-                           confines the vast majority of operations to user space, thereby
+     window-only scheme and lwC, respectively.                                          avoiding the costly privileged transitions that penalize the
+     Case Study 2: In-Memory Key-Value Shielding. We eval-                              other approaches.
+     uated NANO Z ONE on Memcached v1.6.31 [57] to quantify                                To examine NANO Z ONE under frequent privileged switches,
+     the overhead of partitioning a high-performance in-memory                          we repeated this experiment with round-robin domain allo-
+     key-value store. The server was configured with a 512 MB                           cation, leaving all other settings unchanged. This allocation
+     preallocated heap, where each client’s key-value pairs were                        scatters each thread’s domains across L2- and L3-Zones and
+     isolated in a dedicated domain protected by trampoline-based                       lowers the L1 hit rate to 77.29% across 100–1,000 con-
+     access controls. Running with two worker threads, the server                       nections. At 1,000 connections, the number of L2 and L3
+     handled traffic generated by a remote twemperf [52] client.                        switches is 6.6× that at 100 connections. Figure 12 illustrates
+     The workload consisted of 100–1,000 connections, each is-                          the resulting throughput. Compared to Shelter, the average
+     suing 30 concurrent requests for 12-byte keys and 64-byte                          drop grows only from 4.77% under the default allocation
+     values. We report the average throughput computed from 300                         to 7.14%, and is 5.72% at 1,000 connections. NANO Z ONE
+     repetitions under full CPU saturation.                                             still outperforms the bypass-window-only baseline at every
+        Figure 11 illustrates the throughput comparison.                                concurrency level.
+     NANO Z ONE incurs a moderate average overhead of 21.06%                               We also measured tail latency, which is a primary concern
+     relative to native execution, reaching about 24.6% under                           for server workloads. Figure 13 and Figure 14 report P95 and
+     high load. Notably, the majority of this cost is inherent                          P99 latency across concurrency levels. Both percentiles grow
+     to the baseline privileged isolation (§IV-C): compared to                          smoothly and monotonically with load, and NANO Z ONE’s
+     Shelter [9], NANO Z ONE retains 95.23% of the throughput.                          P99 stays at 1.68×–1.84× its P95 throughout, indicating
+     In contrast, NANO Z ONE significantly outperforms alternative                      a well-behaved tail without sporadic slowdowns. At 1,000
+     intra-process isolation schemes, achieving 26.60% and                              connections, NANO Z ONE’s P99 is 36.2ms, close to Shelter’s
+     90.99% higher throughput than the bypass-window-only                               32.1ms and far below the schemes that trap on every switch,
+     baseline and lwC [27], respectively. These gains validate our                      whose tails grow much faster (lwC reaches 124.8ms). The
+     domain-allocation optimization (§IV-A), which successfully                         absolute values are governed mainly by request queuing under
+     IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                                                        14
+
+
+
+                                Native           Shelter (coarse-grained)                 NanoZone             Hook+Bypass Window                        Hook+lwC (simulated)
+                                                                   1.00
+
+
+
+
+                                                               Throughout (Mops/s)
+
+
+
+
+                                                                                                                           Throughout (Mops/s)
+Throughout (Kops/s)
+
+                  7.0                                                            0.75                                                        4
+                  6.5       7.175                                                0.50      0.750
+                            7.150                                                          0.725                                             2
+                  6.0       7.125                                                0.25                   55      60
+                                   110 120
+                                                                                 0.00 0                                                      0
+                        0     50     100      150           200                           50     100      150        200                         0   50     100      150        200
+                               Number of Domains                                           Number of Domains                                          Number of Domains
+                                (a) Linked List test                                        (b) B+ Tree test                                          (c) Hashtable test
+
+     Fig. 15. Data-structure benchmarks: (a) linked list (20 KB per domain); (b) B+ tree (5 MB per domain); (c) hash table (20 KB per domain).
+
+
+
+     high concurrency, which affects all schemes once throughput                                   expensive L2/L3 one. This reveals at most whether a switch
+     saturates; the marginal contribution of NANO Z ONE’s fine-                                    left the current L2-Zone, not which of the 28 domains in a
+     grained isolation over the coarse-grained Shelter baseline stays                              zone was accessed, a signal far coarser than domain identity.
+     within about 4.2 ms across the range.                                                         For denial of service, a switch at any tier writes only registers
+     Case Study 3: NVM Data Isolation. To mitigate risks when                                      on the executing core, and the global lock is taken when an L3-
+     mapping NVM directly into a process, we evaluate intra-                                       Zone is allocated or destroyed, never on the switching path. A
+     process isolation using emulated NVM [58], [59] and three                                     client issuing frequent expensive switches therefore exercises
+     standard data-structure benchmarks [31] (linked list, B+ tree,                                only the lock-free switching path and cannot block other cores
+     hash table). We measured throughput by switching domains                                      by holding a shared lock. Lock contention is confined to zone
+     before and after each random query, varying domain counts                                     allocation and destruction, whose rate is set by connection
+     from 1 to 200 with over 1,000 repetitions per query.                                          establishment rather than by request processing. A client also
+        Figure 15 illustrates that protection overhead is inversely                                cannot select its own tier, since placement is decided by the
+     proportional to query latency. NANO Z ONE incurs negligible                                   Monitor’s affinity-based allocation and OS scheduling rather
+     overhead (0.21%) on the compute-intensive linked list, rising                                 than by the client. Moreover, NANO Z ONE audits the load path
+     to 9.09% for the B+ tree and 30.68% for the fast hash table,                                  through the Monitor, which enforces layout and instruction-
+     where domain switching dominates execution time. However,                                     level invariants before delegation (§VI-B); verifying the image
+     NANO Z ONE’s optimized switching significantly outperforms                                    content against the tenant’s intended binary additionally re-
+     baselines that rely on privileged traps. In the linked-list                                   quires a trusted reference measurement. Full measurement and
+     benchmark, the bypass-window-only scheme and lwC [27]                                         remote attestation form an orthogonal direction. The Monitor’s
+     incur 5.01% and 22.61% higher overhead, respectively. These                                   load-path intervention provides a natural attachment point for
+     gaps widen dramatically for memory-bound workloads: on the                                    such a mechanism, which we leave to future work.
+     B+ tree, their overheads are 4.82× and 21.55× greater than                                    Deployment Boundaries. Four practical constraints limit im-
+     NANO Z ONE’s, reaching 24.22× and 108.92× for the hash ta-                                    mediate deployment. First, NANO Z ONE depends on POE/PIE,
+     ble. In contrast, Shelter [9] maintains near-native performance                               GCS, and GPC3, which are not yet available on any commer-
+     (max 2.30% drop) due to low system-call reliance. Compared                                    cial SoC. Our performance prototype emulates these features
+     to Shelter, NANO Z ONE’s fine-grained isolation cost is minimal                               on a Rockchip RK3399 board. Native hardware will eliminate
+     for slow queries (0.05% on linked list) but noticeable for faster                             the two-stage trap path that dominates our switching estimates
+     ones, reaching 8.59% on the B+ tree and 29.04% on the hash                                    and reduce reported overheads accordingly. On transitional
+     table.                                                                                        hardware that lacks GCS or GPC3, NANO Z ONE remains
+                                                                                                   deployable, but with weaker security guarantees. GPC3 can
+                    VIII. D ISCUSSION & L IMITATION                                                be emulated using a per-PAS-per-GPT scheme, at the cost
+     Security Boundaries. NANO Z ONE’s type-ID mechanism de-                                       of losing the fail-closed property provided by our single-
+     rives a per-function-signature hash via SHAKE-128, enabling                                   GPT design (§IV-A). Similarly, GCS can be replaced with
+     fine-grained validation at each indirect call site and substan-                               Armv8.3 Pointer Authentication [60], [61], though this leaves
+     tially shrinking the set of admissible targets compared to                                    the backward edge vulnerable to pointer-reuse attacks. Second,
+     coarse-grained mechanisms such as Arm BTI [24]. Same-                                         NANO Z ONE’s L3-Zone design requires physically contigu-
+     type reuse remains a residual limitation: an attacker may still                               ous memory of 1 GB to 64 GB via the Linux CMA. Even
+     redirect execution to a legitimate target with a matching type                                with early boot reservation, large allocations may still fail if
+     signature, an inherent constraint of type-based forward-edge                                  pinned or unmovable pages block compaction, or if internal
+     CFI. Additionally, microarchitectural side-channel and denial-                                fragmentation leaves no sufficiently large free extent. In that
+     of-service attacks remain outside NANO Z ONE’s threat model                                   case, the application can be split into multiple processes
+     (§III), as in comparable systems, but the tiered design warrants                              that each use at most seven domains, so that no L3-Zone
+     a brief discussion of both. For timing side channels, an L2                                   is needed. Each switch between these processes, however,
+     and an L3 switch have almost identical cost (Table IV), so                                    passes through the Monitor and costs at least as much as
+     execution timing separates only a fast L1 switch from an                                      an L2/L3 switch (Table IV). The number of processes also
+IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                     15
+
+
+
+grows with the number of principals, and data shared across         OS Security Monitors. A range of systems interpose a trusted
+them must be split or shared through the Monitor. Third,            layer at a higher privilege level to protect applications from
+NANO Z ONE requires recompilation with a modified LLVM              an untrusted OS. Hypervisor-based designs such as Over-
+toolchain to instrument function pointers and strip unsafe          shadow [69] and InkTag [70] shield an application’s memory
+instructions, which precludes protection of pre-built binaries      from the OS. However, they protect the application as a single
+and introduces a dependency on a trusted build environment.         unit, leaving its interior exposed, and add a full hypervisor
+Fourth, code pages are fixed at launch. After delegation, the       to the TCB. Others reduce the trusted stack using hardware
+Monitor denies any transition of a page to executable (§IV-C).      modifications [71] or platform-specific mechanisms such as
+Runtime code loading such as dlopen or JIT compilation              AMD VMPLs [14], [15]. For designs built on Arm CCA
+is therefore unsupported. This is a deliberate trade-off that       primitives, placing the monitor at Realm EL2 is suboptimal
+closes the runtime code-injection surface. Our evaluated server     because it pulls the complex RMM into the TCB. NANO Z ONE
+workloads load all modules at startup and are unaffected.           departs from these in two ways. First, it enforces a fine-
+Performance Boundaries. NANO Z ONE’s low overhead relies            grained boundary within the process, closing the intra-process
+on request locality keeping the majority of domain switches         gap these systems leave open. Second, it anchors security in
+in the user-space L1 tier. For workloads whose access pattern       a minimal root-world monitor at EL3, rather than trusting
+lacks such locality, where consecutive operations scatter across    a hypervisor or the RMM. Unlike RContainer [8], which
+many domains, the share of privileged L2 and L3 switches            offloads some tasks to a mini-OS to reduce root-world usage,
+rises and the average switching cost increases accordingly (see     NANO Z ONE consolidates critical enforcement in the monitor
+§VII-C for a round-robin stress test); the locality-aware alloca-   to maintain a single, minimal root of trust.
+tion (§IV-A) is therefore most effective when requests exhibit      CCA-based Isolation. Shelter [9] provides process-level CCA
+the temporal locality typical of per-connection server work-        isolation, but treats each application as a single protection
+loads. Furthermore, NANO Z ONE intercepts memory-mapping            unit. As a result, it provides no intra-process separation and
+operations, so workloads dominated by repeated mapping              leaves the application interior unprotected. NANO Z ONE adds
+and unmapping of large shared regions incur higher Moni-            this interior boundary at a small marginal cost, only 5.2%
+tor overhead (§VII-B). It is therefore best suited to server        over Shelter (§VII-C). Other systems apply CCA primitives
+applications whose bottleneck lies in compute or network            in different directions. CAGE [48] and Portal [49] use them
+I/O. Allocation-intensive startup nonetheless remains bounded       for confidential GPU computing and secure device access.
+(§VII-B), and pre-allocating memory pools via zone_alloc            Closest to our work is HiveTEE [33], a concurrent system
+further reduces mapping frequency.                                  that, like NANO Z ONE, reuses GPTs to scale domains be-
+                                                                    yond a fixed hardware limit, virtualizing MTE tags where
+                                                                    NANO Z ONE virtualizes POE/PIE indexes. The key difference
+                    IX. R ELATED W ORK
+                                                                    is the switching path: every HiveTEE domain entry is mediated
+MPK-based Mechanisms. Intel MPK has become the stan-                by the Monitor, whereas NANO Z ONE performs most switches
+dard primitive for fast intra-process isolation on x86, and has     in user space (Table V). Because these user-space gates grant
+been used to secure language runtimes [62], [63], compart-          permissions to the calling thread, NANO Z ONE must enforce
+mentalize OS components [64], [65], and optimize process            CPI on the path leading to them (§IV-B) and shield the entire
+abstractions [66], [53]. A separate line of work scales MPK         process from the OS. HiveTEE validates entries but leaves
+beyond its domain limit, by modifying hardware, evicting and        CFI to orthogonal work, and shields only annotated functions,
+reusing domain IDs, or reusing IDs through virtualization-level     which keeps its overhead below 3% but leaves the rest of the
+page tables (§II-B). NANO Z ONE differs in two respects. First,     application untrusted. HiveTEE’s MTE tags, in turn, offer 16-
+it reuses POE/PIE indexes across distinct physical address          byte granularity but must be forced on every memory access
+spaces through GPT, rather than through extra tables or ID          through instrumentation.
+eviction. Second, unlike schemes that depend on a trusted OS
+or hypervisor to manage these structures, it anchors enforce-                               X. C ONCLUSION
+ment in the root-world Monitor and stays secure under an               Arm CCA isolates software only at VM granularity, leaving
+adversarial kernel. More broadly, these advances rely on x86-       applications exposed to a compromised OS and to vulner-
+specific hardware, whereas NANO Z ONE delivers an equally           abilities in their own code. NANO Z ONE addresses both by
+lightweight facility on Arm.                                        protecting normal-world processes from a minimal root-world
+Hardware-assisted Control-flow Integrity. While x86 lever-          monitor and partitioning them into fine-grained domains. It
+ages Intel CET for native shadow stacks [67], Arm architec-         combines POE, PIE, and GPT into a three-tier hierarchy, keeps
+tures long lacked an equivalent hardware mechanism. Prior           most domain switches in user space through locality-aware
+works approximated this functionality using Pointer Authenti-       allocation, and protects the switch paths with CPI. Across our
+cation (e.g., PARTS [60], PACTight [61]) or PAN extensions          server case studies, this fine-grained protection costs about 5%
+(e.g., PANIC [68]), but these approaches remain susceptible to      over process-level isolation.
+pointer reuse or incur substantial complexity. With the advent
+of Armv9, NANO Z ONE is the first to leverage the native                                       R EFERENCES
+Guarded Control Stack (GCS) to enforce strict, bidirectional         [1] AMD, “AMD secure encrypted virtualization (SEV),” 2023, https://ww
+control-flow integrity.                                                  w.amd.com/en/developer/sev.html.
+IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                                        16
+
+
+
+ [2] Intel, “Intel trust domain extensions (Intel TDX),” 2023, https://www.in    [24] ——, “Arm® architecture reference manual for A-profile architecture,”
+     tel.com/content/www/us/en/developer/articles/technical/intel-trust-dom           2024, https://developer.arm.com/documentation/ddi0487/latest/.
+     ain-extensions.html.                                                        [25] H. Shacham, “The geometry of innocent flesh on the bone: return-into-
+ [3] Arm, “Confidential compute architecture,” 2023, https://www.arm.com/             libc without function calls (on the x86),” in Proceedings of the 14th
+     architecture/security-features/arm-confidential-compute-architecture.            ACM conference on Computer and communications security, 2007, pp.
+ [4] K. Zeng, Z. Lin, K. Lu, X. Xing, R. Wang, A. Doupé, Y. Shoshitaishvili,         552–561.
+     and T. Bao, “RetSpill: Igniting user-controlled data to burn away Linux     [26] Intel, “Complex shadow-stack updates (Intel control-flow enforcement
+     kernel protections,” in Proceedings of the 2023 ACM SIGSAC Confer-               technology),” 2023, https://www.intel.com/content/www/us/en/conten
+     ence on Computer and Communications Security, 2023, pp. 3093–3107.               t-details/785687/complex-shadow-stack-updates-intel-control-flow-enf
+ [5] Z. Lin, Y. Wu, and X. Xing, “DirtyCred: Escalating privilege in Linux            orcement-technology.html.
+     kernel,” in Proceedings of the 2022 ACM SIGSAC Conference on                [27] J. Litton, A. Vahldiek-Oberwagner, E. Elnikety, D. Garg, B. Bhattachar-
+     Computer and Communications Security, 2022, pp. 1963–1976.                       jee, and P. Druschel, “Light-Weight contexts: An OS abstraction for
+ [6] Z. Durumeric, F. Li, J. Kasten, J. Amann, J. Beekman, M. Payer,                  safety and performance,” in 12th USENIX Symposium on Operating
+     N. Weaver, D. Adrian, V. Paxson, M. Bailey et al., “The matter                   Systems Design and Implementation (OSDI 16), 2016, pp. 49–64.
+     of Heartbleed,” in Proceedings of the 2014 conference on internet           [28] A. Voulimeneas, J. Vinck, R. Mechelinck, and S. Volckaert, “You shall
+     measurement conference, 2014, pp. 475–488.                                       not (by)pass!: practical, secure, and fast PKU-based sandboxing,” in
+ [7] D. Kuvaiskii, D. Stavrakakis, K. Qin, C. Xing, P. Bhatotia, and M. Vij,          Proceedings of the Seventeenth European Conference on Computer
+     “Gramine-TDX: A lightweight OS kernel for confidential VMs,” in                  Systems, 2022, pp. 266–282.
+     Proceedings of the 2024 on ACM SIGSAC Conference on Computer                [29] D. Schrammel, S. Weiser, S. Steinegger, M. Schwarzl, M. Schwarz,
+     and Communications Security, 2024, pp. 4598–4612.                                S. Mangard, and D. Gruss, “Donky: Domain keys – efficient In-Process
+ [8] Q. Zhou, W. Cao, X. Jia, P. Liu, S. Zhang, J. Chen, S. Xu, and Z. Song,          isolation for RISC-V and x86,” in 29th USENIX Security Symposium
+     “RContainer: A secure container architecture through extending ARM               (USENIX Security 20), 2020, pp. 1677–1694.
+     CCA hardware primitives,” in NDSS, 2025.                                    [30] S. Park, S. Lee, W. Xu, H. Moon, and T. Kim, “libmpk: Software
+ [9] Y. Zhang, Y. Hu, Z. Ning, F. Zhang, X. Luo, H. Huang, S. Yan, and                abstraction for Intel memory protection keys (Intel MPK),” in 2019
+     Z. He, “SHELTER: Extending Arm CCA with isolation in user space,”                USENIX Annual Technical Conference (USENIX ATC 19), 2019, pp.
+     in 32nd USENIX Security Symposium (USENIX Security 23), 2023, pp.                241–254.
+     6257–6274.                                                                  [31] J. Gu, H. Li, W. Li, Y. Xia, and H. Chen, “EPK: Scalable and efficient
+[10] Intel, “Intel® software guard extensions (Intel® SGX),” 2023, https:             memory protection keys,” in 2022 USENIX Annual Technical Conference
+     //www.intel.com/content/www/us/en/products/details/processors/xeon/f             (USENIX ATC 22), 2022, pp. 609–624.
+     eatures/software-guard-extensions.html.                                     [32] Z. Yuan, S. Hong, R. Guo, R. Chang, M. Gao, W. Shen, and
+[11] J. Park, N. Kang, T. Kim, Y. Kwon, and J. Huh, “Nested enclave:                  Y. Zhou, “LightZone: Lightweight hardware-assisted in-process isolation
+     Supporting fine-grained hierarchical isolation with SGX,” in 2020                for ARM64,” in Proceedings of the 25th International Middleware
+     ACM/IEEE 47th Annual International Symposium on Computer Archi-                  Conference, 2024, pp. 467–480.
+     tecture (ISCA). IEEE, 2020, pp. 776–789.                                    [33] H. Huang and F. Zhang, “HiveTEE: Scalable and fine-grained isolated
+[12] J. Gu, B. Zhu, M. Li, W. Li, Y. Xia, and H. Chen, “A Hardware-Software           domains with RME and MTE co-assisted,” IEEE Transactions on
+     co-design for efficient Intra-Enclave isolation,” in 31st USENIX Security        Information Forensics and Security, vol. 21, pp. 2300–2312, 2026.
+     Symposium (USENIX Security 22), 2022, pp. 3129–3145.                        [34] S. Checkoway and H. Shacham, “Iago attacks: why the system call
+[13] Intel, “Intel® 64 and IA-32 architectures software developer manuals,”           API is a bad untrusted RPC interface,” ACM SIGARCH Computer
+     2024, https://www.intel.com/content/www/us/en/developer/articles/tec             Architecture News, vol. 41, no. 1, pp. 253–264, 2013.
+     hnical/intel-sdm.html.                                                      [35] T. Bletsch, X. Jiang, V. W. Freeh, and Z. Liang, “Jump-oriented
+[14] W. Wang, L. Song, B. Mei, S. Liu, S. Zhao, S. Yan, X. Wang, D. Meng,             programming: a new class of code-reuse attack,” in Proceedings of
+     and R. Hou, “The road to trust: Building enclaves within confidential            the 6th ACM symposium on information, computer and communications
+     VMs,” in NDSS, 2025.                                                             security, 2011, pp. 30–40.
+[15] A. Ahmad, B. Ou, C. Liu, X. Zhang, and P. Fonseca, “Veil: A protected       [36] D. Lee, D. Jung, I. T. Fang, C.-C. Tsai, and R. A. Popa, “An Off-Chip
+     services framework for confidential virtual machines,” in Proceedings            attack on hardware enclaves via the memory bus,” in 29th USENIX
+     of the 28th ACM International Conference on Architectural Support for            Security Symposium (USENIX Security 20), 2020, pp. 487–504.
+     Programming Languages and Operating Systems, Volume 4, 2023, pp.            [37] S. F. Yitbarek, M. T. Aga, R. Das, and T. Austin, “Cold boot attacks are
+     378–393.                                                                         still hot: Security analysis of memory scramblers in modern processors,”
+[16] V. A. Sartakov, L. Vilanova, D. Eyers, T. Shinagawa, and P. Pietzuch,            in 2017 IEEE International Symposium on High Performance Computer
+     “CAP-VMs: Capability-Based isolation and sharing in the cloud,” in               Architecture (HPCA). IEEE, 2017, pp. 313–324.
+     16th USENIX Symposium on Operating Systems Design and Implemen-             [38] Y. Kim, R. Daly, J. Kim, C. Fallin, J. H. Lee, D. Lee, C. Wilkerson,
+     tation (OSDI 22), 2022, pp. 597–612.                                             K. Lai, and O. Mutlu, “Flipping bits in memory without accessing them:
+[17] R. N. Watson, J. Woodruff, P. G. Neumann, S. W. Moore, J. Anderson,              An experimental study of DRAM disturbance errors,” ACM SIGARCH
+     D. Chisnall, N. Dave, B. Davis, K. Gudka, B. Laurie et al., “CHERI: A            Computer Architecture News, vol. 42, no. 3, pp. 361–372, 2014.
+     hybrid capability-system architecture for scalable software compartmen-     [39] M. Lipp, M. Schwarz, D. Gruss, T. Prescher, W. Haas, J. Horn, S. Man-
+     talization,” in 2015 IEEE Symposium on Security and Privacy. IEEE,               gard, P. Kocher, D. Genkin, Y. Yarom, M. Hamburg, and R. Strackx,
+     2015, pp. 20–37.                                                                 “Meltdown: reading kernel memory from user space,” Communications
+[18] Y. Chen, S. Reymondjohnson, Z. Sun, and L. Lu, “Shreds: Fine-grained             of the ACM, vol. 63, no. 6, pp. 46–56, 2020.
+     execution units with private memory,” in 2016 IEEE Symposium on             [40] P. Kocher, J. Horn, A. Fogh, D. Genkin, D. Gruss, W. Haas, M. Ham-
+     Security and Privacy (SP). IEEE, 2016, pp. 56–71.                                burg, M. Lipp, S. Mangard, T. Prescher et al., “Spectre attacks: exploit-
+[19] Y. Zhou, X. Wang, Y. Chen, and Z. Wang, “ARMlock: Hardware-based                 ing speculative execution,” Communications of the ACM, vol. 63, no. 7,
+     fault isolation for ARM,” in Proceedings of the 2014 ACM SIGSAC                  pp. 93–101, 2020.
+     conference on computer and communications security, 2014, pp. 558–          [41] Y. Liu, T. Zhou, K. Chen, H. Chen, and Y. Xia, “Thwarting memory
+     569.                                                                             disclosure with efficient hypervisor-enforced intra-domain isolation,” in
+[20] Arm, “Permission indirection and permission overlay extensions,” 2024,           Proceedings of the 22nd ACM SIGSAC Conference on Computer and
+     https://developer.arm.com/documentation/102376/0200/Permission-ind               Communications Security, 2015, pp. 1607–1619.
+     irection-and-permission-overlay-extensions.                                 [42] K. Dinh Duy, K. Cho, T. Noh, and H. Lee, “Capacity: Cryptographically-
+[21] S. Liu, Z. Jiang, J. Wang, W. Zhou, K. Sun, Z. Chen, and Y. Xie,                 enforced in-process capabilities for modern ARM architectures,” in
+     “More granular, less trust: Enforcing intra-process isolation with Arm           Proceedings of the 2023 ACM SIGSAC Conference on Computer and
+     CCA in an untrusted management environment,” IEEE Transactions on                Communications Security, 2023, pp. 874–888.
+     Information Forensics and Security, vol. 20, pp. 12 507–12 522, 2025.       [43] H. Lefeuvre, N. Dautenhahn, D. Chisnall, and P. Olivier, “SoK: Soft-
+[22] Arm, “Learn the architecture - Realm management extension guide,”                ware compartmentalization,” in 2025 IEEE Symposium on Security and
+     2023, https://developer.arm.com/documentation/den0126/latest.                    Privacy (SP). IEEE, 2025, pp. 3107–3126.
+[23] ——, “Granule protection check bypass window register (EL3),” 2024,          [44] Arm, “Arm Cortex-X925 core technical reference manual,” 2024, https:
+     https://developer.arm.com/documentation/ddi0601/2024-12/AArch64-R                //developer.arm.com/documentation/102807/latest/.
+     egisters/GPCBW-EL3--Granule-Protection-Check-Bypass-Window-R                [45] ——, “Fixed virtual platforms,” 2023, https://support.arm.com/tools-a
+     egister--EL3-.                                                                   nd-software/fixed-virtual-platforms.
+IEEE TRANSACTIONS ON DEPENDABLE AND SECURE COMPUTING                                                                                                      17
+
+
+
+[46] Linux Foundation, “Patchwork - the Linux kernel archives,” 2024, https:     [69] X. Chen, T. Garfinkel, E. C. Lewis, P. Subrahmanyam, C. A. Wald-
+     //patchwork.kernel.org/.                                                         spurger, D. Boneh, J. Dwoskin, and D. R. Ports, “Overshadow: a
+[47] Radxa, “ROCK 4B,” 2024, https://radxa.com/products/rock4/4b/.                    virtualization-based approach to retrofitting protection in commodity
+[48] C. Wang, F. Zhang, Y. Deng, K. Leach, J. Cao, Z. Ning, S. Yan, and               operating systems,” ACM SIGOPS Operating Systems Review, vol. 42,
+     Z. He, “CAGE: Complementing Arm CCA with GPU extensions,” in                     no. 2, pp. 2–13, 2008.
+     Proceedings of the 31st Annual Network and Distributed System Security      [70] O. S. Hofmann, S. Kim, A. M. Dunn, M. Z. Lee, and E. Witchel,
+     Symposium, 2024.                                                                 “InkTag: secure applications on an untrusted operating system,” in
+[49] F. Sang, J. Lee, X. Zhang, and T. Kim, “Portal: Fast and secure device           Proceedings of the eighteenth international conference on Architectural
+     access with Arm CCA for modern Arm mobile system-on-chips (SoCs),”               support for programming languages and operating systems, 2013, pp.
+     in 2025 IEEE Symposium on Security and Privacy (SP). IEEE, 2025,                 265–278.
+     pp. 4099–4116.                                                              [71] Y. Song, B. Woo, Y. Han, and B. B. Kang, “Interstellar: Fully par-
+[50] Standard Performance Evaluation Corporation, “SPEC CPU® 2017                     titioned and efficient security monitoring hardware near a processor
+     benchmark,” 2025, https://www.spec.org/cpu2017/.                                 core for protecting systems against attacks on privileged software,” in
+[51] L. McVoy and C. Staelin, “LMbench - tools for performance analysis,”             Proceedings of the 2024 on ACM SIGSAC Conference on Computer and
+     2025, https://lmbench.sourceforge.net/.                                          Communications Security, 2024, pp. 198–212.
+[52] Twitter, “A tool for measuring memcached server performance,” 2024,
+     https://github.com/twitter-archive/twemperf/.
+[53] A. Vahldiek-Oberwagner, E. Elnikety, N. O. Duarte, M. Sammler,
+     P. Druschel, and D. Garg, “ERIM: Secure, efficient in-process isolation
+     with protection keys (MPK),” in 28th USENIX Security Symposium
+     (USENIX Security 19), 2019, pp. 1221–1238.
+[54] H. Lefeuvre, V.-A. Bădoiu, Y. Chen, F. Huici, N. Dautenhahn, and
+     P. Olivier, “Assessing the impact of interface vulnerabilities in com-
+     partmentalized software,” in Network and Distributed System Security
+     Symposium (NDSS), 2023.                                                                             Shiqi Liu received the B.S. degree in Cyber Science
+[55] OpenSSL Foundation, “OpenSSL library,” 2024, https://www.openssl.                                   and Engineering from the University of Interna-
+     org/.                                                                                               tional Relations, Beijing, China, in 2022, and the
+[56] Apache Software Foundation, “ab - Apache HTTP server benchmarking                                   M.S. degree in Cyber Science and Engineering from
+     tool,” 2024, https://httpd.apache.org/docs/current/programs/ab.html.                                Huazhong University of Science and Technology,
+[57] A. Vorobey, B. Fitzpatrick, and A. D. Kasindorf, “memcached - a dis-                                Wuhan, China, in 2025. His research interests in-
+     tributed memory object caching system,” 2024, https://memcached.org/.                               clude hardware–software co-design and verification.
+[58] Y. Xu, Y. Solihin, and X. Shen, “MERR: Improving security of persistent
+     memory objects via efficient memory exposure reduction and random-
+     ization,” in Proceedings of the Twenty-Fifth International Conference
+     on Architectural Support for Programming Languages and Operating
+     Systems, 2020, pp. 987–1000.
+[59] Y. Xu, C. Ye, Y. Solihin, and X. Shen, “Hardware-based domain
+     virtualization for intra-process isolation of persistent memory objects,”
+     in 2020 ACM/IEEE 47th Annual International Symposium on Computer                                    Yongpeng Gao received his B.S. and M.S. degrees
+     Architecture (ISCA). IEEE, 2020, pp. 680–692.                                                       from the School of Cyber Science and Engineering,
+[60] H. Liljestrand, T. Nyman, K. Wang, C. C. Perez, J.-E. Ekberg, and                                   Huazhong University of Science and Technology,
+     N. Asokan, “PAC it up: Towards pointer integrity using ARM pointer                                  Wuhan, China, in 2023 and 2026, respectively. His
+     authentication,” in 28th USENIX Security Symposium (USENIX Security                                 research interests include system security and soft-
+     19), 2019, pp. 177–194.                                                                             ware security.
+[61] M. Ismail, A. Quach, C. Jelesnianski, Y. Jang, and C. Min, “Tightly
+     seal your sensitive pointers with PACTight,” in 31st USENIX Security
+     Symposium (USENIX Security 22), 2022, pp. 3717–3734.
+[62] P. Kirth, M. Dickerson, S. Crane, P. Larsen, A. Dabrowski, D. Gens,
+     Y. Na, S. Volckaert, and M. Franz, “PKRU-safe: automatically locking
+     down the heap between safe and unsafe languages,” in Proceedings of
+     the Seventeenth European Conference on Computer Systems, 2022, pp.
+     132–148.
+[63] H. Lei, Z. Zhang, S. Zhang, P. Jiang, Z. Zhong, N. He, D. Li, Y. Guo, and                           Mingyang Zhang received his B.S. degree in
+     X. Chen, “Put your memory in order: Efficient domain-based memory                                   the School of Cyber Science and Engineering,
+     isolation for WASM applications,” in Proceedings of the 2023 ACM                                    Huazhong University of Science and Technology,
+     SIGSAC Conference on Computer and Communications Security, 2023,                                    Wuhan, China, in 2024. He is currently working
+     pp. 904–918.                                                                                        toward an M.S. degree at the same institution. His
+[64] H. Lefeuvre, V.-A. Bădoiu, A. Jung, S. L. Teodorescu, S. Rauch,                                    research interests include system security and soft-
+     F. Huici, C. Raiciu, and P. Olivier, “FlexOS: towards flexible OS                                   ware security.
+     isolation,” in Proceedings of the 27th ACM International Conference
+     on Architectural Support for Programming Languages and Operating
+     Systems, 2022, pp. 467–482.
+[65] H. Lu, S. Wang, Y. Wu, W. He, and F. Zhang, “MOAT: Towards safe
+     BPF kernel extension,” in 33rd USENIX Security Symposium (USENIX
+     Security 24), 2024, pp. 1153–1170.
+[66] J. Lin, Y. Chen, S. Gao, and Y. Lu, “Fast core scheduling with
+     userspace process abstraction,” in Proceedings of the ACM SIGOPS 30th                               Jie Wang received his Ph.D. degree from the Uni-
+     Symposium on Operating Systems Principles, 2024, pp. 280–295.                                       versity of Chinese Academy of Sciences (UCAS) in
+[67] L. Maar, P. Nasahl, and S. Mangard, “Beyond the edges of kernel                                     2021. He was a visiting scholar at George Mason
+     control-flow hijacking protection with HEK-CFI,” in Proceedings of the                              University and is currently an Associate Profes-
+     19th ACM Asia Conference on Computer and Communications Security,                                   sor at the School of Cyber Science and Engineer-
+     2024, pp. 1214–1230.                                                                                ing, Huazhong University of Science and Technol-
+[68] J. Xu, M. Xie, C. Wu, Y. Zhang, Q. Li, X. Huang, Y. Lai, Y. Kang,                                   ogy. His research interests include system security,
+     W. Wang, Q. Wei et al., “PANIC: PAN-assisted intra-process memory                                   trusted computing, and trusted AI accelerators.
+     isolation on ARM,” in Proceedings of the 2023 ACM SIGSAC Confer-
+     ence on Computer and Communications Security, 2023, pp. 919–933.
+

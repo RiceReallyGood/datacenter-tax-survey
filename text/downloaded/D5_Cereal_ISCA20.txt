@@ -1,0 +1,2802 @@
+A Specialized Architecture for Object Serialization
+with Applications to Big Data Analytics
+Jaeyoung Jang†
+
+Sung Jun Jung‡
+
+Hoon Shin‡
+
+Tae Jun Ham‡
+
+† Sungkyunkwan University
+
+jaey86@skku.edu
+
+Sunmin Jeong‡
+
+Jun Heo‡
+
+Jae W. Lee‡
+
+‡ Seoul National University
+
+{miguel92, sunnyday0208, j.heo, zmqp, taejunham, jaewlee}@snu.ac.kr
+
+[41]. According to Google, serialization, along with other lowlevel operations like memory allocation, compression, and
+network stack processing, consumes 20-25% of total CPU
+cycles as "datacenter tax" [9].
+Unfortunately, existing S/D libraries still have relatively low
+throughput for various reasons. For example, the Java built-in
+serializer (Java S/D) embeds type strings (e.g., class and field
+names) in a string format to require expensive string matching
+operations for type resolution during deserialization and bloat
+the serialized stream. Other S/D libraries improve throughput by
+adopting more compact representations for types (i.e., integer
+class numbering) [34], [41], [51], hand-optimized serialization
+functions [34], [48], compilation-based approach to obviate
+the need for extracting field information at runtime [45], direct
+operations at backing array to reduce the encoding cost [12],
+and sending a raw object graph while overlapping computation
+with communication [41].
+Although these proposals address some of the inefficiencies,
+there is still substantial room for improvement. For example,
+our experiments demonstrate that S/D operations still take about
+28% of total execution time on average (and up to 83.4%)
+for six Spark applications even if we use Kryo [34], a highly
+optimized S/D library for Java (details in Section III).
+A serialization operation requires a recursive traversal of
+Index Terms—Object serialization, Domain-specific architecture, Data analytics, Apache Spark, Hardware-software co-design object graph from the top-level object being serialized as
+all the referenced child objects should be serialized together.
+Furthermore, it invokes a large number of function calls to
+I. I NTRODUCTION
+extract individual fields for each object (e.g., reflection [30]).
+Object serialization and deserialization (S/D) is a fundamen- Existing S/D libraries are inefficient when handling those
+tal operation in modern big data analytics for portable, loseless operations, partly due to their limited use of parallelism within
+communication between distributed computing nodes. For the S/D process. Even with highly parallelized S/D algorithms,
+efficient inter-node data transfers, the sender node first serializes their performance on general-purpose CPUs is bottlenecked
+a sea of objects into a stream of bytes; the receiver node then by limited microarchitectural resources such as instruction
+reconstructs the objects from the serialized byte stream. Massive window and load-store queues. Even worse, S/D operations
+data manipulation operations in today’s big data analytics are characterized by frequent indirect loads, random memory
+frameworks [3]–[6], [11], [55], such as map/reduce, shuffle, accesses, large-volume memory copies, and little data reuse,
+which make it difficult to handle them efficiently on CPUs.
+and join, heavily utilize S/D operations.
+S/D operations incur substantial performance overhead to
+To address these limitations, we propose Cereal, a hardware
+modern data analytics frameworks running on managed runtime accelerator for S/D operations. We carefully co-design the
+environments like Java and Scala. Recent studies report that serialization format with the hardware architecture to effectively
+serialization overhead accounts for some 30% of the total leverage multiple levels of parallelism during the S/D process.
+execution time in popular big data analytics frameworks [40], This multi-level parallelism harnesses massive memory-level
+
+Abstract—Object serialization and deserialization (S/D) is an
+essential feature for efficient communication between distributed
+computing nodes with potentially non-uniform execution environments. S/D operations are widely used in big data analytics frameworks for remote procedure calls and massive data
+transfers like shuffles. However, frequent S/D operations incur
+significant performance and energy overheads as they must
+traverse and process a large object graph. Prior approaches
+improve S/D throughput by effectively hiding disk or network I/O
+latency with computation, increasing compression ratio, and/or
+application-specific customization. However, inherent dependencies in the existing (de)serialization formats and algorithms
+eventually become the major performance bottleneck. Thus, we
+propose Cereal, a specialized hardware accelerator for memory
+object serialization. By co-designing the serialization format
+with hardware architecture, Cereal effectively utilizes abundant
+parallelism in the S/D process to deliver high throughput. Cereal
+also employs an efficient object packing scheme to compress
+metadata such as object reference offsets and a space-efficient
+bitmap representation for the object layout. Our evaluation of
+Cereal using both a cycle-level simulator and synthesizable Chisel
+RTL demonstrates that Cereal delivers 43.4× higher average
+S/D throughput than 88 other S/D libraries on Java Serialization
+Benchmark Suite. For six Spark applications Cereal achieves
+7.97× and 4.81× speedups on average for S/D operations over
+Java built-in serializer and Kryo, respectively, while saving S/D
+energy by 227.75× and 136.28×.
+
+parallelism (MLP) for Cereal to achieve high memory bandwidth utilization, and hence high S/D throughput. To keep the
+space overhead for metadata low, we also propose an efficient
+object packing scheme to compress object reference offsets by
+preserving only significant bits (e.g., discarding leading zeros)
+and a bitmap representation for the object layout. In summary,
+this paper makes the following contributions:
+• We propose a new serialization format to better expose coarsegrained parallelism in the S/D process, while maintaining
+compact representation of metadata via efficient object
+packing.
+• We architect and implement Cereal, a specialized architecture
+for S/D operations, which is co-designed with the new
+serialization format.
+• We integrate Cereal with Apache Spark on HotSpot JVM to
+validate its functionality and evaluate its performance using
+real-world data analytics workloads.
+• We demonstrate that Cereal achieves significant speedups
+and energy savings over state-of-the-art software S/D implementations on Java Serialization Benchmark Suite and Spark
+applications.
+II. BACKGROUND
+Object Serialization. Serialization is a process of converting
+the objects into a stream of bytes and deserialization is a reverse
+process of reconstructing the original objects from the stream
+of bytes. S/D is a fundamental operation in data analytics
+frameworks for massive data communication and manipulation
+(e.g., for join and shuffle), I/O management in a distributed file
+system, and messaging for remote procedure calls [5], [18], [55].
+There are a variety of S/D implementations depending on use
+case, data types, and necessity for supporting references (pointer
+objects) [34], [45]. The serialization process becomes more
+complicated with references as a recursive object graph traversal
+is required to identify all child objects transitively pointed to by
+the top-level object. Indirect loads to fetch information about
+the layout of an object make this process even slower. Recently,
+S/D has been identified as a major performance bottleneck in
+data analytics frameworks [39], [41], [52]. Thus, this paper
+focuses on optimizing S/D operations in Java as many such
+frameworks build on JVM-based execution environments.
+Java Object Layout. Figure 1(a) illustrates the memory
+layout of Java objects in HotSpot [27], the most widely used
+production JVM, using an example code snippet. An object has
+a fixed-length header, followed by fields that hold the values
+and references of the object. The header is 16B in length
+and composed of a mark word (8B) and a klass pointer (8B).
+The mark word includes an identity hash code (31 bits), a
+synchronization state (3 bits), GC state bits (6 bits), and 25
+unused bits. A klass pointer points to type metadata, called
+type descriptor, which contains the object layout as well as
+the total object size. The object layout includes the offsets of
+all the references in the object, which a serializer utilizes to
+locate them.
+Java built-in Serializer. Java built-in serializer [28] (Java S/D)
+is the baseline serializer provided by Java. When an object
+
+Code
+snippet
+
+Class ObjA implements Serializable {
+Int valA = 10;
+ObjB objB = new ObjB();
+}
+
+Class ObjB implements Serializable {
+Long valB = 200L;
+}
+
+Reference offsets
+
+(a)
+Memory
+layout
+
+Type
+descriptor
+
+1 Load
+reference offsets
+
+offset value for
+objB field (24)
+
+object objA
+mark
+
+klass
+
+Header (16B)
+
+2 Find the location of
+the reference
+
+10
+valA (8B)
+
+object objB
+mark
+
+klass
+
+Field information
+
+Class information
+
+(b)
+Java
+S/D
+
+Ser format
+
+200
+
+Length of Class # of Field Length of Field
+Value or
+…
+class name name fields type field name name
+reference
+objA
+
+4 ObjA 2 I 4 valA S 4 ObjB
+
+10
+
+4 ObjB 1 L 4 valB
+
+200
+
+objB
+
+(c)
+Kryo
+
+Type Registry
+…
+…
+ObjA
+11
+ObjB
+12
+
+Ser format ClassID Null check Value
+
+…
+
+Reference
+
+objA
+11 1 10
+
+12 1
+
+200
+
+objB
+
+(d)
+Skyway
+
+Type Registry
+…
+…
+ObjA
+11
+ObjB
+12
+mark
+
+Ser format mark ClassID
+
+addr = 100
+11
+
+10
+
+objA
+40
+
+Value or
+reference
+
+addr = 140
+mark
+
+12
+
+200
+
+objB
+
+Fig. 1. Serialization format of three Java serializers
+
+is serialized, the serialized stream contains the field data of
+the object and metadata for its class and the classes of all
+the objects it recursively references to. Figure 1(b) shows an
+example of a serialized stream of Java S/D. Java S/D stores the
+names of all classes and fields as string types. In addition, Java
+S/D stores the length of the name, the metadata of the fields
+(number of fields, field types), and other metadata associated
+with serialization. As a result, the serialized stream contains
+a large amount of metadata. For reference fields, Java S/D
+uses Package java.lang.reflect [30] to get the content
+of each reference field and insert it to the serialized stream.
+For example, Field getField (String name) in the package
+returns a Field object of the class specified by name and void
+set (Object obj, Object value) sets the target field with
+the input value. Generally, the methods in this package are a
+well-known source of computational overhead in Java S/D as
+they perform string lookups with no given type information.
+Kryo Serializer. Kryo [34] is one of the most popular thirdparty serialization libraries for Java. Kryo addresses the
+limitations of Java S/D with manual registration of classes.
+Figure 1(c) shows a serialized stream in Kryo. Unlike Java
+S/D, Kryo represents all classes by just using a 4B ClassID
+(integer class numbering). All field types and primitive types
+(e.g., Int, Long) are also registered to get assigned distinct
+ClassIDs. By registering classes and types (type registration),
+Kryo reduces the overhead of storing type names as strings
+(plus additional metadata) in Java S/D. And, there is a Null
+check (1B) field to mark an object with no fields. Overall,
+
+SER
+
+DES
+
+SER I/O
+
+≈
+
+DES I/O
+
+GC
+
+Compute
+
+use cases are common in other large-scale data analytics
+frameworks. We select six S/D-intensive applications from
+Bayes
+Intel HiBench [24] and execute them using two Spark executor
+LR
+instances on Intel i7-7820X Processors [25]. More detailed
+Terasort
+experimental setup is available in Section VI-A. We breakdown
+ALS
+the total application time into 1) computation time, 2) GC time,
+0%
+10%
+20%
+30%
+40%
+50%
+60%
+70%
+80%
+90% 100%
+3) I/O time, and 4) S/D time.
+(a) Java S/D
+Figure 2 shows a runtime breakdown of the six applications
+SER
+DES
+SER I/O
+DES I/O
+GC
+Compute
+using Java S/D (Figure 2(a)) and Kryo (Figure 2(b)), which are
+Nweight
+SVM
+used by Spark. Our analysis shows that the overhead of S/D
+Bayes
+operations is substantial, accounting for an average of 39.5%
+LR
+of total execution time for Java S/D (and up to 90.9% with
+Terasort
+ALS
+SVM), and 28.3% for Kryo (and up to 83.4% with SVM). As
+0%
+10%
+20%
+30%
+40%
+50%
+60%
+70%
+80%
+90% 100%
+discussed in Section II, Java S/D embeds a string for every class
+(b) Kryo
+and field into the serialized stream, which leads to substantial
+I/O overhead (up to 13.9% for NWeight). Even worse, the
+Fig. 2. S/D overhead in Spark applications with different serializer libraries
+excessive use of reflection functions for type resolution, which
+there is much less metadata than Java S/D as Kryo only stores involve expensive string match operations, makes S/D process
+the actual data. Kryo also uses an optimized library [49] to very slow. In contrast, Kryo employs integer class numbering,
+get class/field information (serialization) or set field values minimizing type metadata overhead. Also, Kryo does not need
+(deserialization), instead of the original reflect package in Java to use reflection for type resolution but utilizes a custom
+S/D. These optimizations reduce the time and space overhead reflection library for (re)storing values, to yield substantially
+drastically, but it requires users to manually register the class lower runtime overhead than Java S/D. However, even with
+of every single object being serialized. The same type registry Kryo, the S/D overhead is still substantial, taking nearly 30%
+must be used for deserialization. Therefore, Kryo requires of total execution time on average.
+To understand the S/D performance better, we use three data
+additional user effort for performance.
+Skyway Serializer. Skyway [41] is a state-of-the-art serializer structure benchmarks commonly used in many applications,
+specialized for data shuffling between nodes in a distributed Tree, List, and Graph, and measure the IPC, cache miss rate, and
+system. Skyway proposes a way to transfer an object by a bandwidth utilization of S/D process using Linux Perf tool [14].
+simple memory copy to reduce the computational overhead For each benchmark, we scale the number of children nodes
+of disassembling and reassembling it. This eliminates the cost and depth (Tree), the size (List), and the number of connected
+of accessing any field or type imposed on existing serializers. edges (Graph). More details of these benchmarks are covered
+Skyway also uses an integer type ID (like Kryo) for identifying in Section VI-A.
+There are several observations with the results. First, Figthe class of the object instead of type string. Skyway also keeps
+a global type registry, which maps every type string to its unique ure 3(a) shows relatively low average IPCs for both Java S/D
+type ID (like Kryo). Unlike Kryo, however, Skyway can reduce (1.01) and Kryo (0.96). Second, Figure 3(b) demonstrates that
+manual type registration effort by utilizing an automatic type the degree of (temporal) locality is pretty low (i.e., cache miss
+registration system. During serialization, Skyway converts the rate is high). Finally, even with a high cache miss rate, both fail
+absolute address of the object to a relative address, eliminating to fully utilize memory bandwidth due to limited parallelism
+the overhead of invoking methods in the reflect package for in the S/D process (Figure 3(c)).
+adjusting references. Skyway reduces the user effort as well as Motivation for Specialized Hardware. In an abstract form,
+computational overhead, to report a 16% speedup over Kryo the key operations in the S/D process include (i) object graph
+on average [34]. However, the sequential reference adjustment traversal for serialization and (ii) copying the contents of the
+of objects at the receiver is still inefficient. Also, the size of visited object into another space. These operations are handled
+the serialized byte is larger than Kryo’s size as the object is poorly in general-purpose CPUs for the following reasons.
+First, object graph traversal requires many indirect loads to
+serialized as is including reference fields and headers.
+visit its child objects. Such indirect loads inherently generate
+III. A NALYSIS AND M OTIVATION
+lots of random memory accesses, which significantly degrade
+S/D Overhead. To quantify the S/D overhead in data analytics the cache performance. A copying operation, which touches
+applications, we analyze the performance of six data analytics large memory regions, evicts cache lines to increase cache
+applications on Apache Spark running on HotSpot JVM [27]. miss rate. Moreover, the object graph has a low degree of
+Spark extensively utilizes S/D operations for 1) input/output parallelism without exploiting intra-object parallelism, and
+management in a distributed file system (e.g., HDFS [50]), 2) CPUs cannot fully utilize memory-level parallelism (MLP) due
+communication between the master and worker nodes, 3) data to limited instruction window and load/store queue size, hence
+manipulation across the nodes such as Shuffle, and 4) software yielding low memory bandwidth utilization (Figure 3(c)). As
+caching and data spill for efficient memory management. These a result, Kryo improves the Java S/D by removing several
+Nweight
+SVM
+
+Java S/D
+
+3
+
+Kryo
+
+0
+obj A
+
+IPC
+
+2
+
+0
+
+0
+
+1
+
+0
+
+0
+
+0
+
+1
+
+V
+
+B
+
+V
+
+V
+
+V
+
+C
+
+1
+
+0
+
+0
+
+(a)
+Memory
+layout
+
+0
+Narrow Wide
+Tree
+
+Small
+
+Large Sparse Dense Narrow Wide
+
+List
+
+Graph
+
+Tree
+
+Small
+
+Large Sparse Dense
+
+List
+
+SER
+
+Graph
+
+0
+obj B
+
+0
+
+Header
+
+2000
+0
+obj D
+
+DES
+
+0
+
+D
+
+V
+
+V
+
+1
+
+0
+
+A
+
+V
+
+0
+obj C
+
+2048
+0
+
+0
+
+Header
+
+Value array
+
+75
+
+meta mark ID
+
+Class
+
+(b)
+serialized
+format
+
+25
+0
+Tree
+
+List
+
+Graph
+
+Tree
+
+Small
+
+Large Sparse Dense
+
+List
+
+SER
+
+0
+
+0
+
+V
+
+V
+
+3000
+
+3040
+
+A Reference field (A’s address)
+
+V
+
+V
+
+V
+
+V
+
+H
+
+Obj A
+
+50
+
+Large Sparse Dense Narrow Wide
+
+0
+
+4040
+
+100
+
+Small
+
+0
+Header
+
+V Non-Reference field (Value)
+4000
+
+(a)
+
+Narrow Wide
+
+Bitmap
+
+1072
+
+Address = 1000
+
+1
+
+LLC miss rate (%)
+
+0
+Header
+
+Graph
+
+DES
+
+(b)
+
+V
+
+V
+
+H
+
+V
+
+V
+
+Obj C
+
+Obj B
+
+Reference array
+
+Layout bitmap
+
+72 120160 0
+
+200 000010001 000100 00000 00010
+
+A’s relative address
+
+D’s bitmap
+
+D’s relative address
+
+C’s bitmap
+
+C’s relative address
+
+B’s bitmap
+
+B’s relative address
+
+A’s bitmap
+
+V
+
+Object graph size
+
+10
+
+Bandwidth (GB/s)
+
+H
+Obj D
+
+New object A’s address = 8000
+
+5
+
+(c)
+deserialized
+format
+
+0
+Narrow Wide
+Tree
+
+Small
+
+Large Sparse Dense Narrow Wide
+
+List
+SER
+
+10
+
+Graph
+
+Tree
+
+Small
+
+Large Sparse Dense
+
+List
+
+Graph
+
+DES
+
+(c)
+42.9
+
+44.8
+
+42.9
+
+44.8
+
+112.4
+
+H
+8000 + 72
+
+V
+
+VV V
+8000 + 120
+
+H
+
+VV
+
+H
+
+VV
+
+8000 + 160
+
+H
+
+V
+8000 + 0
+
+Fig. 4. Illustration of Cereal’s baseline serialization format: (a) original
+memory layout (b) serialized format (c) deserialized format
+
+39.0
+
+reduce the size of the serialized stream. Figure 4(c) shows how
+the four objects are reconstructed at the base address 8000
+4
+from the serialized stream.
+2
+0
+A notable difference of Cereal from Skyway is the way
+Narrow Wide Small Large Sparse Dense Narrow Wide Small Large Sparse Dense
+Tree
+List
+Graph
+Tree
+List
+Graph
+to store references and values and the aforementioned object
+SER
+DES
+packing scheme. During deserialization, Skyway needs to adjust
+(d)
+the references sequentially using relative addresses. However,
+Fig. 3. S/D process analysis with microbenchmark (a) IPC (b) LLC miss rate
+because Cereal stores values and references separately, it can
+(c) bandwidth (d) speedup
+handle value copying and reference adjustment in parallel.
+Since the layout bitmap contains the location of each reference,
+inefficiencies like size reduction and reducing the use of
+the operation on the value and the reference can be performed
+expensive reflective functions, but the performance gain is
+independently. This enables Cereal to exploit a greater demarginal (Figure 3(d)). Moreover, many big data applications
+gree of parallelism, hence achieving higher throughput using
+are compute-intensive [41], [44], [54] for user computation
+specialized hardware.
+to contend with S/D operations for CPU cycles. Thus, a
+specialized architecture designed to extract parallelism within Space Overhead Analysis of the Baseline Format. The
+the S/D process can substantially improve the S/D performance overhead of the layout bitmap itself is proportional to the
+object size. Since one bit of the layout bitmap is responsible
+and reduce the CPU load.
+for 8B, the size of the layout bitmap is 1.56% of the object
+size. Also, when the layout bitmap is stored as a byte stream, it
+IV. S ERIALIZATION F ORMAT FOR C EREAL
+is necessary to tell the boundary between two adjacent objects
+A. Serialization Stream Layout
+in the layout bitmap. The easiest way to distinguish the layout
+Serilization Format. Figure 4 presents the baseline serializa- bitmap boundaries would be to store the layout bitmap length.
+tion format of Cereal (before object packing) with an illustrative However, since the space overhead of layout bitmap length
+example. Figure 4(a) shows an object graph with four objects is 8B per each object, if the object size is small, the layout
+with objA as the root object. It also shows how the layout bitmap length can be much larger than the data size stored.
+bitmap marks the location of each reference field. Since all Alternatively, a layout bitmap could be stored with padding
+fields in a JVM object are 8B aligned, one bit of the layout using fixed bucket sizes (4B, 8B, and so on), but, depending on
+bitmap corresponds to an 8B in the heap. If the object contains the range of layout bitmap values, the space overhead due to
+a reference, the bit at that location is set to 1, and the size of padding can be significant. For references, the value (relative
+the object can be obtained by multiplying the layout bitmap address) is the difference between the top-level object address
+size in bits by 8B. Figure 4(b) illustrates the serialized format and the referenced object address in the deserialized stream.
+of Cereal composed of three structures: value array, reference Typically, it takes much fewer bits than 8B (long type) to
+array, and layout bitmaps (including object graph size). These represent the relative address. Finally, there is a 4B overhead
+structures are fed into the object packer (Section IV-B) to representing the sum of object sizes (before serialization) that
+Speedup
+
+8
+6
+
+(a)
+Object packing
+example
+(reference
+array)
+
+A
+
+2 Packing
+
+1 Extracting significant bits
+& Adding End bit
+Long type (8B)
+1
+0
+0…00
+01
+
+B 72 0…01001000
+
+Cereal
+Packed value
+
+2
+
+01000000
+
+10010001
+
+10010001
+
+11110001
+
+11110001
+
+D 160 0…010100000
+
+101000001
+
+10100000 10000000
+
+End bit
+
+Bucket (1B) padding
+
+Host
+CPU
+
+DU pool
+DU 0
+
+DU 1
+
+…
+
+Request Scheduler
+Class Klass
+ID
+Pointer
+Table
+Table
+(SRAM) (CAM)
+
+Class
+
+V
+
+V
+
+V
+
+V
+
+H
+
+Obj A
+(b)
+Optimized
+serialized
+format
+
+SU pool
+SU 0
+
+sID0
+SU 1
+
+…
+
+sID1
+
+MAI
+
+Value array
+meta mark ID
+
+Global
+sID
+
+…
+
+C 120 0…01111000
+
+padding significant bits
+
+CMD Queue
+
+V
+
+V
+
+H
+
+V
+Obj C
+
+Obj B
+
+V
+
+H
+
+V
+
+I/O devices
+
+Obj D
+
+Memory Controller
+
+Packed reference array
+01000000 10010001 11110001 10100000 10000000
+1
+
+1
+
+1
+
+0
+
+DRAM
+
+1
+End map
+
+Packed layout bitmap
+
+Fig. 6. Cereal architecture overview
+
+00001000 11000000 00010010 00000100 00010100
+0
+
+1
+
+1
+
+1
+
+1
+
+(MAI), which performs basic functionalities such as requesting
+coalescing (as in conventional MSHRs).
+Software Interface. Cereal shares the similar serialization,
+deserialization interfaces with other popular serializers such
+are included in this serialized format. Using the serialization
+as Kryo [34] and Skyway [41], which essentially makes
+format in this section as is can result in large space overhead
+replacing a conventional serializer/deserializer to a Cereal
+than the existing schemes. To compensate for this overhead,
+serializer/deserializer a trivial work. Initialize is simply
+we propose an object packing scheme to compress both the
+called at the beginning of the application to secure a cerlayout bitmap and references in the following section.
+tain amount of memory region for Cereal’s S/D process.
+RegisterClass(Class Type) registers the specified class so
+B. Object Packing Scheme
+that the class can be serialized and deserialized with Cereal.
+Cereal uses an optimized packing scheme to eliminate This function should be called once for every type that needs
+the redundant metadata (layout bitmap length and excessive to be serialized or deserialized. Note that this function is
+padding) and reduce the overall size of serialized bytes. Figure 5 effectively identical to the Kryo serializer’s function having
+shows the optimized serialization format of Cereal with object the same name. To serialize an object obj, the user needs to
+packing. Figure 5(a) illustrates a step-by-step process of use WriteObject(ObjectOutputStream oos, Object obj).
+packing four references. In Step 1, the object packer extracts Here, the ObjectOutputStream oos is often connected to the
+only significant bits from the reference bits (i.e., dropping FileStream for the output file. To deserialize an object, the user
+leading zeros) and add an end bit (1 in bold). In Step 2, it should use ReadObject(ObjectInputStream ois) which reputs the bit string (with optional padding zeros) to 1B buckets turns the deserialized object. Here, ObjectInputStream
+to make it byte-aligned. Using the end map to indicate the ois provides the raw byte sequences from the associated
+boundaries of the packed references (shown in Figure 5(b)) FileStream.
+occupies much less space than storing the layout bitmap length Memory Access Interface (MAI). MAI is a memory access
+for each object or using a static bucket size. When deserializing interface for our accelerator. The main role of the MAI is to
+the serialized stream Cereal can process multiple values and correctly return the response to requests from various modules
+references by inspecting the end map. Thus, we apply this of Cereal. The MAI contains an associative memory with 64
+object packing scheme to both the layout bitmap and references. entries. Each entry has the memory address for this outstanding
+In contrast, the value array (with headers and values) is stored request, the list of modules that it should send the responses
+as in the baseline format (Section IV-A) without applying this to, and the associated metadata related to this memory request.
+scheme.
+In addition, the MAI also contains multiple reorder buffer
+which reorders the unordered memory responses so that the
+V. C EREAL A RCHITECTURE
+requester can receive these responses in order of the original
+requests. Finally, the MAI also supports an atomic read-modifyA. Overview
+write (within an accelerator) so that a module within this
+Figure 6 shows an overview of Cereal architecture. The host accelerator can safely update a value without a race. For
+issues a serialization or deserialization request through the this atomic operation, the MAI contains another associative
+simple software interface (explained in the paragraph below). memory structure, which buffers outstanding read-modify-write
+This request is then buffered in Cereal’s command queue. The operations.
+request scheduler inspects the request at the head of the queue
+and finds the available serialization unit (SU) or deserialization B. Serialization Unit (SU)
+unit (DU). If found, it forwards a request to the corresponding Serialization Flow. Figure 7 shows the block diagram of our
+unit, which then starts the execution. Our Cereal interacts with serialization unit (SU). At a high level, this unit consists of
+the memory system directly without going through the cache four components: header manager, object metadata manager,
+hierarchy. Instead, Cereal has its own memory access interface object handler, and reference array writer. Each of these
+Fig. 5. The optimized serialized format in Cereal (a) object packing example
+for the reference array (b) the optimized serialized format
+
+6 Object address
+
+visited or not. If it is not, it means that this object needs to
+be serialized. In this case, the loaded header is passed to the
+Input
+object
+2 Object/klass
+object metadata manager, which will then utilize this header
+address
+address
+4 Metadata
+Object metadata
+Object
+Header
+manager
+handler
+manager
+to fetch various object metadata. Another job of the header
+3 Metadata
+1 Header
+manager is to update the object header. First, it needs to mark
+2 Relative address
+that this object is visited if this is the first time to trace this
+Reference
+array writer
+object. Second, the header manager needs to record the relative
+4 Layout
+5 Object
+6 Value
+2 Update
+3 Reference
+bitmap
+array
+array
+header
+address of the current object to the header (see Figure 4) . This
+Memory controller
+value equals the total serialized object size so far and indicates
+the relative address of the currently serialized objects in the
+Fig. 7. The data flow of Serialization Unit
+deserialized format. When the object metadata manager returns
+components performs a different functionality. Specifically, the the object size information, the header updates a counter that
+header manager is responsible for inspecting object headers and tracks this value. The last responsibility of the header manager
+updating the headers. The object metadata manager receives the is to pass the relative addresses of the current object (i.e., the
+object header from the header manager, fetches all the necessary relative address in the deserialized format) to the reference array
+object metadata from memory, and then generates a packed writer. As explained, if the object was not visited previously,
+layout bitmap in the Cereal serialization format (Figure 4 and this address is equal to the total serialized objects size. In case
+5). The object handler receives the object layout information the object was previously visited, the relative address is already
+from the object metadata manager and fetches the object from recorded in the header and thus can be extracted from it. Note
+memory. Using this layout information, the object handler that the header manager cannot process another object until it
+can distinguish the references and values within this object. receives the object size from the object metadata manager and
+Then, it sends the references (i.e., addresses of the referenced update its counter.
+objects) to the header manager, and updates the value array in Object Metadata Manager. Object metadata manager rethe memory. Lastly, the reference array writer receives object trieves the object header from the header manager and fetches
+relative addresses from the header manager, performs packing relevant object metadata (e.g., object layout, object size) from
+(Section IV-B), and outputs the packed reference array.
+memory. Then, it passes the object layout fetched from memory
+4 Metadata
+
+Serialization starts when the object enters the header manager.
+1 Every time an object in the object graph is visited, the header
+manager needs to check its header to determine if it is visited.
+2 If the object has not been visited, the header manager
+sets the object’s relative address as the sum of the already
+serialized object sizes, sends it to the reference array writer,
+and updates the header as visited by storing the relative address
+in the object header. At the same time, the header manager
+also sends the object/klass address to the object metadata
+manager. If the object is already visited, which implies that the
+object is already serialized, the header manager just gets the
+relative address from the object header, sends it to the reference
+array writer, and then gets the new object address. Once the
+object metadata manager gets the object/klass address from
+the header manager, serialization of the current object starts. 3
+The object metadata manager fetches the object’s metadata to
+identify which of 8-byte fields following the object header are
+references/values. 4 Once the metadata is loaded, the object
+metadata manager generates the layout bitmaps (see Figure 4)
+and stores them in memory. At the same time, this metadata
+passed to the object handler. 5 The object handler loads the
+object from memory and 6 gathers value fields to update
+the value array in memory or 6 passes the references (i.e.,
+addresses of the referenced objects) to the header manager.
+Below, we discuss the operations of each component in detail.
+Header Manager. Header manager takes object addresses as
+its inputs. For each object provided, it first reads the header
+of the object and then inspects it. By inspecting the header,
+the header manager identifies whether this object was already
+
+to the object handler. In addition, it generates the packed
+layout bitmap utilizing the object layout information. Finally,
+it also passes the fetched object size information to the header
+manager so that the header manager can update the total size
+of the objects serialized so far.
+Object Handler. Object handler receives the object metadata
+(including object layout) from the object metadata manager.
+Once receiving the object metadata, the object handler loads
+the object from memory. When the object is loaded, the values
+(including the header) or the references are extracted. If a
+reference is extracted, the object handler passes it to the header
+manager. Here, it is important to pass the references within
+the object to the header manager in the original order. To
+guarantee that the memory accesses return in the requested
+order, we utilize the reorder buffers in the memory access
+interface (MAI). When a value is extracted, the object handler
+first checks if it is a header. If so, the klass address field
+is translated to the class ID by performing a lookup on its
+content-addressable memory (CAM) structure (Klass Pointer
+Table, 4KB), whose contents are filled when RegisterClass
+API is called in the software. These headers and values are
+buffered and then stored in memory at 64B granularity when
+the buffer becomes full. The stored data in memory is the value
+array of Cereal serialization format (Figure 4).
+Reference Array Writer. Reference array writer is a module
+that outputs the packed reference array. It receives the object
+relative addresses from each object handled by the header
+manager and then performs the packing to generate the packed
+reference array.
+
+4 Assemble Block
+
+references to one of the available block constructors. In addition
+to those three values, it also maintains the internal counter that
+counts the number of 64B blocks that it processed to generate
+Base address
+Block
+the destination address where the block reconstructor should
+Layout
+Block manager
+reconstructor 1
+manager
+write
+its outputs.
+1 Packed
+2 Value array
+5 Block
+Layout bitmap
+Packed reference array
+Block Reconstructor. Block reconstructor can start reconstructMemory controller
+ing the output when the block manager assigns the block to
+Fig. 8. The data flow of Deserialization Unit
+it. During the time it is reconstructing a block, it marks itself
+busy and this prevents the block manager from issuing another
+work to this block reconstructor. With the 8-bit layout bitmaps,
+C. Deserialization Unit (DU)
+the block reconstructor simply puts the values to where the
+Deserialization Flow. Figure 8 shows the block diagram of corresponding layout bitmap value is zero while putting the
+our deserialization unit (DU). This unit consists of a layout references to where the corresponding layout bitmap value is
+manager, a block manager, and multiple block reconstructors. one. Additionally, the block reconstructor identifies whether
+1 Here, the layout manager is a module that fetches the layout it has a header field that represents the class ID using a 8-bit
+bitmap, unpacks it, and counts the number of 0s and 1s in the layout bitmap chunk along with its corresponding end map. If
+layout bitmap and then identifies how many values/headers so, it needs to translate that class ID to a klass address by
+and references that a single block (64B) has. Then, it sends checking the appropriate index from a SRAM structure (Class
+the 8-bit layout bitmap corresponding to a single block along ID Table, 2KB) which has class ID to klass address mapping.
+with the number of 1s and 0s to the block manager. 2 The As in the case of serialization, this SRAM is populated when the
+block manager is a module that internally prefetches i) the RegisterClass API is called in the software. Once finished,
+value array, and ii) the packed reference array. Once fetched, it sends the write request of the resulting 64B block to the
+the packed reference array is unpacked immediately. When the provided destination address and marks it not busy.
+block manager receives the 8-bit layout bitmap chunk, along
+with the number of value/headers and references, it retrieves
+i) the exact amount of values (and headers) in the block from
+its internal value array loader and ii) the exact amount of D. Parallelism in Cereal
+Block
+reconstructor N
+
+…
+
+3 Layout bitmap,
+Values,
+References
+
+references in the block from its internal reference array loader.
+3 This block manager dispatches this loaded layout bitmap, Cereal exploits three different forms of parallelism.
+values, and references for a single block to one of the available • Operation-level parallelism: This is the parallelism across
+S/D operations. With multiple Cereal SUs and DUs, multiple
+block reconstructors. 4 Finally, the block reconstructor scans
+S/D operations can be executed in parallel. This form of
+the 8-bit layout bitmap and reconstructs them to 64-byte output
+parallelism is essentially the task-level parallelism exploited
+according to the layout bitmap. 5 After reconstruction, block
+by the multi-threaded execution of S/D operations on multiple
+reconstructor writes the output to its destination address.
+CPU cores.
+Layout Manager. Layout manager module eagerly fetches the
+•
+Object-level parallelism: This is the parallelism across objects
+packed layout bitmap, unpacks it, and counts the number of 0s
+within
+an object graph. Our SU exploits pipeline parallelism
+and 1s in a single 64B block. It has a hardware module named
+to
+process
+multiple objects within the same object graph.
+layout bitmap loader, which eagerly prefetches the packed
+Each
+block
+in Figure 7 processes different objects within
+layout bitmap. It maintains a set amount of internal buffer and
+the
+object
+graph.
+eagerly issues a load request to the memory whenever this
+buffer is empty. This loaded layout bitmap is then fed to the • Block-level parallelism: The is the parallelism across multiple
+unpacked blocks in DU. Decoupled value/reference array
+custom unpacking module, which unpacks the layout bitmap.
+and layout bitmap enable deserialization to be processed in
+Finally, the custom logic counts the number of 0s and 1s in
+parallel with multiple block reconstructors.
+a single cycle and passes this information and the unpacked
+layout for a single block to the next module, block manager.
+Existing libraries such as Java S/D and Kryo also utilize
+Block Manager. Block manager module also includes two operation-level parallelism with multiple CPU cores (i.e.,
+modules that eagerly prefetch the value array and the packed multi-threaded execution). However, those libraries cannot
+reference array, respectively. As in the layout manager, the easily exploit neither object-level parallelism nor block-level
+loaded packed reference array is unpacked with the custom parallelism. This is because conventional CPU lacks the
+hardware module, and the unpacked result is stored in the ability to extract such parallelism due to the limited resources
+internal buffer. Whenever the layout manager passes the 8-bit (i.e., instruction window, load/store queue size). Furthermore,
+layout bitmap and the number of 0s and 1s, it retrieves the the existing S/D libraries’ serialization format also limits
+number of values (i.e., equal to the number of 0s) from the value the amount of parallelism. In contrast, Cereal leverages
+array loader and retrieves the number of references (i.e., equal to hardware specialization with tightly-coupled software format
+the number of 1s) from the reference array loader. Then, it sends optimization to fully exploit abundant parallelism within these
+i) 8-bit layout bitmap, ii) retrieved values, and iii) retrieved operations.
+
+E. Implementation Details
+Header Extension. Cereal requires a certain amount of perobject metadata for its serialization process. However, assigning
+a separate memory address space for these per-object metadata
+leads to a performance degradation since the Cereal serializer
+cannot easily retrieve the address for the specific object’s
+metadata. To avoid this performance degradation, Cereal
+extends the JVM so that all potentially serializable objects
+(whose type implements Java Serializable interface) allocate
+an additional 8B in its header so that the Cereal serializer can
+utilize that space for metadata necessary during the serialization.
+By doing so, these metadata can easily be retrieved with
+a simple relative address calculation on an object address.
+These metadata include i) metadata to track visited objects, ii)
+metadata to support shared objects, and iii) metadata to record
+relative address for the already serialized objects.
+Tracking Visited (Traversed) Objects. A conventional way
+of tracking the visited object for the object graph traversal is
+maintaining a single bit on the object header, then mark it
+when it is visited. However, that approach requires resetting
+the visited bit to zero every time the traversal ends. In our
+case, this means that all object’s visited bits need to be cleared
+at the end of the serialization. However, such overhead can
+potentially negate the benefits of the Cereal. Thus, we assign a
+certain number of bits (e.g., 16 bits in our case) in the object
+header for this purpose. Every time a serialization happens
+during the application runtime, a per-unit serialization counter
+is incremented. Then, when the serializer visits an object during
+a traversal, it compares its serialization counter with the value
+in the reserved field of the object header. If these two values
+are equal, this means that this object has been visited during
+this serialization. If not, the current serialization counter is
+recorded to mark that it is visited. This counter has a chance
+to overflow; however, we clear this metadata during the Java
+garbage collection so that the overflow is not likely to happen.
+If a serialization counter is about to overflow, it is also possible
+to force the garbage collection by invoking System.gc().
+Supports for Shared Objects. During the serialization, we
+record the relative address of the object for already serialized
+objects. However, since there is only a limited space reserved
+for this purpose, when multiple threads happen to perform
+serialization on a shared object, only one thread can record the
+value for this reserved space. In our implementation, we let
+the very first thread to serialize this object reserve this header
+area by writing down its unit ID to another reserved field.
+Then, when other unit accesses this header and then checks the
+unit ID field, it will find out that this object’s header area is
+reserved for a different unit. In this case, Cereal cannot perform
+the serialization and should fall back to the software-handled
+serialization, which utilizes a thread-local hash table to record
+the relative addresses for serialized objects. This can potentially
+reduce the performance benefits of the Cereal; however, we
+observe that real-world big data analytics workload essentially
+does not serialize shared objects. Note that this unit ID field
+can also be regularly cleared during a garbage collection.
+
+TABLE I
+A RCHITECTURAL PARAMETERS FOR EVALUATION
+Host Processor
+Core
+Intel (R) Core (TM) i7-7820X CPU 8-core @ 3.60GHz
+L1 $
+32KB I-cache, 32KB D-cache
+L2 $
+1MB (Private, Unified)
+L3 $
+11MB (Shared, Unified)
+DDR4 Memory System
+Organization
+DDR4-2400, 4 channels, 128GB
+Bandwidth
+76.8 GB/s (19.2 GB/s per channel),
+Latency
+Zero-load latency 40ns
+Cereal Configuration
+Cereal Unit
+8 Serializer Unit, 8 Deserializer Unit
+MAI / TLB
+4KB, 32B block size, 64 entries / 128 entries
+
+Limitations on the Number of Class Types. Since Cereal
+utilizes hardware structures (CAM for the serialization; SRAM
+for the deserialization) for a klass address to the class ID
+translation (during serialization) and a class ID to the klass
+address translation, Cereal can only support serializations or
+deserializations which involves less than the certain number of
+serializable class types. However, in practice, our 4K entries
+for this CAM and RAM is more than enough to run various
+real-world applications. In fact, we found that our evaluated
+real-world big data analytics applications running on Spark
+has at most a few hundreds of serializable class types.
+Address Translation and Cache Coherence. Cereal assumes
+1GB huge pages, which are popular in a system with large physical memory size. Our prototype system has 128GB physical
+memory, and thus we assume no TLB miss with our 128-entry
+TLB. However, on a system with larger physical memory, a
+TLB miss may happen in Cereal. Since Cereal Deserialization
+Unit (DU) has sequential memory access pattern, the cost of
+missing TLB can be amortized. On the other hand, Cereal
+Serialization Unit (SU) includes random memory accesses, and
+therefore TLB misses can potentially become a performance
+bottleneck. Improving TLB effectiveness for accelerators is
+an active research area, and we can leverage recent proposals
+such as identity mapping with coarse-grained protection [20],
+flattened/region-based page tables [23], coalesced/shared MMU
+caches for a large working set [10], and speculative address
+translation using huge pages [8]. For cache coherence Cereal
+sends get coherence messages as in [37] to fetch the up-to-date
+copy from either the on-chip cache or off-chip memory. As
+Cereal is directly connected to the on-chip bus, participating in
+the on-chip coherence domain is relatively straightforward.
+A potential increase in memory latency due to coherence
+operations can be effectively tolerated by Cereal’s pipelined
+execution.
+VI. E VALUATION
+A. Methodology
+Evaluation Model. We evaluate Cereal using a custom cyclelevel simulator integrated with a DRAM model similar to
+what is used in popular architectural simulators [21], [47].
+We integrated the simulator to the production-grade JVM
+(OpenJDK 1.8.0.60 [43]) so that the simulator can access the
+complex JVM internal functions, such as class, object layout,
+
+Tree
+
+List
+SER
+
+Graph
+
+SER
+
+<Width Ref>
+
+Tree
+
+List
+DES
+
+Graph
+
+DES
+
+<Width Ref>
+
+R
+V
+
+R
+
+R
+
+R
+
+R
+
+R
+
+R
+
+V
+
+V
+
+(a)
+
+R
+
+…
+
+R
+
+V
+
+V
+
+V
+
+V
+
+V
+
+V
+
+V
+
+R
+
+R
+
+(b)
+
+104
+
+R
+
+R
+(c)
+
+Speedup
+Speedup
+
+R
+
+R
+
+Java S/D
+
+Kryo
+
+Cereal Vanilla
+
+Cereal
+
+Java S/D
+
+Kryo
+
+Cereal Vanilla
+
+Cereal 2349.52
+2092.94
+
+1043
+3
+10
+102
+
+1021
+
+22.94
+
+31.93
+
+26.87
+
+28.96
+
+22.98
+
+2092.94 2349.52
+150.84 183.45 130.61 132.05
+26.36 150.84 183.45 130.61 132.05
+
+22.94
+
+31.93
+
+26.87
+
+28.96
+
+22.98
+
+26.36
+
+1
+10
+100
+
+100 Narrow Wide
+Narrow
+TreeWide
+
+Fig. 9. Simplified layouts of microbenchmarks (a) Tree (b) List (c) Graph
+
+Tree
+
+M ICROBENCHMARK CONFIGURATION
+Tree
+List
+Graph
+
+narrow(leaf: 2, node: 2,097,150) / wide(leaf: 8, node: 19,173,960)
+small(length: 524,288) / large(length: 2,097,152)
+sparse(node: 4,096, edge: 1) / dense(node: 4,096, edge: 4,095)
+
+TABLE III
+S PARK W ORKLOADS
+
+Workload
+NWeight
+Support Vector Machine (SVM)
+Bayesian Classification (Bayes)
+Logistic Regression (LR)
+Terasort
+Alternating Least Squares (ALS)
+
+Type
+Graph
+Machine learning
+Machine learning
+Machine learning
+Sort
+Machine learning
+
+Input size
+156MB
+1740MB
+1126MB
+1945MB
+3072MB
+1331MB
+
+Large Sparse Dense Narrow Wide
+
+List
+SER
+
+Graph
+
+SER
+
+Figure 10
+
+Small
+
+Large Sparse Dense
+
+SmallListLarge Sparse
+Dense
+Graph
+
+Tree
+
+List
+DES
+
+Graph
+
+DES
+
+Fig. 10. Performance of software
+S/D implementations and Cereal for
+Figure 10
+microbenchmarks (in log scale)
+(GB/s)
+Bandwidth
+(GB/s)
+Bandwidth
+
+TABLE II
+
+Small
+
+SmallListLarge Sparse
+Dense Narrow
+Graph
+TreeWide
+
+20
+
+Java S/D
+
+Kryo
+
+Cereal Vanilla
+
+Cereal
+
+Java S/D
+
+Kryo
+60.5
+
+58.9 Cereal Vanilla
+
+Cereal
+64.0
+
+63.6
+
+60.5
+
+58.9
+
+64.0
+
+63.6
+
+20
+10
+
+10
+0
+
+0
+
+Narrow Wide
+
+Small
+
+Narrow
+TreeWide
+
+SmallListLarge Sparse
+Dense Narrow
+Graph
+TreeWide
+
+Tree
+
+Large Sparse Dense Narrow Wide
+
+List
+SER
+
+Graph
+
+SER
+
+Figure 11
+
+Tree
+
+Small
+
+Large Sparse Dense
+
+SmallListLarge Sparse
+Dense
+Graph
+List
+DES
+
+Graph
+
+DES
+
+Figure 11
+
+Fig. 11. Bandwidth utilization of software S/D implementations and Cereal
+implementation for microbenchmarks
+
+B. Microbenchmark Analysis
+and address/constant acquisition. We functionally validated
+our simulator and checked that our simulator can produce the
+functional outcome for the S/D during real-world workloads,
+including Spark applications. We compare Cereal with two
+software serializers; Java S/D and Kryo. For the Kryo, we use
+Kryo version 4.0. Table I summarizes the system parameters
+we use to evaluate the software serializers and Cereal. For the
+power and area estimation, we implement Cereal modules in
+RTL using Chisel3 [13], and then synthesize Cereal RTL using
+Synopsys Design Compiler with TSMC 40nm standard cell
+library. Throughout the evaluation, we assumed eight S/D units.
+Each deserialization unit utilizes four-block reconstructors to
+process multiple blocks in parallel.
+
+Figure 10 shows the overall speedup of Kryo and Cereal over
+Java S/D. Throughout all benchmarks, Kryo achieves significant
+speedups of 2.30× (serialization) and 52.3× (deserialization)
+from its integer class numbering and tightly optimized reflection
+functions. On the other hand, Cereal achieves speedups of
+26.5× (serialization) and 364.5× (deserialization) over Java
+S/D, which are much more significant than those of Kryo.
+Cereal’s significant speedups come from the utilization of
+multi-level parallelism that existing S/D libraries such as Java
+S/D and Kryo fails to exploit. The third bar from each group
+in Figure 10 (labeled "Cereal Vanilla") demonstrates this point.
+In the figure, the third bar from each group represents the
+hypothetical performance of Cereal without any parallelism (i.e.,
+Workloads. To evaluate Cereal, we use the three sets of no pipelining, single block reconstructor for DU) except for
+workloads; microbenchmarks, Java Serialization Benchmark the operation-level parallelism (i.e., still assumes the multiple
+Suite (JSBS) [29], and real-world Spark applications. First, SUs and DUs can run in parallel). Comparing those bars to
+we evaluate a set of microbenchmarks that serializes objects the third bars from each group (i.e., real Cereal performance),
+whose object graph has a tree, list, or random graph shape. we can identify that substantial amount of performance gains
+Figure 9 shows the example layouts of our microbenchmark are indeed attributed to the fine-grained parallelism.
+Part of this parallelism, especially for DUs, is newly exposed
+set. Table II shows our microbenchmark configuration.
+by efficient S/D format. Specifically, our serialization format
+To compare Cereal with the performance of other S/D that decouples value array, reference array, and layout bitmap
+libraries, we evaluate Cereal on JSBS as well. JSBS contains allows the DUs to execute the deserialization process in parallel
+a set of different serializers and repeatedly executes the S/D at the 64B block granularity regardless of the object layout.
+process of each serializer using several pre-defined objects. This enables a single DU to have multiple block reconstructor
+We execute all of the serializers in JSBS for 1,000 times and modules to further improve the throughput. Also, our proposed
+compare average S/D speedup and the size of the serialized serialization format lets Cereal DU to handle deserialization
+object with Cereal.
+with sequential memory accesses and maximize the on-chip
+Lastly, we evaluate Apache Spark 2.4.1 with Intel HiBench data reuse. As a result, Cereal achieves higher speedups on
+7.0 [24]. We carefully select a different set of benchmarks that deserialization than serialization.
+heavily use the S/D process. Table III summarizes workloads
+Figure 11 shows the bandwidth utilization during the
+with the corresponding input size and type. we set a region-of- serialization and deserialization. For both Java S/D and Kryo
+interest (ROI) for the S/D event only and use sufficiently large executed on CPU, the system utilizes only a small fraction of
+heap size (64GB) with the default heap size ratio (Young:Old the memory bandwidth it can use. For example, Java serializer
+Generation = 1:2) to minimize the impact of GC.
+and Kryo utilizes an average of 2.71% and 4.12% of total
+
+<Width Ref>
+
+0
+S
+
+D
+
+S
+
+NWeight
+
+D
+
+S
+
+SVM
+
+S
+
+D
+
+Bayes
+LR
+<Figure 13>
+
+Java S/D
+
+S
+
+D
+
+Terasort
+
+Kryo
+
+2
+3.10
+
+D
+
+4.66
+
+S
+
+D
+ALS
+
+S
+
+D
+
+Geomean
+
+Cereal
+
+Java
+Java S/D
+S/D
+
+TABLE IV
+
+Java S/D
+Kryo
+Nweight
+Cereal
+
+0
+
+Tree
+List
+Narrow
+Wide
+Small
+Large
+23.0
+148.6
+8.0
+59.4
+12.0
+48.0
+2.5
+10.0
+SVM
+Bayes
+LR
+Terasort
+16.1
+80.0<Figure 14>
+16.0
+47.8
+DES
+
+25
+
+15
+15
+10
+10
+5
+5
+S
+D
+S
+D
+NWeight
+NWeight
+
+S
+S
+
+D
+D
+
+S
+D
+S
+D
+S
+D
+S
+D
+Bayes
+LR
+Bayes
+LR
+<Figure
+<Figure 13>
+13>
+
+SVM
+SVM
+
+Java
+Java S/D
+S/D
+
+15
+
+2
+2
+
+3.10
+3.10
+
+10
+
+0
+
+S
+D
+S
+D
+Terasort
+Terasort
+
+S
+S
+
+D
+D
+ALS
+ALS
+
+S
+D
+S
+D
+Geomean
+Geomean
+
+Fig. 13. S/D speedups for Spark applications
+
+46.57
+
+20
+
+5
+
+Cereal
+Cereal
+
+0
+0
+
+Speedup
+Speedup
+
+Normalized execution time
+
+SER
+
+Graph
+Sparse
+Dense
+22.1
+115.5
+10.8
+51.1
+ALS
+Geomean
+2.4
+2.4
+
+Speedup
+Speedup
+
+Speedup
+
+1
+Unit
+(MB)
+
+Kryo
+Kryo
+
+20
+20
+
+S ERIALIZED OBJECTS SIZE ACROSS VARIOUS MICROBENCHMARKS
+
+Kryo
+Kryo
+
+Cereal
+Cereal
+
+4.66
+4.66
+
+1
+1
+
+0
+0
+
+Nweight
+Nweight
+
+SVM
+SVM
+
+Bayes
+Bayes
+
+LR
+LR
+
+Terasort
+Terasort
+
+ALS
+ALS
+
+Geomean
+Geomean
+
+<Figure 14>
+
+<Figure 14>
+Fig. 14. Program speedups
+for Spark applications
+
+Fig. 12. Performance comparisons
+of different S/D libraries
+<Figure 12>
+time
+executiontime
+Normalizedexecution
+Normalized
+
+25
+D.25
+Apache Spark
+
+SER SER
+
+DES
+DES
+
+46.57
+46.57
+
+20
+20
+DRAM bandwidth (i.e., 76.8 GB/s with four DDR4 memory
+15
+15Figure 13 shows the S/D speedup of Cereal over software
+channels), respectively. This indicates that there is ample room
+10
+10
+implementations
+on Spark applications. Compared to the Java
+for a hardware accelerator to achieve a substantially higher
+5
+5
+S/D,
+Kryo
+only
+achieves
+1.67× speedup. On the other hand,
+throughput without being limited by the memory bandwidth.
+0
+0
+Cereal
+achieves
+7.97×
+and
+4.81× speedup over Java S/D and
+In fact, Cereal utilizes 20.9% of the peak DRAM bandwidth
+Kryo
+throughout
+all
+the
+applications.
+This is because Cereal
+on average (up to 74.5%), which leads to significant speedups
+utilizes
+specialized
+hardware
+to
+exploit
+abundant parallelism
+presented in Figure 10. Similar patterns are observed in
+within
+S/D
+operations
+exposed
+by
+the
+specialized
+serialization
+deserialization. Cereal utilizes 31.1% of the DRAM bandwidth
+<Figure
+12>
+<Figure
+12> process, overall application
+format.
+By
+accelerating
+the
+S/D
+on average (up to 83.3%), while Java deserializer and Kryo
+performance is improved by 1.81× (up to 4.66×) and 1.69×
+only use 3.48% and 4.50%, respectively.
+(up
+to 4.53×) over Java S/D and Kryo, respectively. Figure 14
+Table IV compares the size overhead of microbenchmarks.
+shows
+overall application performance improvements.
+The size of our format is similar or a little larger than Java
+Figure
+15 shows the bandwidth utilization of software S/D
+S/D for Tree and List benchmarks. As our serialization format
+and
+Cereal.
+The overall trends are similar to those of the
+focuses more on efficient computation, the Cereal serialization
+microbenchmarks
+and JSBS. Cereal utilizes substantially more
+format incurs modest size overhead mostly coming from
+memory
+bandwidth
+than software schemes, and deserialization
+additional metadata and reference offsets that Java S/D and
+significantly
+more
+than
+serialization.
+Kryo do not include. However, Cereal provides the object
+We carefully co-design the serialization format to enable
+packing scheme to represent our metadata. As a result, the size
+of Graph benchmark which has objects with many references specialized hardware to execute more efficiently. Consequently,
+the serialization format of Cereal requires such additional
+can be serialized much more efficiently than other formats.
+metadata, such as bitmap and references. As Java S/D and Kryo
+C. JVM Serializer Benchmark Set
+do not include references in their serialized format, Cereal
+Figure 12 compares the normalized speedups of different has relatively large size overhead than Java S/D and Kryo
+libraries for S/D. Cereal shows significantly high speedups when the objects have a large number of references. In our
+compared to the other 88 libraries, which achieves the 43.4× experiments, the size of Cereal is larger than Java S/D and Kryo
+speedups on average. Kryo-manual is the fastest library among by 4.3% and 21.7%, respectively. However, Cereal focuses on
+all serializers in our experiment. As an optimization, Kryo- computation efficiency through its unique serialization format
+manual utilizes the integer class numbering to reduce size and specialized hardware designed for the format.
+and reflection overhead, optimized reflection functions in
+Figure 16 shows the compression ratio of Cereal across
+deserializer, and manually optimized serialization functions. varying applications. Note that our packing scheme only
+Even with aggressive optimizations of Kryo-manual, Cereal reduces the size of reference offsets and layout bitmaps.
+still outperforms the Kryo-manual by 15.1× due to better Naturally, the scheme is not very effective for the objects
+computation efficiency that comes from utilizing multiple levels with a few references. Cereal can further reduce the size
+of compute parallelism and memory-level parallelism. While of the serialized format by stripping markword (8B) in the
+Cereal significantly outperforms others, the size of Cereal is header that are often not necessary after the serialization (i.e.,
+comparable to the others. Note that the size of Cereal is smaller Header Strip in Figure 16). However, there are cases where
+than the average size of all the benchmarks by 46% with its a certain field of the header (e.g., hashcode) needs to be repacking scheme for the references and bitmap metadata.
+constructed during the deserialization [41], incurring additional
+
+<Width Ref>
+Bayes
+
+0
+NWeight
+
+SVM
+
+LR
+
+Terasort
+
+ALS
+
+<Figure 15>
+Kryo
+
+Cereal
+
+Bandwidth (GB/s)
+
+Java S/D
+100%
+
+SER
+
+BW Utilization (GB/s)
+
+10%
+60
+
+DES
+
+1%
+
+10
+
+5
+
+0
+Narrow Wide
+
+40
+0%
+
+Tree
+SER
+
+20
+
+DES
+
+SER
+
+NWeight
+
+DES
+
+SER
+
+SVM
+
+DES
+
+SER
+
+Bayes
+
+DES
+LR
+
+SER
+
+DES
+
+SER
+
+Terasort
+
+DES
+
+ALS
+
+<Figure 17>
+
+0
+NWeight
+
+SVM
+
+Bayes
+
+LR
+
+Terasort
+
+ALS
+
+<Figure 15>
+
+Fig. 15. Bandwidth utilization of Cereal on Spark applications
+Kryo
+
+No Compression
+
+Cereal
+
+Reference Compression
+
+Ref Comp. + Header Strip
+
+Compression rate
+
+3.0
+10%
+2.0
+1%
+1.0
+0%
+
+SER
+
+DES
+
+NWeight
+S
+D
+NWeight
+
+SER
+S
+
+DES
+
+SVM
+D
+SVM
+
+SER
+
+DES
+
+SER
+
+DES
+
+SER
+
+DES
+
+Bayes
+LR
+Terasort
+D
+S
+D
+S
+D
+S
+D
+<Figure 17>
+Bayes
+LR
+Terasort
+ALS
+
+S
+
+SER
+
+DES
+
+ALS
+S
+D
+
+BW Utilization (GB/s)
+
+Java S/D
+100%
+
+0.0
+
+TABLE V
+T OTAL AREA / POWER USAGE OF C EREAL
+
+Geomean
+
+Unit
+
+Small
+
+Total
+Total
+Large Sparse Dense
+Area
+Power
+Graph
+(mW)
+(mm )
+
+Large Sparse
+Narrow Wide
+Area Dense Power
+# ofSmall
+
+List
+
+2
+Graph
+(mm
+)
+
+(mW)Tree unit
+
+List 2
+
+SER
+DES
+Serializer
+<Width Ref>
+Header manager
+0.003
+1.3
+8
+0.024
+Reference array writer
+0.013
+5.8
+8
+0.104
+Object metadata manager
+0.014
+7.6
+8
+0.112
+Object handler
+0.028
+18.4
+8
+0.224
+Serializer Area: 0.464mm2 / Average Power : 264.8mW
+Deserializer
+SER
+DES
+Layout manager
+0.020
+10.9
+8
+0.16
+60
+Block manager
+0.217
+81.1
+8
+1.736
+Block reconstructor
+0.011
+6.9
+32
+0.352
+40
+Deserializer Area: 2.248mm2 / Average Power : 956.8mW
+TLB
+0.282
+2.7
+1
+0.282
+20
+MAI
+0.161
+0.8
+1
+0.161
+Class ID Table (2KB)
+0.230
+1.2
+1
+0.230
+0.472
+5.3
+1
+0.473
+0 Klass Pointer Table (4KB)
+2
+NWeight Total Area:
+SVM 3.857mm
+Bayes
+LR
+Terasort
+/ Average Power
+: 1231.6mW
+
+10.4
+46.4
+60.8
+147.2
+
+87.2
+648.8
+220.8
+2.7
+0.8
+1.2
+5.3
+ALS
+
+<Figure 15>
+
+<Figure 16>
+
+Fig. 16. Compression rate of Cereal object packing scheme
+Java S/D
+
+Kryo
+
+Cereal
+
+100%
+
+performance overheads. While our packing scheme achieves a
+moderate compression ratio (28.3% on average), the packing
+scheme is very effective on some workloads such as NWeight,
+which includes a very large number of references. For several
+workloads like SVM, Bayes, and LR, most objects have just
+a few references. Therefore, both our packing scheme and
+markword stripping have little impact on the compression rate.
+
+10%
+1%
+0%
+SER
+
+DES
+
+NWeight
+
+SER
+
+DES
+
+SVM
+
+SER
+
+DES
+
+Bayes
+
+SER
+
+DES
+LR
+
+SER
+
+DES
+
+Terasort
+
+SER
+
+DES
+
+ALS
+
+<Figure 17>
+
+Fig. 17. Normalized energy consumption
+
+<Figure
+12>
+E. Area, Power, and Energy
+Analysis
+
+Compression rate
+
+S/D during serialization, and geomean 165.4× less energy
+Area. Table V shows the breakdown of the area in Cereal. Total compared to Java S/D during deserialization. Also, Cereal
+No Compression
+Reference Compression
+Ref Comp. + Header Strip
+area of Cereal with 8 serialization and deserialization units is consumes
+geomean 225.5×
+less energy compared
+to Kryo
+3.0
+2
+3.857mm . Note that the die size of our baseline CPU, Intel during serialization, and geomean 82.3× less energy compared
+i7-7820X Processors with 14nm process, is 2362.5mm2 [25]. to2.0 Kryo during deserialization. Cereal saves total 227.75×
+Cereal occupies 612.5 times less area than our baseline CPU. and
+1.0 136.28× S/D energy over Java built-in serializer and
+Considering that we synthesize Cereal using 40nm technology, Kryo respectively. The superior energy efficiency of Cereal is
+0.0
+the effective area difference becomes even larger. A single attributed
+to both
+its
+high
+speedups
+S
+D
+S
+D
+S
+D
+S
+D and
+S specialized
+D
+S
+D hardware.
+S
+D
+2
+NWeight
+SVM
+Bayes
+LR
+Terasort
+ALS
+Geomean
+Serializer Unit occupies 0.058mm , so the total area for eight
+16>
+VII. R<Figure
+ELATED
+W ORK
+serializer units is 0.464mm2 . A single deserializer unit occupies
+2
+0.281mm , so the total area for eight deserializer units is Software-based S/D Optimization. Many S/D libraries have
+2.248mm2 . The others are system-wide components such as been proposed [28], [32], [34], [38], [39], [41]. Instant
+pickles [38] serializes Scala objects fast by using statically
+TLB and MAI which consume 1.145mm2 .
+Power. Table V also shows the average power breakdown of generated S/D code. However, it still falls back to the reflection
+Cereal. Compared to the Host CPU power, whose TDP is 140W, function at runtime when a type cannot be settled at compile
+Cereal consumes 113.7× less power. This indicates that general- time. Skyway [41] focuses on reducing the inefficiencies of
+purpose CPU is inefficient in performing S/D operations, which using reflective functions and user effort for manual type
+mainly consists of very simple arithmetic operations and many registration. However, Skyway achieves only marginal average
+off-chip memory accesses. The use of specialized architecture performance gains over Kryo and can produce much more
+for S/D operations achieves both performance improvement inflated serialized streams. While many off-heap approaches [7],
+[17], [36], [42] are proposed as an alternative way to cope
+and power savings at the same time.
+Energy. Figure 17 shows the energy consumption of Java S/D, with several problems with data representation as an object,
+Kryo, and Cereal in Spark applications that are normalized they heavily relies on the user-level refactorization [42] or
+to numbers of Java S/D. Kryo, which runs on the host CPU heavy engineering effort both on dedicated compiler/runtime
+like Java S/D does, consumes geomean 1.39× less energy systems [39].
+compared to Java S/D during serialization, and geomean 2.01× Hardware-based S/D Optimization. Morpheus [52] aim to
+energy compared to Java S/D during deserialization. Since both minimize CPU burden by offloading deserialization to the
+serializers run on the same device, the energy efficiency of embedded core in the SSD. However, since the SSD controller
+Kryo results from its speedup. On the other hand, Cereal cores often be overloaded with various tasks such as FTL,
+consumes geomean 313.6× less energy compared to Java garbage collection, and flash control functions, adding more
+
+burden to the cores leads to I/O performance degradation. As
+an alternative approach, HODS [35] exploits separate FPGA
+module to offload deserialization which works in parallel with
+all storage operations. However, they have relatively narrow
+applicability as they cannot deal with objects with references
+in their fields inside the SSD. On the other hand, several
+studies proposed to accelerate the serialization with FPGAbased accelerators [46], [56], but they show relatively marginal
+gains due to limited utilization of object-level parallelism.
+Domain-specific Architectures for Big Data Applications.
+Recent studies proposed various domain-specific architectures
+to accelerate data-intensive workloads such as graph processing [1], [2], [19], garbage collection [26], [31], [37], and
+database applications [15], [16], [22], [33], [53]. Many of
+these proposals overcome the limitations of the convention
+CPU by i) specializing hardware for primitive data-intensive
+or computational operations within the target algorithms,
+ii) exploiting the abundant data-level parallelism within the
+algorithm, iii) utilizing memory-level parallelism, iv) maximizing the re-use of on-chip memory to minimize the off-chip
+communication, and v) adopting emerging technologies such
+as near-data processing. Cereal also exploits such techniques to
+design efficient hardware for serialization and deserialization.
+Moreover, our proposal jointly optimizes the serialization
+format along with the hardware design to achieve greater
+efficiency.
+VIII. C ONCLUSION
+This paper presents Cereal, a specialized architecture for
+S/D operations, which are widely used in big data analytics
+frameworks. With careful co-design of the serialization format
+and hardware architecture, Cereal effectively exploits massive
+memory-level parallelism (MLP) by processing in parallel
+multiple references and values in an object as well as multiple
+objects in the S/D process. Cereal also introduces an object
+packing scheme to keep the metadata for a serialized stream
+compact. Cereal demonstrates substantial performance and
+energy efficiency gains over the state-of-the-art S/D libraries
+running on a CPU for both synthetic benchmarks and real-world
+data analytics applications on Apache Spark.
+ACKNOWLEDGMENTS
+This work was partly supported by Institute for Information & communications Technology Promotion (IITP) grant
+funded by Korea government (MSIT) (2014-0-00035, Research
+on High Performance and Scalable Manycore Operating
+System), Nano-Material Technology Development Program
+through the National Research Foundation of Korea (NRF)
+funded by the Ministry of Science, ICT and Future Planning
+(2016M3A7B4909668), and a research grant from Samsung
+Electronics. We also acknowledge support from the IC Design
+Education Center (IDEC) Korea for EDA tools and the ICT at
+Seoul National University for research facilities. Jae W. Lee is
+the corresponding author.
+
+R EFERENCES
+[1] J. Ahn, S. Yoo, O. Mutlu, and K. Choi, “Pim-enabled instructions:
+A low-overhead, locality-aware processing-in-memory architecture,” in
+Proceedings of the 42nd Annual International Symposium on Computer
+Architecture, 2015, pp. 336–348.
+[2] J. Ahn, S. Hong, S. Yoo, O. Mutlu, and K. Choi, “A scalable processingin-memory accelerator for parallel graph processing,” in Proceedings of
+the 42nd Annual International Symposium on Computer Architecture,
+2015, p. 105–117.
+[3] “Apache Flink,” http://flink.apache.org.
+[4] “Apache Giraph,” http://giraph.apache.org.
+[5] “Apache Hadoop,” http://hadoop.apache.org.
+[6] “Apache Ignite,” https://ignite.apache.org.
+[7] “Tungsten - Databricks,” https://databricks.com/glossary/tungsten.
+[8] T. W. Barr, A. L. Cox, and S. Rixner, “Spectlb: A mechanism for
+speculative address translation,” in Proceedings of the 38th Annual
+International Symposium on Computer Architecture, 2011, p. 307–318.
+[9] L. Barroso, M. Marty, D. Patterson, and P. Ranganathan, “Attack of the
+Killer Microseconds,” Commun. ACM, vol. 60, no. 4, pp. 48–54, 2017.
+[10] A. Bhattacharjee, “Large-reach memory management unit caches,” in
+Proceedings of the 46th International Symposium on Microarchitecture,
+2013, p. 383–394.
+[11] V. Borkar, M. Carey, R. Grover, N. Onose, and R. Vernica, “Hyracks:
+A flexible and extensible foundation for data-intensive computing,” in
+2011 IEEE 27th International Conference on Data Engineering, 2011,
+pp. 1151–1162.
+[12] “Cap’n Proto,” https://capnproto.org.
+[13] “Chisel3,” https://github.com/freechipsproject/chisel3.
+[14] A. C. De Melo, “The new linux’perf’tools,” in Slides from Linux Kongress,
+vol. 18, 2010.
+[15] M. Drumond, A. Daglis, N. Mirzadeh, D. Ustiugov, J. Picorel, B. Falsafi,
+B. Grot, and D. Pnevmatikatos, “The mondrian data engine,” in
+Proceedings of the 44th Annual International Symposium on Computer
+Architecture, 2017, p. 639–651.
+[16] M. Gao, G. Ayers, and C. Kozyrakis, “Practical near-data processing for
+in-memory analytics frameworks,” in 2015 International Conference on
+Parallel Architecture and Compilation, 2015, pp. 113–124.
+[17] I. Gog, J. Giceva, M. Schwarzkopf, K. Vaswani, D. Vytiniotis, G. Ramalingam, M. Costa, D. G. Murray, S. Hand, and M. Isard, “Broom:
+Sweeping out garbage collection from big data systems,” in 15th
+Workshop on Hot Topics in Operating Systems (HotOS XV), 2015.
+[18] “gRPC,” https://grpc.io.
+[19] T. J. Ham, L. Wu, N. Sundaram, N. Satish, and M. Martonosi,
+“Graphicionado: A high-performance and energy-efficient accelerator
+for graph analytics,” in Proceedings of the 49th International Symposium
+on Microarchitecture, 2016, pp. 1–13.
+[20] S. Haria, M. D. Hill, and M. M. Swift, “Devirtualizing memory in
+heterogeneous systems,” in Proceedings of the Twenty-Third International
+Conference on Architectural Support for Programming Languages and
+Operating Systems, 2018, p. 637–650.
+[21] W. Heirman, T. Carlson, and L. Eeckhout, “Sniper: scalable and accurate
+parallel multi-core simulation,” in 8th International Summer School on
+Advanced Computer Architecture and Compilation for High-Performance
+and Embedded Systems, 2012, pp. 91–94.
+[22] J. Heo, J. Won, Y. Lee, S. Bharuka, J. Jang, T. J. Ham, and J. W. Lee,
+“IIU: Specialized architecture for inverted index search,” in Proceedings
+of the Twenty-Fifth International Conference on Architectural Support for
+Programming Languages and Operating Systems, 2020, p. 1233–1245.
+[23] K. Hsieh, S. Khan, N. Vijaykumar, K. K. Chang, A. Boroumand, S. Ghose,
+and O. Mutlu, “Accelerating pointer chasing in 3d-stacked memory:
+Challenges, mechanisms, evaluation,” in 2016 IEEE 34th International
+Conference on Computer Design, 2016, pp. 25–32.
+[24] S. Huang, J. Huang, J. Dai, T. Xie, and B. Huang, “The hibench
+benchmark suite: Characterization of the mapreduce-based data analysis,”
+in 2010 IEEE 26th International Conference on Data Engineering
+Workshops, 2010, pp. 41–51.
+[25] Intel,
+“Intel®
+core™
+i7-7820x
+x-series
+processor,”
+https://ark.intel.com/content/www/us/en/ark/products/123767/intelcore-i7-7820x-x-series-processor-11m-cache-up-to-4-30-ghz.html,
+2017.
+[26] J. Jang, J. Heo, Y. Lee, J. Won, S. Kim, S. J. Jung, H. Jang, T. J.
+Ham, and J. W. Lee, “Charon: Specialized near-memory processing
+
+architecture for clearing dead objects in memory,” in Proceedings of the
+52nd International Symposium on Microarchitecture, 2019, p. 726–739.
+[27] “Java HotSpot Virtual Machine,” http://openjdk.java.net/groups/hotspot.
+[28] “Java
+object
+serialization
+specification,”
+https://docs.oracle.com/javase/8/docs/technotes/guides/serialization/index.
+html.
+[29] “Java Serializer Benchmark Suite,” https://github.com/eishay/jvmserializers/wiki.
+[30] “java.lang.reflect,” https://docs.oracle.com/javase/8/docs/api/java/lang/ref
+lect/package-summary.html.
+[31] J. A. Joao, O. Mutlu, and Y. N. Patt, “Flexible reference-counting-based
+hardware acceleration for garbage collection,” in Proceedings of the 36th
+International Symposium on Computer Architecture, 2009, p. 418–428.
+[32] A. Khrabrov and E. de Lara, “Accelerating complex data transfer for
+cluster computing,” in 8th USENIX Workshop on Hot Topics in Cloud
+Computing, 2016.
+[33] O. Kocberber, B. Grot, J. Picorel, B. Falsafi, K. Lim, and P. Ranganathan,
+“Meet the walkers accelerating index traversals for in-memory databases,”
+in Proceedings of the 46th International Symposium on Microarchitecture,
+2013, pp. 468–479.
+[34] “Kryo,” https://github.com/EsotericSoftware/kryo.
+[35] D. Li, F. Wu, Y. Weng, Q. Yang, and C. Xie, “Hods: Hardware
+object deserialization inside ssd storage,” in 2018 IEEE 26th Annual
+International Symposium on Field-Programmable Custom Computing
+Machines, 2018, pp. 157–164.
+[36] L. Lu, X. Shi, Y. Zhou, X. Zhang, H. Jin, C. Pei, L. He, and Y. Geng,
+“Lifetime-based memory management for distributed data processing
+systems,” Proceedings of the VLDB Endowment, vol. 9, no. 12, pp.
+936–947, 2016.
+[37] M. Maas, K. Asanović, and J. Kubiatowicz, “A hardware accelerator
+for tracing garbage collection,” in Proceedings of the 45th International
+Symposium on Computer Architecture, 2018, pp. 138–151.
+[38] H. Miller, P. Haller, E. Burmako, and M. Odersky, “Instant pickles:
+Generating object-oriented pickler combinators for fast and extensible
+serialization,” in Proceedings of the ACM SIGPLAN International
+Conference on Object Oriented Programming Systems Languages &#38;
+Applications, 2013, pp. 183–202.
+[39] C. Navasca, C. Cai, K. Nguyen, B. Demsky, S. Lu, M. Kim, and G. H.
+Xu, “Gerenuk: Thin computation over big native data using speculative
+program transformation,” in Proceedings of the 27th ACM Symposium
+on Operating Systems Principles, 2019, pp. 538–553.
+[40] J. Nelson, B. Holt, B. Myers, P. Briggs, L. Ceze, S. Kahan, and M. Oskin,
+“Latency-tolerant software distributed shared memory,” in 2015 USENIX
+Annual Technical Conference, 2015, pp. 291–305.
+[41] K. Nguyen, L. Fang, C. Navasca, G. Xu, B. Demsky, and S. Lu, “Skyway:
+Connecting managed heaps in distributed big data systems,” in Proceedings of the Twenty-Third International Conference on Architectural
+Support for Programming Languages and Operating Systems, 2018, pp.
+56–69.
+[42] K. Nguyen, K. Wang, Y. Bu, L. Fang, J. Hu, and G. Xu, “Facade: A
+compiler and runtime for (almost) object-bounded big data applications,”
+in Proceedings of the Twentieth International Conference on Architectural
+Support for Programming Languages and Operating Systems, 2015, pp.
+675–690.
+[43] “OpenJDK8,” http://openjdk.java.net/projects/jdk8.
+[44] K. Ousterhout, R. Rasti, S. Ratnasamy, S. Shenker, and B.-G. Chun,
+“Making sense of performance in data analytics frameworks,” in 12th
+USENIX Symposium on Networked Systems Design and Implementation,
+2015, pp. 293–307.
+[45] “Protocol
+Buffers,”
+https://developers.google.com/protocolbuffers/docs/javatutorial.
+[46] S. Rheindt, A. Fried, O. Lenke, L. Nolte, T. Wild, and A. Herkersdorf,
+“Nemesys: near-memory graph copy enhanced system-software,” in
+Proceedings of the International Symposium on Memory Systems, 2019,
+pp. 3–18.
+[47] D. Sanchez and C. Kozyrakis, “Zsim: Fast and accurate microarchitectural
+simulation of thousand-core systems,” in Proceedings of the 40th
+International Symposium on Computer Architecture, 2013, p. 475–486.
+[48] “SerDe,” https://serde.rs.
+[49] “ReflectAsm,” https://github.com/EsotericSoftware/reflectasm.
+[50] K. Shvachko, H. Kuang, S. Radia, R. Chansler et al., “The hadoop
+distributed file system.” in 2010 IEEE 26th Symposium on Mass Storage
+Systems and Technologies, vol. 10, 2010, pp. 1–10.
+[51] “The Colfer Serializer,” https://go.libhunt.com/project/colfer.
+
+[52] H. Tseng, Q. Zhao, Y. Zhou, M. Gahagan, and S. Swanson, “Morpheus:
+Creating application objects efficiently for heterogeneous computing,” in
+Proceedings of the 43rd Annual International Symposium on Computer
+Architecture, 2016.
+[53] L. Wu, A. Lottarini, T. K. Paine, M. A. Kim, and K. A. Ross, “Q100:
+The architecture and design of a database processing unit,” SIGARCH
+Comput. Archit. News, vol. 42, no. 1, 2014.
+[54] M. Zaharia, “What is changing in big data,” 2016.
+[55] M. Zaharia, M. Chowdhury, M. J. Franklin, S. Shenker, and I. Stoica,
+“Spark: Cluster computing with working sets,” in Proceedings of the
+2nd USENIX Conference on Hot Topics in Cloud Computing, 2010, pp.
+10–10.
+[56] S. Zhang, H. Angepat, and D. Chiou, “Hgum: Messaging framework for
+hardware accelerators,” in 2017 International Conference on ReConFigurable Computing and FPGAs, 2017.
+

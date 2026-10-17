@@ -1,0 +1,1039 @@
+               TMO: Transparent Memory Offloading in Datacenters
+                 Johannes Weiner                                                Niket Agarwal                                Dan Schatzberg
+                      Meta Inc.                                                    Meta Inc.                                     Meta Inc.
+                   Menlo Park, USA                                              Menlo Park, USA                               Menlo Park, USA
+                   jweiner@fb.com                                               niketa@fb.com                               dschatzberg@fb.com
+
+                       Leon Yang                                                   Hao Wang                                  Blaise Sanouillet
+                       Meta Inc.                                                  Meta Inc.                                      Meta Inc.
+                   Menlo Park, USA                                             Menlo Park, USA                                Menlo Park, USA
+                    lnyng@fb.com                                              haowang3@fb.com                                  blez@fb.com
+
+                   Bikash Sharma                                                   Tejun Heo                                   Mayank Jain
+                       Meta Inc.                                                   Meta Inc.                                     Meta Inc.
+                   Menlo Park, USA                                              Menlo Park, USA                               Menlo Park, USA
+                   bsharma@fb.com                                               htejun@fb.com                                 mjain8@fb.com
+
+                                               Chunqiang Tang                                     Dimitrios Skarlatos
+                                                    Meta Inc.                                   Carnegie Mellon University
+                                                 Menlo Park, USA                                     Pittsburgh, USA
+                                                  tang@fb.com                                      dskarlat@cs.cmu.edu
+
+ABSTRACT                                                                                    swap-in rate of anonymous memory and the reload rate of file pages
+The unrelenting growth of the memory needs of emerging data-                                that were recently evicted from the file cache.
+center applications, along with ever increasing cost and volatility                            TMO has been running in production for more than a year, and
+of DRAM prices, has led to DRAM being a major infrastructure                                has saved between 20-32% of the total memory across millions
+expense. Alternative technologies, such as NVMe SSDs and upcom-                             of servers in our large datacenter fleet. We have successfully up-
+ing NVM devices, offer higher capacity than DRAM at a fraction                              streamed TMO into the Linux kernel.
+of the cost and power. One promising approach is to transparently
+offload colder memory to cheaper memory technologies via ker-                               CCS CONCEPTS
+nel or hypervisor techniques. The key challenge, however, is to                             • Software and its engineering → Operating Systems; Memory
+develop a datacenter-scale solution that is robust in dealing with di-                      management; • Hardware → Non-volatile memory.
+verse workloads and large performance variance of different offload
+devices such as compressed memory, SSD, and NVM.                                            KEYWORDS
+   This paper presents TMO, Meta’s transparent memory offloading                            Datacenters, Operating Systems, Memory Management, Non-volatile
+solution for heterogeneous datacenter environments. TMO intro-                              Memory
+duces a new Linux kernel mechanism that directly measures in re-
+                                                                                            ACM Reference Format:
+altime the lost work due to resource shortage across CPU, memory,
+                                                                                            Johannes Weiner, Niket Agarwal, Dan Schatzberg, Leon Yang, Hao Wang,
+and I/O. Guided by this information and without any prior appli-
+                                                                                            Blaise Sanouillet, Bikash Sharma, Tejun Heo, Mayank Jain, Chunqiang
+cation knowledge, TMO automatically adjusts how much memory                                 Tang, Dimitrios Skarlatos. 2022. TMO: Transparent Memory Offloading in
+to offload to heterogeneous devices (e.g., compressed memory or                             Datacenters. In Proceedings of the 27th ACM International Conference on
+SSD) according to the device’s performance characteristics and                              Architectural Support for Programming Languages and Operating Systems
+the application’s sensitivity to memory-access slowdown. TMO                                (ASPLOS ’22), February 28 – March 4, 2022, Lausanne, Switzerland. ACM,
+holistically identifies offloading opportunities from not only the                          New York, NY, USA, 13 pages. https://doi.org/10.1145/3503222.3507731
+application containers but also the sidecar containers that provide
+infrastructure-level functions. To maximize memory savings, TMO                             1   INTRODUCTION
+targets both anonymous memory and file cache, and balances the                              The massive growth in memory needs of emerging applications
+                                                                                            such as machine learning, coupled with the slowdown of DRAM
+Permission to make digital or hard copies of part or all of this work for personal or       device scaling [19, 25] and large fluctuations of the DRAM cost, has
+classroom use is granted without fee provided that copies are not made or distributed       made DRAM prohibitively expensive as the sole memory capacity
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for third-party components of this work must be honored.      solution.
+For all other uses, contact the owner/author(s).                                               In recent years, a plethora of non-DRAM cheaper memory tech-
+ASPLOS ’22, February 28 – March 4, 2022, Lausanne, Switzerland                              nologies such as NVMe SSDs [8, 11] and NVM [14, 17, 24, 30, 34, 37]
+© 2022 Copyright held by the owner/author(s).
+ACM ISBN 978-1-4503-9205-1/22/02.                                                           have been successfully deployed in datacenters, or are on their way.
+https://doi.org/10.1145/3503222.3507731                                                     Moreover, emerging non-DDR memory bus technologies such as
+ASPLOS ’22, February 28 – March 4, 2022, Lausanne, Switzerland                                                                     J. Weiner, et al.
+
+
+CXL [9] provide memory-like access semantics and close-to-DDR             several heuristics. This relegated swap to only be used as an emer-
+performance. The confluence of these trends enable new opportu-           gency overflow for memory, which is not suitable for offloading op-
+nities for memory tiering not possible in the past [12, 16, 21, 31–       erations. In order to offload file and anonymous pages more evenly,
+33, 39, 40].                                                              we modified the kernel to balance the swap-in rate of anonymous
+   With memory tiering, less frequently accessed data is migrated         memory and the reload rate of file pages that were recently evicted
+to slower memory. The migration process can be driven by the              from the file cache.
+application itself, a userspace library [6, 12, 26, 29], the kernel, or      Second, TMO holistically identifies offloading opportunities from
+the hypervisor. This paper focuses on kernel-driven migration, or         not only the application containers but also the sidecar containers
+swapping, as it can be transparently applied to many applications         that provide connectivity functions (e.g., routing and proxy) among
+without requiring any application modification.                           microservices or infrastructure-level functions such as logging and
+   Despite its conceptual simplicity, the only known large-scale          service discovery.
+adoption of kernel-driven swapping for latency-sensitive datacen-            Finally, as memory is distributed across complex container hi-
+ter applications, is Google’s deployment [18] of zswap [43], which        erarchies and containers may have different priorities, TMO accu-
+we call g-swap in the rest of this paper. As a pioneer, g-swap sig-       rately monitors each container’s memory needs, and considers the
+nificantly advanced the state of the art, but still has several major     hierarchies and properties of containers when making offloading
+limitations.                                                              decisions.
+   First, g-swap supports only a single slow memory tier, i.e., a            Currently, TMO provides transparent memory offloading across
+compressed memory pool managed by zswap. On one hand, this                millions of servers in our datacenters, and saves 20-32% of the total
+simplicity avoids the difficult problem of tackling heterogeneous         memory. About 7-19% of the savings come from the application
+memory tiers that exhibit large performance variances, e.g., NVMe         containers, while about 13% of the savings come from the sidecar
+SSDs and NVM devices. On the other hand, it is insufficient in            containers.
+maximizing memory-cost savings. §2.1 shows that NVMe SSDs                    The contributions of this paper are as follows:
+offer an order of magnitude cost and power savings compared                   (1) We introduce PSI, a Linux kernel component that directly
+with compressed memory. Moreover, some application’s data are                     measures in realtime the lost work due to resource shortage
+hard to compress, e.g., machine learning models with quantized                    across CPU, memory, and I/O. This is the first solution that
+byte-encoded values.                                                              can directly measure an application’s sensitivity to memory-
+   Second, g-swap relies on extensive offline application profiling,              access slowdown, without resorting to fragile low-level met-
+and sets a static target page-promotion rate to determine how much                rics such as the page-promotion rate.
+memory to offload. This empirical approach is not sufficiently ro-            (2) We introduce Senpai, a userspace agent that applies a mild
+bust because the promotion-rate metric does not directly reflect                  memory pressure to effectively offload memory across di-
+an application’s sensitivity to memory-access slowdown, and does                  verse workloads and heterogeneous hardware with minimal
+not consider the performance characteristics of the offloading de-                impact on application performance. Compared with g-swap,
+vice. Specifically, our evaluation in §4.3 with one of the largest                the key advantages of Senpai are that it does not require of-
+applications at Meta, directly contradicts g-swap’s assumption that               fline application profiling and supports both SSDs and zswap
+memory offloading should be kept below a pre-configured promo-                    as slow memory tiers.
+tion rate in order to avoid hurting the application’s performance.            (3) TMO performs memory offloading to swap at a subliminal
+To the contrary, with a faster offloading device, a higher promotion              memory-pressure level, and the turnover is proportional
+rate actually improves the application’s performance                              to file cache. This is in contrast to the historic behavior of
+   To address these limitations, we built TMO, a transparent mem-                 swapping as an emergency overflow under severe memory
+ory offloading solution for containerized environments. Fundamen-                 pressure.
+tally, TMO needs to answer two questions: how much memory to                  (4) We report our experience of deploying TMO in production
+offload and what memory to offload. To answer the first question,                 to millions of servers.
+TMO introduces a new kernel mechanism called Pressure Stall In-               (5) We have upstreamed PSI into the Linux kernel and also made
+formation (PSI ), which directly measures in realtime the lost work               Senpai1 open source.
+due to resource shortage across CPU, memory, and I/O. PSI is re-
+ported on a per-process and per-container basis. Unlike g-swap’s          2    MEMORY OFFLOADING OPPORTUNITIES
+promotion-rate metric, PSI accounts for both the performance char-
+acteristics of the slow memory tier and the application’s sensitivity
+                                                                               AND
+to memory-access slowdown. A userspace agent called Senpai uses                CHALLENGES IN DATACENTERS
+the PSI metrics to dynamically decide how much memory to offload          In this section, we first present DRAM and SSD cost trends from
+without prior application knowledge while taking into account             Meta’s datacenters that consist of millions of servers. Then, we
+hardware heterogeneity in datacenters.                                    showcase memory offloading opportunities across a wide range of
+   To answer the question of what memory to offload, we had to            applications running in our fleet. Furthermore, beyond workloads,
+address several challenges. First, the Linux kernel attempted to          we introduce datacenter and microservice memory tax and present
+balance memory reclamation between file cache and swap-backed             fleet-wide characterization of offloading opportunities. Next, we
+anonymous memory, but skewed heavily towards file cache through
+                                                                          1 https://github.com/facebookincubator/oomd
+TMO: Transparent Memory Offloading in Datacenters                                                                  ASPLOS ’22, February 28 – March 4, 2022, Lausanne, Switzerland
+
+
+highlight the need for a memory offloading system to take into                                                       Used 1-min           Used 2-min            Used 5-min       Total Allocated
+
+
+
+
+                                                                                            of Application
+account the intricacies of the memory allocation subsystem. Finally,                                         100
+
+
+
+
+                                                                                             Memory %
+                                                                                                              75
+we show SSD heterogeneity across our datacenters and how it poses
+                                                                                                              50
+significant challenges to heterogeneous memory offloading.                                                    25
+                                                                                                               0
+                                                                                                                          A          B            s         d        eA        eB       b           e
+2.1         Memory and SSD Cost Trends                                                                             Ad
+                                                                                                                      s
+                                                                                                                              Ad
+                                                                                                                                 s
+                                                                                                                                         An
+                                                                                                                                           aly
+                                                                                                                                              tic     Fee
+                                                                                                                                                                Ca
+                                                                                                                                                                  ch
+                                                                                                                                                                          Ca
+                                                                                                                                                                            ch       We
+                                                                                                                                                                                             Av
+                                                                                                                                                                                                erag
+
+
+
+
+                                       Memory Cost                SSD Cost
+                                                                                     Figure 2: Application’s recently used memory in 1 min, 2
+       % of Infrastructure
+
+
+
+
+                             45        Compressed Memory Cost                        min, and 5 min intervals, and memory not used in the last 5
+                             35                                                      min.
+                             25
+                             15
+                              5                                                      last 5 minutes. Overall, the memory offloading opportunity (i.e.,
+                             Gen 1   Gen 2     Gen 3      Gen 4   Gen 5      Gen 6   fraction of cold memory) averages about 35%, but varies wildly
+                                                                                     across applications in a range of 19-62%, which emphasizes the
+Figure 1: Cost of memory, compressed memory, and SSDs                                importance of having an offloading method that is robust against
+as a percentage of compute infrastructure across hardware                            application’s diverse memory behaviors.
+generations.
+                                                                                     2.3      Memory Tax
+   Figure 1 shows the relative cost of DRAM, compressed memory,                      To ease the operation of applications in datacenters, a significant
+and SSD storage as a fraction of server cost in our datacenters.                     amount of memory is used to enable microservices and provide
+The 𝑥-axis shows different hardware generations. The compressed                      infrastructure-level functions. We define as datacenter memory tax
+memory cost is estimated based on a 3x compression ratio repre-                      the memory required for software packages, profiling, logging, and
+sentative of the average for our production workloads. The Gen-1                     other supporting functions related to the deployment of applica-
+hardware is near its end of life while Gen-5 and Gen-6 are expected                  tions in datacenters. We further define as microservice memory tax
+to be deployed in the near future. The cost of DRAM, as a fraction                   all the memory required by applications due to their disaggrega-
+of server cost, is expected to grow and reach 33%. While not shown                   tion into microservices, e.g., to support routing and proxy, and it is
+in the figure, DRAM power consumption follows a similar trend                        applicable uniquely to microservice architectures.
+and is expected to reach 38% of our server infrastructure.
+   Using compressed memory can reduce the cost significantly,
+                                                                                                       20
+but it is still insufficient and we need alternative memory tech-
+nologies such as NVMe SSDs to further drive down the cost more
+                                                                                            Memory %
+
+
+
+
+                                                                                                       15
+
+aggressively. NVMe SSDs provide a much larger memory footprint                                         10
+per-server than DRAM, at substantially cheaper cost and lower                                           5
+power per-byte. We equip all our production servers with a very
+                                                                                                        0
+capable NVMe SSD. At the system level, NVMe SSDs contribute to                                           Datacenter Tax                          Microservice Tax                           Total
+
+under 3% of server cost (about 3x lower than compressed memory
+in our current generation of servers). Moreover, Figure 1 shows                            Figure 3: Datacenter and microservice memory tax.
+that, iso-capacity to DRAM, SSD remains under 1% of server cost
+across generations (about 10x lower than compressed memory in                           Figure 3 shows the average memory tax as a percentage of the
+cost-per-byte!). These trends make NVMe SSDs much more cost                          total server memory across all workloads at Meta. Both datacenter
+effective compared to compressed memory for our fleet.                               and microservice tax account for a significant percentage of mem-
+                                                                                     ory usage. On average, the memory tax accounts for 20% of the total
+2.2         Cold Memory as Offloading Opportunity                                    memory capacity. Datacenter memory tax is 13% and it is uniform
+Datacenter applications exhibit drastic differences in their memory                  across all workloads. Microservice memory tax accounts for 7%
+behavior. To quantify the opportunity of memory offloading we                        on average, and can vary depending on application characteristics.
+characterize the memory coldness of seven large applications at                      Notably, the performance SLA for most of the memory tax is more
+Meta.                                                                                relaxed than that of memory directly consumed by applications. As
+   Figure 2 shows the amount of memory touched in the last 𝑥                         a result, the memory tax was a prime target for memory offloading
+minutes, where 𝑥 is 1, 2, or 5 minutes, as well as memory that                       during our first production launch of TMO.
+remains untouched after 5 minutes. For example, for Feed, starting
+from the bottom, 50% of the memory is used in the last 1 minute,                     2.4      Anonymous and File-Backed Memory
+additional 8% in the last 2 minutes, and additional 12% in the last                  Memory is separated into two main categories, anonymous mem-
+5 minutes. The remaining 30% remains cold past the 5 minute                          ory and file-backed memory. Anonymous memory is allocated by
+interval. The memory coldness of applications vary drastically. For                  applications and is not backed by a file or a device. File-backed
+example, 81% of memory for Cache B is active in the last 5 minutes.                  memory represents allocated memory in relation to a file and is
+By contrast, only 38% of memory for Web is actively used in the                      further stored in the kernel’s page cache.
+ASPLOS ’22, February 28 – March 4, 2022, Lausanne, Switzerland                                                                                                                 J. Weiner, et al.
+
+
+
+                                                         Anonymous                    File-backed
+                                                                                                                       3     TMO DESIGN
+       Memory %
+
+
+                               100
+                                75                                                                                     The goal of TMO is to transparently offload memory to hetero-
+                                50                                                                                     geneous backends that offer cost-effective but slower memory ac-
+                                25
+                                 0                                                                                     cesses. TMO’s workload-transparent design allows for a seamless
+                                             ter     ice s A      s   B       eo      ed
+                                                                                                ch
+                                                                                                   e       RE   We
+                                                                                                                   b
+                                          en      erv Ad
+                                       tac x cros x
+                                                               Ad         Vid      Fe         Ca                       deployment across a diverse set of applications and heterogeneous
+                                     Da  Ta Mi   Ta
+                                                                                                                       infrastructure. Fundamentally, TMO addresses the questions of how
+                                                                                                                       much memory to offload and what memory to offload.
+Figure 4: Anonymous and file-backed memory breakdown.
+                                                                                                                       3.1    Transparent Memory Offloading
+                                                                                                                              Architecture
+   Figure 4 shows the breakdown of anonymous and file-backed                                                           Figure 6 shows the overview of the TMO architecture (left) and the
+memory for several large applications, datacenter memory tax, and                                                      memory and storage layout (right). TMO is composed of multiple
+microservice memory tax. The breakdown varies wildly across                                                            pieces across userspace and the kernel. Unmodified workloads ex-
+applications and memory taxes. Overall, we need to consider of-                                                        ecute within a container 1 and interact with the kernel memory
+floading opportunities for both anonymous and file-backed memory                                                       management subsystem through system calls and paging. TMO’s
+in order to maximize the savings.                                                                                      Senpai is a userspace component 2 responsible for controlling the
+                                                                                                                       memory offloading process and deciding how much memory should
+                                                                                                                       be offloaded from each workload. The Senpai monitors application
+2.5          Hardware Heterogeneity of Offload Backend                                                                 performance degradation in the form of pressure information that
+We define a memory offload backend as the slow-memory tier that                                                        is reported by the Pressure Stall Information (PSI) component 3
+holds offloaded memory. In our current production fleet this consists                                                  that lives in the kernel. We describe PSI in §3.2 and Senpai in §3.3.
+of NVMe SSDs and a compressed memory pool. In the future we                                                                Based on the PSI information, Senpai drives the offload pro-
+expect this to include NVM and CXL devices.                                                                            cess by writing to cgroup control files 4 that trigger the kernel’s
+   NVMe SSD device heterogeneity is a significant challenge in                                                         memory reclamation logic. The reclamation logic determines what
+datacenter environments. Multiple factors unavoidably create het-                                                      memory to offload. We describe our modifications to Linux kernel
+erogeneous hardware in large-scale datacenters, including datacen-                                                     reclaim algorithms in §3.4. The memory management subsystem 5
+ter turn-ups, hardware refresh, and the need to maintain a diverse                                                     exposes memory pressure information to the PSI module and trig-
+supply chain from different vendors.                                                                                   gers read and write operations to the offload backend 6 and the
+                                                                                                                       regular filesystem. TMO supports offloading to either a compressed
+                                                                                                                       memory pool based on zswap or storage devices through swap.
+                                                 Endurance (pTBW) Read (us)    Write (us)                                  The right side of Figure 6 shows a high-level layout of the mem-
+       SSD Metric (logscale)
+
+
+
+
+                                                 Read (iops)      Write (iops)
+                               106                                                                                     ory and storage in addition to their respective operations. TMO
+                               104
+                                                                                                                       targets workload memory as well as datacenter and microservice
+                                                                                                                       memory tax. Furthermore, TMO is responsible for both offloading
+                               102
+                                                                                                                       memory to the backends 7 by compression, swapping or discard-
+                               100
+                                          A        B           C           D              E            F        G
+                                                                                                                       ing page cache, as well as bringing it back to main memory when
+                                                                                                                       needed, following the reverse operations. Finally, the figure shows
+Figure 5: SSD characteristics in logscale. 𝐴-𝐺 on the 𝑥-axis                                                           TMO’s currently supported offloading backends 8 , with zswap
+represent different SSD devices.                                                                                       being in DRAM and swap and filesystem in storage SSDs.
+
+                                                                                                                       3.2    Defining Resource Pressure
+   Figure 5 shows in logscale, the endurance, read and write IOPS                                                      In determining how much memory to offload we need a measure
+and p99 latency across major SSD types across Meta’s fleet. Newer                                                      of the impact on application performance due to lack of memory.
+devices are to the right of the figure. Notably, although SSD en-                                                      Devising a uniform metric for application performance across di-
+durance has improved over SSD generations, it is still a limited                                                       verse workloads is by itself difficult, but even more challenging is
+resource and should be used judiciously by a memory offloading                                                         capturing the performance impact of lack of memory specifically,
+system. Furthermore, although IOPS are relatively stable across                                                        excluding other unrelated issues.
+generations, read and write latency shows significant variation                                                           The OS kernel exports various event counters that can indicate
+across generations, ranging from 9.3ms to 470us.                                                                       problems, such as counts of major page faults, and most prior work
+   Besides SSDs, we also use compressed memory as an offload                                                           has used major faults as a primary indicator for approximating the
+backend. The p90 latency of a 4KB read from compressed memory                                                          impact of memory offloading to application performance. However,
+is about 40us. Compared with SSDs, compressed memory is an                                                             elevated major fault counts could be due to a workload starting up or
+order of magnitude faster and with a small latency variance. More-                                                     a working set transition, and not due to a shortage of memory. Also,
+over, compressed memory avoids the endurance limits of SSDs.                                                           in a heterogeneous memory system with diversity across offloading
+Overall, a memory offloading system needs to effectively tackle a                                                      backends, a given major fault rate could constitute a problem on
+heterogeneous fleet despite large differences in offload backends.                                                     a slow storage device while being insignificant on a faster one. In
+TMO: Transparent Memory Offloading in Datacenters                                                    ASPLOS ’22, February 28 – March 4, 2022, Lausanne, Switzerland
+
+
+
+                                                                                                                 Memory            DRAM
+                                     Userspace       Kernel
+                                                                                                                Workload
+                                         1                                                Read/
+                       Workload                             Memory Management
+                                                                                          Write                Datacenter
+                                        Syscall/PF                5
+                                                          Memory       Paging                                     Tax
+                       Container
+                                                                                                              Microservice
+                                                     Reclaim                                                      Tax
+                                        2
+                        i Observe                        cgroup         zSwap        Swap                                             8
+                          Pressure      Control      4                                                        zSwap Pool
+                        ii Reclaim                                     Offload 6      File                                            SSD
+                           Memory                                                                              Swap Pool
+                        Senpai           Report           PSI         Backends       System          7
+                                                                  3                                 File System
+                                                                                Memory Offloading Offload Backends
+
+                    Figure 6: Overview of the TMO architecture (left) and the memory and storage layout (right).
+
+
+general, it can be difficult to understand if particular kernel events                                   Some: One process       Full: All process
+                                                                                       Time              stalls for resources    stall for resources      stall
+are a functional problem for a workload or not. We will demonstrate
+in the evaluation §4.3 that major fault rate or promotion rate has                  Process A
+limitations, especially when considering heterogeneous offloading
+backends with significant diversity in performance.                                 Process B
+3.2.1 PSI Metrics. Fundamentally, PSI exposes a metric that rep-                               0.0               25%            50%              75%         100%
+resents the amount of lost work due to the lack of a resource. It
+can be measured for a single process, a container or machine-wide.
+PSI calculates pressure metrics by considering only non-idle pro-                             Figure 7: Kernel resource pressure metrics.
+cesses. For each non-idle process, PSI further distinguishes between
+periods of time when a process is exclusively either runnable or
+stalled due to insufficient resources. Furthermore, it defines the                 is that by itself it does not capture the impact of memory, or a lack
+compute potential as the number of non-idle processes capped at                    thereof, on application performance. Other metrics, like promotion
+the number of CPUs. PSI is the proportion of compute potential                     rate account for the number of swap-ins per second. A drawback
+that is unproductive due to resource stalls. It is often represented               of the promotion rate is that it does not take into account the
+as a percentage. For containers and whole-system domains, PSI                      performance characteristics of the offloading backend. Furthermore,
+introduces two pressure indicators for each resource called some                   it fails to capture application performance improvements as more
+and full. The some metric tracks the percentage of time in which                   memory becomes available due to offloading.
+at least one process within the domain is stalled waiting for the                      Instead, PSI directly captures the impact of memory-access slow-
+resource. The full metric tracks the percentage of time in which                   down to an application and further incorporates the performance
+all processes are delayed simultaneously.                                          and utilization characteristics of the offloading backend. The main
+    Consider the example in Figure 7, which shows the execution                    cost of PSI is scheduling latency since some logic needs to be per-
+time of two processes A and B as well as their stall time with a dotted            formed on a context switch. In real applications in our fleet the
+box. The some stalling information is shown with a blue arrow,                     overhead is negligible. Beyond datacenters, PSI is enabled by de-
+while full stalling is shown with a green arrow. The execution time                fault on all major Linux distributions including Android. We further
+is normalized to 100% and partitioned into four sections. During the               compare PSI to other metrics in Section 4.
+first quarter, only one process stalls at a time, either process A or
+process B. Hence 12.5% of time is accounted for by the some metric.                3.2.3 PSI Across System Resources. To track memory pressure, PSI
+Instead, in the second quarter, for 6.25% of time, both processes stall            records time spent on events that occur exclusively when there is a
+concurrently during their execution time and hence this stalling                   shortage of memory. Currently, this includes three occasions. The
+time is accounted for by the full metric. In addition, 18.75% of stall             first occasion is when a process triggers reclaiming pages when
+time is accounted for by the some metric. The next two quarters                    memory is full and the process tries to allocate new pages. The
+show different variations of stalls and how some and full are                      second occasion is when a process needs to wait for IO for a refault,
+accounted for accordingly. Overall, some aims to capture added                     i.e., a major fault against a page which was recently evicted from the
+latencies to individual processes due to lack of a resource while                  file cache. The third occasion is when a process blocks on reading
+full indicates the amount of completely unproductive time in the                   a page in from the swap device.
+container or system.                                                                   Block IO stalls are more difficult to accurately calculate because
+                                                                                   existing hardware provides little insights into device contention.
+3.2.2 PSI Comparison to Other Metrics and Cost. One existing                       In particular, we cannot attribute a portion of a stall on block IO
+mechanism is the resident set size (RSS), which tracks the amount of               to the device being oversubscribed or simply expected latency of a
+main memory that belongs to a process. The main limitation of RSS                  device access. We therefore treat any process waiting on block IO
+ASPLOS ’22, February 28 – March 4, 2022, Lausanne, Switzerland                                                                                       J. Weiner, et al.
+
+
+completion to be stalled due to lack of IO. This has worked well for       3.3    Determining Memory Requirements of
+us in production across diverse workloads.                                        Containers
+   CPU stalls are accounted for as the periods of time when a
+                                                                           Senpai is a userspace tool responsible for driving memory offload,
+process is runnable but needs to wait for an idle CPU to become
+                                                                           using PSI metrics to determine how much memory can be moved
+available. CPU full pressure is only possible within a container,
+                                                                           out.
+which occurs when none of the processes can execute either due
+                                                                              Estimating the memory a workload requires is challenging. Along
+to outside competition or due to configured limits on the cgroup’s
+                                                                           with their workingsets, applications also make allocations or in-
+CPU cycles.
+                                                                           stantiate file cache that is rarely used - or even used just once -
+                                                                           but the kernel only identifies and reclaims such cold pages when
+                                                                           free memory is low. This leads to applications’ memory footprints
+                                                                           being larger than the number of pages they would need resident
+                                                                           in order to function normally. In practice, most developers notice
+3.2.4 PSI Use Cases. By aggregating these process state times
+                                                                           when their applications run out of memory, but are rarely made
+across all CPUs in the system and breaking them down per con-
+                                                                           aware when memory is (vastly) overprovisioned.
+tainer, PSI gives an intuitive insight into the quality of resource
+                                                                              Senpai continuously engages the kernel’s reclaim algorithm,
+provisioning for any given workload and container, and provides
+                                                                           using PSI as feedback on workload health to modulate its aggres-
+the ability to root-cause performance problems or SLO violations
+                                                                           siveness, to identify the share of allocated pages that the workload
+observed at the application level such as missed response deadlines.
+                                                                           requires to function, and offload any beyond that. This proactive
+   The pressure metrics are aggregated in realtime, and are available
+                                                                           approach ensures that available offloading capacity is utilized opti-
+at the microsecond resolution as well as running averages (10s,
+                                                                           mally on one hand, and simultaneously provides an accurate work-
+1m, 5m). This enables resource management on both ends of the
+                                                                           ingset profile of the application over time. This allows application
+pressure spectrum.
+                                                                           developers to more precisely provision memory capacity for their
+   Large amounts of full pressure can be used to detect unac-
+                                                                           workloads.
+ceptable losses of productivity that require immediate remediation.
+These can be caused by overlapping peaks in a system’s main work-
+                                                                                                                        Memory Pressure
+
+                                                                                         Reclaim Resource Pressure
+load and a system maintenance process, as well as application bugs,                                                   x PSI Tracking      Pressure
+or errors in configuration and scheduling. Any of these situations
+                                                                                                                                 x x Threshold
+                                                                                                    Container
+
+require a timely intervention in order to prevent disruption to ser-                                                   x       x
+vice quality or threats to the health of the server itself. For example,                                             x   x           x
+                                                                                                                           x x         x x
+long before the kernel’s out-of-memory killer triggers, applications
+can be functionally out of memory when the lack of it causes de-                                                        Reclaim Volume
+                                                                                        Container
+
+
+
+
+lays that prevent the application from meeting its SLO. Userspace
+out-of-memory killers can monitor full metrics and apply killing
+policies.                                                                                                                       Time
+   Additionally, some pressure measures the latency impact of lack
+of a resource and is sensitive enough to detect aggregate delays           Figure 8: Example of Senpai PSI tracking and reclaim volume
+below the threshold that would cause applications to suffer mean-          tuning.
+ingful performance losses. In TMO we exclusively rely on some                 Figure 8 shows a high-level overview of Senpai’s operations.
+metrics to measure the performance impact of memory offloading.            Once every few seconds, Senpai calculates for each cgroup the
+By ensuring the value is low but non-zero, we maintain the pres-           amount of memory to reclaim as follows:
+ence of resource contention just high enough that no resources are
+                                                                                   𝑟𝑒𝑐𝑙𝑎𝑖𝑚_𝑚𝑒𝑚 = 𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑚𝑒𝑚 × 𝑟𝑒𝑐𝑙𝑎𝑖𝑚_𝑟𝑎𝑡𝑖𝑜 ×
+going idle, but not so high as to disturb the nominal operation of
+the workload. In this pressure range, the workload is provisioned                                                  𝑃𝑆𝐼𝑠𝑜𝑚𝑒
+                                                                                                     𝑚𝑎𝑥 (0, 1 −              )
+with the minimum amount of the resource it requires to function                                                  𝑃𝑆𝐼𝑡ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑
+well.                                                                         𝑃𝑆𝐼𝑠𝑜𝑚𝑒 is the cgroup’s some PSI metric. 𝑃𝑆𝐼𝑡ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑 and re-
+   Before PSI, operators relied on correlating indirect metrics such       claim_ratio are configurable parameters. 𝑐𝑢𝑟𝑟𝑒𝑛𝑡_𝑚𝑒𝑚 is the cur-
+as kernel time, variations in application throughput, event counters       rent memory footprint of the cgroup. No memory is reclaimed when
+for reclaim activity, file re-reads, and swap-ins, in order to estimate    𝑃𝑆𝐼𝑠𝑜𝑚𝑒 is above 𝑃𝑆𝐼𝑡ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑 . Otherwise, Senpai asks the kernel
+the resource health of workloads. This required an intuitive under-        to reclaim 𝑟𝑒𝑐𝑙𝑎𝑖𝑚_𝑚𝑒𝑚 from the cgroup. As 𝑃𝑆𝐼𝑠𝑜𝑚𝑒 approaches
+standing of the storage hardware device characteristics and kernel         𝑃𝑆𝐼𝑡ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑 , Senpai gradually reclaims less memory in order to
+behavior. For example, the file read-ahead algorithm may shield the        achieve a mild steady-state memory pressure.
+application to varying degrees from the effects of recorded cache             Senpai uses the cgroup interface to direct the kernel’s reclaim
+re-reads. PSI on the other hand measures productivity losses from          algorithm. In an early version, Senpai would continuously adjust the
+qualifying stall events directly at the process level. It takes into       memory limit of the workload’s cgroup. Lowering the limit below
+account differences in underlying hardware, the effectiveness of the       the current size causes the kernel to reclaim the difference. Instead,
+kernel’s memory management algorithms, and even the internal               increasing the limit relieves pressure and allows the workload to
+concurrency (i.e., some vs. full stalls) of the workload.                  expand. However, the statefulness of the memory limit combined
+TMO: Transparent Memory Offloading in Datacenters                                        ASPLOS ’22, February 28 – March 4, 2022, Lausanne, Switzerland
+
+
+with dynamic workloads can cause problems in some situations.            3.4    Kernel Optimizations for Memory
+For example, if a container is under rapid memory growth and its                Offloading
+size is actively expanding, it may become blocked until Senpai can
+                                                                         Senpai relies on the kernel to reclaim cold memory pages from
+raise its limit further.
+                                                                         cgroups. Instead of using expensive full page table scans to deter-
+   To address this problem, we added a stateless memory.reclaim
+                                                                         mine which memory pages are cold, Senpai lets the kernel’s reclaim
+cgroup control file to the kernel. This knob allows Senpai to ask the
+                                                                         algorithm choose the pages to offload. This algorithm operates by
+kernel to reclaim exactly the calculated memory amount without
+                                                                         maintaining a pair of active/inactive page LRU lists for both file and
+applying any limit, thus avoiding the risk of blocking expanding
+                                                                         swap-backed pages and by reclaiming colder pages first. This mech-
+workloads.
+                                                                         anism is production-tested for identifying less-used memory pages
+   As PSI is effective in capturing the impact of memory offloading
+                                                                         with relatively low CPU cost and high accuracy. Using it in Sen-
+on diverse applications, we strive for using a single globally optimal
+                                                                         pai greatly simplifies our implementation. In production, reclaim
+Senpai configuration to support all applications. We studied the
+                                                                         driven by Senpai consumes 0.05% of all CPU cycles, a negligible
+performance sensitivity of applications related to file cache and
+                                                                         amount.
+anonymous memory, and iteratively arrived at the current configu-
+                                                                            Historically, the kernel has been very conservative in using swap.
+ration that is used in production for all applications, specifically,
+                                                                         In the era of slow, spinning disks, the semi-random IO patterns
+𝑟𝑒𝑐𝑙𝑎𝑖𝑚_𝑟𝑎𝑡𝑖𝑜=0.0005 and 𝑃𝑆𝐼 _𝑡ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑=0.1%. In production, re-
+                                                                         produced by paging would impose substantial latencies on the
+claim is performed every six seconds. We set this value empirically
+                                                                         workload due to seek overheads of rotational media. Workloads
+to leave enough time to measure the delayed impact (refaults) of
+                                                                         typically could not sustain the IO overhead of constant paging, so
+reclaimed memory. The step size of how much memory is reclaimed
+                                                                         supporting working sets larger than available memory was not
+(𝑟𝑒𝑐𝑙𝑎𝑖𝑚_𝑚𝑒𝑚) depends on how far or how close the observed pres-
+                                                                         considered a case to optimize for. Rather, the kernel focused on
+sure (𝑃𝑆𝐼𝑠𝑜𝑚𝑒 ) is to the target threshold (𝑃𝑆𝐼𝑡ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑 ). The maxi-
+                                                                         simply reclaiming memory that would never be accessed again,
+mum is 1% of the total workload size in each reclaim period. As a
+                                                                         specifically, file cache from previous reads. The kernel’s logic for
+result, reaction time to extreme contraction tends to be minutes.
+                                                                         balancing scans of file cache against swap-backed memory would
+Adaptation to workload expansion, on the other hand, is immediate.
+                                                                         attempt to balance reclaim success rate between the two pools of
+   On one hand, TMO’s effectiveness is not very sensitive to these
+                                                                         memory, but skewed heavily towards file cache through a number
+parameters. On the other hand, our experiments demonstrate that
+                                                                         of different heuristics. This relegated swap to only be used as an
+certain workloads (e.g., batch workloads with less stringent SLOs)
+                                                                         emergency overflow for memory. While developing TMO, we no-
+can tolerate more memory pressure, which provides opportunities
+                                                                         ticed that substantial portions of a workload’s file cache would be
+for offloading more memory. We leave it as future work to per-
+                                                                         reclaimed before the kernel began to consider swapping out cold
+form automated or online tuning of these parameters to maximize
+                                                                         swap-backed memory.
+savings.
+                                                                            Fundamentally, at the time the algorithm was conceived, the
+   Senpai has additional mechanisms to modulate reclaim in certain
+                                                                         kernel lacked knowledge of when reclamation of file cache was
+events such as SSD write endurance thresholds being exceeded or
+                                                                         resulting in recently resident file pages (part of the working set)
+swap space exhaustion. Besides the memory PSI metrics, Senpai
+                                                                         needing to be read in from storage. We augmented the kernel with
+also monitors the IO PSI metrics, because the memory PSI metrics
+                                                                         non-resident cache tracking. Whenever a file cache page is evicted
+alone are insufficient to fully capture the performance impact of
+                                                                         from memory, a counter that is maintained per cgroup is incre-
+memory offloading. In some cases, refaults induced by Senpai might
+                                                                         mented and the current value is stored in a shadow entry that
+not impact the workload in the form of fault latencies, but might
+                                                                         replaces the page. When a file page is faulted in, the kernel can
+slow down the storage device enough to impact the workload’s
+                                                                         determine the reuse distance [7], i.e., the difference between the
+operation indirectly. In theory, the same idea might apply to CPU
+                                                                         current page fault count and its value in the shadow entry. If the
+contention, but in practice, we have not found the CPU cycles spent
+                                                                         reuse distance is smaller than the size of resident memory, the fault
+on refaults to be significant.
+                                                                         is considered a refault.
+   Advantages of a userspace Senpai.
+                                                                            TMO uses this refault-detection mechanism in two ways. For
+   Senpai is implemented in userspace on top of exported kernel in-
+                                                                         one, we repurpose it to calculate memory PSI, by tracking stalls
+terfaces for PSI and cgroup memory control. This has several advan-
+                                                                         due to recently evicted file cache, and excluding stalls due to first-
+tages over a hypthetical in-kernel implementation. First, userspace
+                                                                         time-accessed file cache.
+has full access to floating point units and can therefore perform cal-
+                                                                            For the purpose of offloading to swap backends, we modify the
+culations more effectively. Second, release cycles for userspace com-
+                                                                         kernel reclaim algorithm to exclusively reclaim from file cache
+ponents tend to be significantly faster than for the kernel. We have
+                                                                         so long as no refaults occur. As soon as refaults begin to occur,
+repeatedly iterated through Senpai variables over experimental and
+                                                                         the kernel now balances reclamation of file cache and swap based
+deployment phases, and have also deployed different settings across
+                                                                         on the refault rate and swap-in rate respectively. With this new
+applications for extended periods of time. In the future we have
+                                                                         reclaim algorithm, swap occurs as soon as the file cache’s working-
+plans to exploit distinct Senpai configurations across workloads
+                                                                         set begins to be reclaimed, i.e., refaults begin to occur. This approach
+with different performance SLO thresholds.
+                                                                         more equally offloads file-backed and swap-backed cold memory,
+                                                                         and minimizes the aggregate amount of paging. Our changes to the
+                                                                         Linux kernel reclaim algorithm have been upstreamed.
+ASPLOS ’22, February 28 – March 4, 2022, Lausanne, Switzerland                                                                                                J. Weiner, et al.
+
+
+3.4.1 Transparent Zswap Support. As described in §2.5, using com-                              compression would be unattainable with previous approaches [18].
+pressed memory as an offload backend has substantial performance                               Specifically, machine learning models used for Ads prediction com-
+advantages. It provides a memory offload solution in the absence                               monly use quantized byte-encoded values that exhibit a compres-
+of SSDs, and avoids the endurance limits imposed by SSDs.                                      sion ratio of 1.3-1.4x, leading to poor memory savings through a
+   As a new Linux component, zswap allows the kernel to store                                  compressed memory offloading. Instead, for such applications SSD
+anonymous memory compressed in RAM. Instead of writing pages                                   offloading provides a more cost-effective solution. Overall, across
+to a swap partition on disk, the kernel compresses the page and                                compressed-memory and SSD backends, TMO achieves significant
+stores them in RAM. Accessing the original anonymous memory                                    savings of 7-19% of the total memory, without any noticeable appli-
+page will still result in a page fault, but this time no disk IO needs                         cation performance degradation.
+to be performed, the page can be decompressed and made resident.
+                                                                                                 Datacenter and application memory tax savings. Beyond regular
+Zswap fault latencies can be substantially faster than loading from
+                                                                                               workload memory, TMO further targets datacenter and application
+a block device, but the per-page memory savings depend on the
+                                                                                               memory tax.
+compressibility of the application’s cold anonymous memory.
+   With Senpai and PSI, we can deploy swap or zswap with no
+additional modifications to the application or Senpai, since Senpai                                                                w/o TMO         w/ TMO       13%
+automatically adjusts the reclaim rate based on the offload back-                                            20
+
+
+
+
+                                                                                                  Memory %
+end’s performance. In the case of faster storage or zswap, more                                              15           9%
+pages can be offloaded due to lower latency per-page swap-in.                                                10
+                                                                                                                                             4%
+                                                                                                              5
+4               EVALUATION
+                                                                                                              0
+TMO has been running in production for more than a year leading                                                   Datacenter Tax    Microservice Tax        Total
+
+to significant memory savings across Meta’s fleet. Our evaluation
+focuses on showcasing different aspects of TMO. Specifically, it                               Figure 10: Datacenter and application memory tax savings
+answers the following questions:                                                               normalized to a server’s total memory.
+   (1) How much memory can TMO save?
+   (2) How does TMO impact memory-bound applications?                                             Figure 10 shows the relative memory savings by offloading mem-
+   (3) Are PSI metrics more effective than the promotion-rate met-                             ory tax across Meta’s fleet. When it comes to datacenter tax, TMO
+       ric?                                                                                    saves on average 9% of the total memory within a server. Applica-
+   (4) How to tune TMO’s configurable parameters?                                              tion tax savings account for 4%. Overall, TMO achieves on average
+   (5) Can TMO avoid SSD wear-out due to offloading writes?                                    13% of memory tax savings, in addition to actual workload savings.
+                                                                                               This is a significant amount of memory at the scale of Meta’s fleet.
+4.1                     Fleet-Wide Memory Savings
+We break TMO’s memory savings into savings from applications,                                  4.2            Performance Impact on Memory-Bound
+datacenter memory tax, and application memory tax, respectively.                                              Applications
+                                                                                               In this section we demonstrate how TMO helps improve the perfor-
+                                             Anonymous            File-backed
+                                                                                               mance of memory-bound applications. Specifically, we perform an
+    Memory Savings %
+
+
+
+
+                                                                                               analysis of the Web application, which is one of the largest appli-
+                       24           Compressed Memory Offload              SSD Offload
+                       20
+                                                                                               cations at Meta. Our production load-testing framework provides
+                       16                                                                      high fidelity A/B tests and we use it to guide our hardware and
+                       12                                                                      software optimizations across Meta’s fleet. The hardware used for
+                        8
+                        4                                                                      each of the experimental machine pools in the experiments below
+                        0                                                                      are production Skylake 64GB hosts (representative of what is de-
+                            Ads A    Ads C   Web Warehouse Feed    Ads B        RE ML Reader
+                                                                                               ployed in our fleet). We chose enough machines (often 10s of hosts)
+Figure 9: Memory savings across eight applications normal-                                     to have statistically accurate A/B comparisons. In this section we
+ized to their resident memory size.                                                            will extensively demonstrate results from Web due to its excellent
+                                                                                               testing framework, but most of the conclusions are representative
+                                                                                               across our fleet for other large applications. The performance met-
+   Application savings. Figure 9 shows the relative memory sav-                                ric is requests per second (RPS) with a predefined target tail latency.
+ings achieved by TMO for eight representative applications using                               Each server automatically throttles its RPS in order to meet the tail
+different offload backends, either compressed memory or SSDs. Us-                              latency.
+ing a compressed-memory backend, TMO saves 7-12% of resident                                      The memory profile of Web works as follows. It starts by loading
+memory across five applications.                                                               up the entire file system cache into memory and then lazily loads
+   Multiple applications’ data have poor compressibility and their                             anonymous memory as Web requests arrive over time. As Web hosts
+memory offloading is more effective with a SSD backend. For those                              get closer to their memory limits, servers self-regulate and throttle
+applications, Figure 9 shows that TMO achieves significant savings                             the processed requests per second in order to avoid running out of
+of 10-19% with a SSD backend. Such savings that do not rely on                                 memory. The baseline tier in Figure 11(a) illustrates that behavior,
+TMO: Transparent Memory Offloading in Datacenters                                                                                                                                           ASPLOS ’22, February 28 – March 4, 2022, Lausanne, Switzerland
+
+
+                                       800
+                                                                    Baseline             TMO w/ 3 Phases                                                                                          Baseline                      TMO w/ 3 Phases
+
+
+
+
+                                                                                                                                            Norm. Resident Memory Size
+            Request per Second (RPS)
+
+                                                                                                                                                                         1.00
+                                       600
+                                                                                                                                                                         0.95
+                                       400
+                                                                                                   restart due to                                                        0.90
+                                                   (a)                                               code push                                                                       (b)
+                                       200
+                                                                                                                                                                         0.85
+                                                       offloading           offload to                offload to                                                                     offloading                offload to               offload to
+                                                        disabled           SSD devices                mem pool                                                                        disabled                SSD devices               mem pool
+                                         0                                                                                                                               0.80
+                                              0                2               4         6                    8            10                                                   0            2                 4               6             8            10
+                                                                           Time (Hour)                                                                                                                        Time (Hour)
+
+Figure 11: Performance improvement and memory saving for the Web application on memory-bound hosts. We set up two tiers:
+started with identical configuration without any swap enabled and later enabled SSD & then compressed memory offloading
+on the 2nd tier.
+
+                                                  P90 SSD Read Latency (ms)                                       Resident Memory Size & Swap Size (GB)                                            2000
+                                                                                                                                                                                                                    Promotion Rate (# Swap-In per Sec)
+      8.0                                                                                            40
+                                             fast SSD               slow SSD                                                           fast SSD                                     slow SSD                         fast SSD         slow SSD
+      6.0                                                                                            30                                                                                            1500
+                                                                                                                          Resident Memory
+      4.0                                                                                            20                                                                                            1000
+                                  (a)                                                                         (b)                                                                                              (c)
+      2.0                                                                                            10                                                                                             500
+                                                                                                                                Swap
+      0.0                                                                                             0                                                                                               0
+            0                                     30                60             90        120          0               30           60                                       90           120          0              30             60           90        120
+                                                         Time (minutes)                                                         Time (minutes)                                                                                  Time (minutes)
+                                               Request Per Second (RPS)                                                        Memory Pressure                                                                                     IO Pressure
+   1500                                                                                             1.2                                                                                             1.2
+                                                                                                                        fast SSD         slow SSD                                                                   fast SSD         slow SSD
+   1000                                                                                             0.8                                                                                             0.8
+
+                                       (d)                                                                        (e)                                                                                         (f)
+      500                                                                                           0.4                                                                                             0.4
+                                                   fast SSD               slow SSD
+        0                                                                                           0.0                                                                                             0.0
+               0                                  30                60             90        120          0               30           60                                       90           120          0              30             60           90        120
+                                                         Time (minutes)                                                         Time (minutes)                                                                                  Time (minutes)
+
+Figure 12: The Web application under the control of TMO with fast and slow SSDs. The solid-gray configuration has lower
+RPS/performance but actually lower promotion/swap-in rate; while its PSI metrics are indeed higher.
+
+
+i.e., as the server gets memory bound, the RPS gradually goes down.                                                                                        and utilization aspects of a given offload backend. These cannot be
+Note that the loss can be more than 20% over a two-hour period.                                                                                            achieved by low-level metrics such as the promotion rate.
+    Figure 11(b) shows the resident memory size when offloading to                                                                                            In general, a slower backend directly impacts the PSI memory
+SSD devices (2nd phase in the middle) and a compressed memory                                                                                              pressure and IO pressure, since a page fault takes longer to resolve,
+pool (3rd phase on the right), respectively, compared with a baseline                                                                                      which leads to lower memory savings. Figure 12 presents various
+without offloading (1st phase on the left). The figure shows that                                                                                          metrics to compare TMO with two different SSD backends, when
+once TMO is enabled, it is able to offload a significant fraction of                                                                                       running the Web application under load tests, with a Senpai config-
+system memory to the heterogeneous backends and the RPS drop is                                                                                            uration to keep the memory and IO pressure below a predefined
+eliminated over time. This leads to 20% of capacity savings for Web.                                                                                       threshold. The “fast SSD” and “slow SSD” in Figure 12 refer to SSD
+Because the Web application’s data has a high compression ratio                                                                                            C and B in Figure 5, respectively.
+of 4x, compressed-memory offloading is effective and saves about                                                                                              Figure 12(a) shows that the P90 read latency of the slow SSD is
+13% of Web memory at the peak. By contrast, SSD offloading saves                                                                                           significantly worse than that of the fast SSD. Figure 12(b) shows that
+only about 4% memory in the best case, because Web is sensitive to                                                                                         TMO with the fast SSD backend exhibits more aggressive swapping,
+memory-access slowdown.                                                                                                                                    with a higher swap size and a lower resident memory size. Note
+                                                                                                                                                           the consistent 1.6-3GB difference between the amount of anony-
+                                                                                                                                                           mous memory offloaded across the two SSDs. This corresponds to
+                                                                                                                                                           a significant difference of 10-15% of the resident set size.
+4.3         Comparing PSI and Promotion Rate                                                                                                                  Figure 12(c) further shows that the promotion rate (i.e., swap-in
+TMO relies on PSI to report the lost work due to lack of resources                                                                                         per second) is higher for the fast SSD. Combined with Figure 12(d),
+such as CPU, memory, and IO. Compared with counting page-                                                                                                  we see that the host with a higher promotion rate actually processes
+promotion events [18], PSI naturally factors in an application’s                                                                                           more requests per second. This illustrates the flaw in simply using
+sensitivity to memory-access slowdown as well as the performance                                                                                           promotion rate as a proxy for application performance. First, it
+ASPLOS ’22, February 28 – March 4, 2022, Lausanne, Switzerland                                                                                                                                                                             J. Weiner, et al.
+
+
+                                60              Baseline       TMO / diff. configs                                       Baseline      TMO / diff. configs                                                Baseline           TMO / diff. configs
+    Resident Memory Size (GB)
+
+
+                                                                                                                                                                                          0.2
+                                                                                                         2.5
+                                                     modest saving     large saving                                            RPS neutral    RPS drop                                                            enabled
+                                                                                                                                                                                                    disabled                            config B
+
+
+
+
+                                                                                                                                                                    PSI - Memory
+                                                                                                                                                                                                                 w/ config A
+                                40                                                                                 (b)
+
+
+
+
+                                                                                        RPS (K)
+                                          (a)                                                                                                                                                                                 notably higher
+                                                                                                                               restart due to                                             0.1
+                                                                                                         2.0                                                                                                             but absolute value is low
+                                20                                                                                               code push                                                          (c)
+                                                        enabled
+                                          disabled     w/ config A      config B
+                                  0                                                                      1.5                                                                              0.0
+                                      0         2          4     6       8         10                          0         2          4     6         8         10                                0         2          4         6       8        10
+                                                       Time (hours)                                                              Time (hours)                                                                    Time (hours)
+
+                                0.2             Baseline       TMO / diff. configs                                       Baseline       TMO / diff. configs                               60              Baseline           TMO / diff. configs
+                                                                                                                                         file cache refault
+
+
+
+
+                                                                                                                                                                   File Cache Size (GB)
+                                                                                                         10
+
+
+
+
+                                                                                        SSD Read Rates
+                                                                                                                                                                                                                                         too
+                                          expected spikes on restart
+                                                                        sustained                                                                                                         40                                          aggressive
+                                              due to code push
+                                                                                                                   (e)
+    PSI - IO
+
+
+
+
+                                0.1                                       higher
+                                          (d)                          IO pressure                        5
+                                                                                                                                                                                          20
+
+                                                                                                                                 enabled                                                            (f)
+                                                                                                                   disabled                         config B
+                                                                                                                                w/ config A
+                                0.0                                                                       0                                                                                0
+                                      0         2          4     6       8         10                          0         2          4     6         8         10                                0         2          4         6       8        10
+                                                       Time (hours)                                                             Time (hours)                                                                     Time (hours)
+
+Figure 13: Memory savings, RPS, observed memory and IO PSI metrics, SSD Read Rate, and File Cache Size for the Web
+application on non-memory-bound hosts. We set up two tiers: the 2nd tier started with TMO disabled and later enabled
+compressed memory offloading with 2 different configs.
+
+
+ignores the fact that the performance characteristics of the offload                                                                         We are currently running our production fleet with Config A and
+backend impacts the offloading decision. Second, it ignores the fact                                                                     it works well across different offload backends. In order to arrive
+that some applications actually gain better performance as more                                                                          at this config, we had to understand the sensitivity of applications
+memory becomes available due to more aggressive offloading. The                                                                          to various Senpai configuration parameters. Figures 13(c) and (d)
+observed behavior in this experiment demonstrates that promotion                                                                         show that across the two configs, memory PSI pressure was similar
+rate is not a robust metric to drive offloading decisions with not                                                                       to the baseline tier without TMO, while IO PSI pressure with Config
+only heterogeneous offload backends, but also the same offload                                                                           B was noticeably higher to Config A, which itself tracked baseline
+backend with device-to-device performance variance in the fleet,                                                                         pretty well. Recall that memory PSI pressure tracks stalls due to
+e.g., slow SSD vs. fast SSD as shown above.                                                                                              shortage of memory, while IO PSI pressure tracks Block IO stalls
+   Unlike the promotion rate, the PSI memory and IO pressures in                                                                         coming from SSD reads. In this experiment we are using compressed
+Figures 12(e) and (f) adapt well to maintain the application-level per-                                                                  memory pool as the offload backend, and so Block IO stalls should
+formance. It offloads more memory for a better-performing offload                                                                        be coming from increased file cache faults. Figures 13(e) and (f)
+backend, while keeping the memory pressure within the target                                                                             confirm that we are experiencing higher IO PSI pressure in file
+threshold. Overall, the figure shows that Senpai naturally adapts                                                                        cache since we see that SSD read rates are higher, while resident
+its behavior based on the real-time characteristics of individual                                                                        file cache is significantly lower, with Config B.
+backends and applications.                                                                                                                   A higher IO PSI pressure doesn’t always direclty translate into
+                                                                                                                                         application performance loss unless the data is critical. Digging
+                                                                                                                                         deeper and tracing the SSD reads we found that SSD reads are
+                                                                                                                                         contributed primarily by application bytecode which is directly
+4.4                              Impact of Senpai Configuration Tuning and                                                               loaded from filesystem and cached in the file cache. In our fleet,
+                                 Production Selection Process                                                                            Web is bound in the cpu front-end (fetching instructions/code) and
+In order to select the production Senpai configurations for memory                                                                       increased IO PSI pressure caused by higher application bytecode
+and IO PSI metrics, and the maximum reclaim step, we performed                                                                           misses in the file cache directly impacted the RPS with Config B.
+tuning of the parameters across many production workloads and                                                                            This tuning experiment, yet again, highlights the importance of
+finally selected one global configuration. Our goal was to select a                                                                      holistically tuning for both file cache and anonymous memory in
+configuration that 1) avoids application end-to-end performance                                                                          TMO.
+SLA regressions when compared to a system without offloading,
+and 2) provides maximum memory savings.
+   Figure 13 compares the Web application across 2 different Senpai                                                                      4.5       Handling SSD Endurance
+configurations, Config A and Config B. Config A has more mild set-                                                                       SSDs have limited write endurance. To avoid premature SSD wear-
+tings compared to Config B. Figures 13(a) and (b) show the memory                                                                        out, TMO regulates writes during memory offloading to SSDs. Fig-
+savings and RPS across the two configs. While the aggressive Config                                                                      ure 14 shows memory offloading for the Ads B application with
+B leads to larger memory savings compared to Config A, which still                                                                       and without the regulation mechanism. Based on a fleet-wide anal-
+saves significant memory for Web, it comes at the cost of significant                                                                    ysis, we have identified that 1MB per-second is a safe threshold
+RPS regression, violating our design goal.                                                                                               for the SSDs in our fleet. The figure shows that Senpai accurately
+TMO: Transparent Memory Offloading in Datacenters                                                                 ASPLOS ’22, February 28 – March 4, 2022, Lausanne, Switzerland
+
+
+                                                                                                   and Zsmalloc [43], and finally chose Zsmalloc as it provided the
+                         10           without write regulation       with write regulation
+  Swap-Out Rate (MB/s)
+
+
+
+
+                                                                        down to 1MB/s              most efficient memory pool and gave the biggest memory savings.
+                         8
+                                                                                                   5.2    Limitations and Future Work
+                         6                                               P50 across cluster
+                                                                         P90 across cluster        Currently, we manually choose the offload backend between zswap
+                         4                                                                         and SSD-backed swap depending on the application’s memory com-
+                                                                     modulated to 1MB/s            pressibility and sensitivity to memory-access slowdown. Although
+                         2
+                                                                                                   we could develop tools to automate the process, a more fundamental
+                         0                                                                         solution is for the kernel to manage a hierarchy of offload backends,
+                              1   2      3    4    5    6    7   8   9   10   11   12    13   14
+                                                                                                   e.g., automatically using zswap for warmer pages and using SSD for
+                                                        Days
+                                                                                                   colder or less-compressible pages, as well as including NVM and
+  Figure 14: Swap rate with and without write regulation.                                          CXL devices into the memory hierarchy in the future. The kernel
+                                                                                                   reclaim algorithm should dynamically balance across these pools
+modulates the write rate of memory offloading, which gives us the                                  of memory. We are actively working on this architecture.
+confidence to deploy TMO across Meta’s fleet.
+                                                                                                   5.3    Hardware for Memory Offloading
+5 DISCUSSION                                                                                       Hardware support can make memory offloading more efficient and
+5.1 Production Deployment Experience                                                               effective. Specifically, zswap can benefit from hardware-assisted
+                                                                                                   memory compression and decompression. Currently, we rely on
+Since PSI is already in the upstream Linux kernel and Senpai is
+                                                                                                   sampling in software to maintain the LRU ordering for memory
+also open source, it is feasible for other organizations to deploy the
+                                                                                                   reclaim and offloading, and the overhead scales with the targeted
+full TMO solution. We describe our deployment experience as a
+                                                                                                   paging rate. With upcoming bus technologies such as CXL that
+reference for others.
+                                                                                                   provide memory-like access semantics, hardware assistance for
+   We first deployed TMO to tackle datacenter memory and mi-
+                                                                                                   estimating not only cold memory but also warm memory will help
+croservice memory tax, as they had more relaxed performance
+                                                                                                   TMO-like techniques work more effectively.
+constraints compared with user-facing workloads such as our Web
+application. Previous measurements of tax memories were ad hoc,
+reliant on measuring how much memory was used before hitting
+                                                                                                   6     RELATED WORK
+out-of-memory or unreliable per-process metrics such as RSS. With                                  The work from Lagar-Cavilla et al. [18] is the closest to ours. Their
+TMO, we were able to measure and attribute memory consump-                                         approach swaps cold pages into a compressed in-memory pool,
+tion to specific processes and proactively act on regressions. This                                enforces a target rate of swapping-in pages, and uses machine
+improved observability by itself was very valuable and helped us                                   learning to tune the key parameters. The fundamental difference
+accurately repurpose tax memories for application workloads.                                       that distinguishes our work lies in the way we measure application
+   After the success with offloading datacenter and microservice                                   performance degradation. Instead of building heuristics around
+memory tax, we then deployed TMO in file-only mode (i.e., without                                  low-level performance indicators based on offline profiling, our
+swapping) for all applications. The improved observability helped                                  approach relies on high-level, real-time pressure metrics that nat-
+accurately setting the memory size for application containers. It                                  urally factors in memory access pattern, sensitivity to page faults
+also helped determine how much file cache each application needed.                                 and hardware characteristics. As a result, TMO is applicable to a
+In one case, TMO helped detect that an application unexpectedly                                    much wider variety of production environments.
+consumed a large amount of file cache due to its repeated execu-                                      Remote Memory. Using remote machine’s memory to offload cold
+tion of a self-extracting binary. Most methods for memory-usage                                    local memory has been studied before [2, 22, 23]. Infiniswap [13]
+accounting would not detect this as they discount file cache as                                    reduces remote CPU usage and addresses fault tolerance concerns.
+negligible or reclaimable. We changed the application to extract                                   Fastswap [4] uses a far-memory-aware scheduler to optimize total
+the binary ahead of time, which resulted in 70% memory savings                                     workload throughput. These systems do not provide fine-grained
+for the application!                                                                               control over performance degradation and hence are unsuitable for
+   Finally, we switched TMO from file-only mode to include swap-                                   latency-sensitive workloads.
+ping for several of the largest applications at Meta. The performance
+SLO of our user-facing applications is much more stringent than                                       DRAM-NVM hybrid memories and Page Migration Optimizations.
+that of the system-tax components. As PSI works well to capture the                                The emerging NVM technologies attract many studies on using
+impact of memory offloading on diverse applications, we were able                                  NVM to extend DRAM with several optimizations [3, 12, 16, 21, 31–
+to use a single globally-optimal Senpai configuration to support all                               33, 36, 38]. Techniques such as prefetching, kernel-object migra-
+applications (§3.3).                                                                               tions, multi-threaded and huge page migrations, batching and asyn-
+   In order to get the best performance and compression ratio for                                  chronous memory management operations, as well as compiler
+zswap, we experimented with many compression algorithms, in-                                       support can further improve the overall system performance and
+cluding lzo, lz4, and zstd [42], and finally chose zstd as it provided a                           enable even more aggressive memory management. Persistent mem-
+good compression ratio with a low overhead. We also experimented                                   ory file systems [5, 15, 27, 35, 40] often cope with similar problems
+with various zswap memory pool allocators, including Z3fold, Zbud,                                 as TMO in determining how often to migrate data to slower storage
+ASPLOS ’22, February 28 – March 4, 2022, Lausanne, Switzerland                                                                                                  J. Weiner, et al.
+
+
+mediums and which data to migrate. We believe that PSI could be                           [7] Kristof Beyls and Erik D’Hollander. 2001. Reuse distance as a metric for cache
+used in this domain to better account for the performance implica-                            behavior. In Proceedings of the IASTED Conference on Parallel and Distributed
+                                                                                              Computing and systems, Vol. 14. Citeseer, 350–360.
+tions of data placement in such tiered storage systems.                                   [8] Danny Cobb and Amber Huffman. 2012. Nvm express and the pci express ssd
+                                                                                              revolution. In Intel Developer Forum, Vol. 2012. Intel.
+   Cold page detection. Some earlier work [20, 41] classifies cold/hot                    [9] Compute Express Link. [n. d.]. https://www.computeexpresslink.org/.
+pages based on the accessed bit in page table entry (PTE), which is                      [10] Vladimir Davydov. 2015. Idle memory tracking. https://lwn.net/Articles/639341/.
+                                                                                              Accessed: 2021-07-19.
+also used by the kernel’s reclaim logic. Idle memory tracking [10]                       [11] Jaeyoung Do, Sudipta Sengupta, and Steven Swanson. 2019. Programmable Solid-
+avoids this conflict by introducing an additional page flag. G-swap                           State Storage in Future Cloud Datacenters. Commun. ACM 62, 6 (may 2019),
+improves accessed bit accuracy by additionally tracking page age                              54–62. https://doi.org/10.1145/3286588
+                                                                                         [12] Subramanya R Dulloor, Amitabha Roy, Zheguang Zhao, Narayanan Sundaram,
+histograms and feeding them to machine learning [18]. [28] samples                            Nadathur Satish, Rajesh Sankaran, Jeff Jackson, and Karsten Schwan. 2016. Data
+accessed bit in dynamic sized regions that are subdivided when                                tiering in heterogeneous memory systems. In Proceedings of the Eleventh European
+                                                                                              Conference on Computer Systems. 1–16.
+getting too hot. Our work instead relies on the kernel LRU algorithm                     [13] Juncheng Gu, Youngmoon Lee, Yiwen Zhang, Mosharaf Chowdhury, and Kang G
+to estimate page hotness, which is more efficient than unoptimized                            Shin. 2017. Efficient memory disaggregation with infiniswap. In 14th {USENIX }
+or unsorted linear sampling methods. Most previous work uses                                  Symposium on Networked Systems Design and Implementation ( {NSDI } 17). 649–
+                                                                                              667.
+access rate for a hot/cold page cutoff decision. Thermostat [1] uses                     [14] Intel. [n. d.]. https://www.intel.com/content/www/us/en/architecture-and-
+estimated access latency based on access rate to better quantify                              technology/optane-dc-persistent-memory.html.
+performance impact. Our use of pressure metrics takes a step further                     [15] Rohan Kadekodi, Saurabh Kadekodi, Soujanya Ponnapalli, Harshad Shirwadkar,
+                                                                                              Gregory R. Ganger, Aasheesh Kolli, and Vijay Chidambaram. 2021. WineFS: A
+by directly measuring performance loss, which is more adaptive to                             Hugepage-Aware File System for Persistent Memory That Ages Gracefully. In
+different hardware and workloads.                                                             Proceedings of the ACM SIGOPS 28th Symposium on Operating Systems Principles
+                                                                                              (Virtual Event, Germany) (SOSP ’21). Association for Computing Machinery, New
+                                                                                              York, NY, USA, 804–818. https://doi.org/10.1145/3477132.3483567
+7    CONCLUSION                                                                          [16] Sudarsun Kannan, Yujie Ren, and Abhishek Bhattacharjee. 2021. KLOCs: Kernel-
+                                                                                              Level Object Contexts for Heterogeneous Memory Systems. Association for Com-
+This paper introduces TMO, Meta’s transparent memory offload-                                 puting Machinery, New York, NY, USA, 65–78. https://doi.org/10.1145/3445814.
+ing solution for heterogeneous datacenter environments. TMO is                                3446745
+composed of multiple components across userspace and the kernel.                         [17] Emre Kültürsay, Mahmut Kandemir, Anand Sivasubramaniam, and Onur Mutlu.
+                                                                                              2013. Evaluating STT-RAM as an energy-efficient main memory alternative.
+The Pressure Stall Information (PSI) in the OS kernel tracks the                              In 2013 IEEE International Symposium on Performance Analysis of Systems and
+amount of lost work due to the lack of CPU, memory, and I/O. Sen-                             Software (ISPASS). IEEE, 256–267.
+pai is a userspace component responsible for controlling how much                        [18] Andres Lagar-Cavilla, Junwhan Ahn, Suleiman Souhlal, Neha Agarwal, Radoslaw
+                                                                                              Burny, Shakeel Butt, Jichuan Chang, Ashwin Chaugule, Nan Deng, Junaid Shahid,
+memory to offload given the workload behavior and hardware char-                              Greg Thelen, Kamil Adam Yurtsever, Yu Zhao, and Parthasarathy Ranganathan.
+acteristics. We further presented a set of kernel optimizations for                           2019. Software-Defined Far Memory in Warehouse-Scale Computers (ASPLOS
+                                                                                              ’19). 14 pages.
+efficient memory offloading for both anonymous and file-backed                           [19] Seok-Hee Lee. 2016. Technology scaling challenges and opportunities of memory
+memory. Finally, we described our production deployment experi-                               devices. In 2016 IEEE International Electron Devices Meeting (IEDM). IEEE, 1–1.
+ence of TMO and future work.                                                             [20] Michel Lespinasse. 2011. Idle page tracking / working set estimation. https:
+                                                                                              //lwn.net/Articles/460762/. Accessed: 2021-07-19.
+                                                                                         [21] Yang Li, Saugata Ghose, Jongmoo Choi, Jin Sun, Hui Wang, and Onur Mutlu. 2017.
+ACKNOWLEDGMENTS                                                                               Utility-based hybrid memory management. In 2017 IEEE International Conference
+                                                                                              on Cluster Computing (CLUSTER). IEEE, 152–165.
+Dimitrios Skarlatos at CMU is funded by NSF under grant CNS                              [22] Shuang Liang, Ranjit Noronha, and Dhabaleswar K Panda. 2005. Swapping to
+2107307 and a Meta Faculty Award.                                                             remote memory over infiniband: An approach using a high performance network
+                                                                                              block device. In 2005 IEEE International Conference on Cluster Computing. IEEE,
+                                                                                              1–10.
+REFERENCES                                                                               [23] Kevin Lim, Jichuan Chang, Trevor Mudge, Parthasarathy Ranganathan, Steven K
+ [1] Neha Agarwal and Thomas F Wenisch. 2017. Thermostat: Application-                        Reinhardt, and Thomas F Wenisch. 2009. Disaggregated memory for expansion
+     transparent page management for two-tiered main memory. In Proceedings of the            and sharing in blade servers. ACM SIGARCH computer architecture news 37, 3
+     Twenty-Second International Conference on Architectural Support for Programming          (2009), 267–278.
+     Languages and Operating Systems. 631–644.                                           [24] Tz-Yi Liu, Tian Hong Yan, Roy Scheuerlein, Yingchang Chen, Jeffrey KoonYee Lee,
+ [2] Marcos K Aguilera, Nadav Amit, Irina Calciu, Xavier Deguillard, Jayneel Gandhi,          Gopinath Balakrishnan, Gordon Yee, Henry Zhang, Alex Yap, Jingwen Ouyang,
+     Pratap Subrahmanyam, Lalith Suresh, Kiran Tati, Rajesh Venkatasubramanian,               Takahiko Sasaki, Sravanti Addepalli, Ali Al-Shamma, Chin-Yu Chen, Mayank
+     and Michael Wei. 2017. Remote memory in the age of fast networks. In Proceedings         Gupta, Greg Hilton, Saurabh Joshi, Achal Kathuria, Vincent Lai, Deep Masiwal,
+     of the 2017 Symposium on Cloud Computing. 121–127.                                       Masahide Matsumoto, Anurag Nigam, Anil Pai, Jayesh Pakhale, Chang Hua
+ [3] Hasan Al Maruf and Mosharaf Chowdhury. 2020. Effectively prefetching                     Siau, Xiaoxia Wu, Ronald Yin, Liping Peng, Jang Yong Kang, Sharon Huynh,
+     remote memory with leap. In 2020 {USENIX } Annual Technical Conference                   Huijuan Wang, Nicolas Nagel, Yoichiro Tanaka, Masaaki Higashitani, Tim Min-
+     ( {USENIX } {ATC } 20). 843–857.                                                         vielle, Chandu Gorla, Takayuki Tsukamoto, Takeshi Yamaguchi, Mutsumi Oka-
+ [4] Emmanuel Amaro, Christopher Branner-Augmon, Zhihong Luo, Amy Ouster-                     jima, Takayuki Okamura, Satoru Takase, Takahiko Hara, Hirofumi Inoue, Luca
+     hout, Marcos K Aguilera, Aurojit Panda, Sylvia Ratnasamy, and Scott Shenker.             Fasoli, Mehrdad Mofidi, Ritu Shrivastava, and Khandker Quader. 2013. A
+     2020. Can far memory improve job throughput?. In Proceedings of the Fifteenth            130.7mm<sup>2</sup> 2-layer 32Gb ReRAM memory device in 24nm technol-
+     European Conference on Computer Systems. 1–16.                                           ogy. In 2013 IEEE International Solid-State Circuits Conference Digest of Technical
+ [5] Thomas E. Anderson, Marco Canini, Jongyul Kim, Dejan Kostić, Youngjin Kwon,              Papers. 210–211. https://doi.org/10.1109/ISSCC.2013.6487703
+     Simon Peter, Waleed Reda, Henry N. Schuh, and Emmett Witchel. 2020. Assise:         [25] Chris A. Mack. 2011. Fifty Years of Moore’s Law. IEEE Transactions on Semicon-
+     Performance and Availability via Client-local NVM in a Distributed File System.          ductor Manufacturing 24, 2 (2011), 202–207. https://doi.org/10.1109/TSM.2010.
+     In 14th USENIX Symposium on Operating Systems Design and Implementation                  2096437
+     (OSDI 20). USENIX Association, 1011–1027. https://www.usenix.org/conference/        [26] Sara McAllister, Benjamin Berg, Julian Tutuncu-Macias, Juncheng Yang, Sathya
+     osdi20/presentation/anderson                                                             Gunasekar, Jimmy Lu, Daniel S. Berger, Nathan Beckmann, and Gregory R.
+ [6] Benjamin Berg, Daniel S. Berger, Sara McAllister, Isaac Grosof, Sathya Gunasekar,        Ganger. 2021. Kangaroo: Caching Billions of Tiny Objects on Flash. In Pro-
+     Jimmy Lu, Michael Uhlar, Jim Carrig, Nathan Beckmann, Mor Harchol-Balter, and            ceedings of the ACM SIGOPS 28th Symposium on Operating Systems Principles
+     Gregory R. Ganger. 2020. The CacheLib Caching Engine: Design and Experiences             (Virtual Event, Germany) (SOSP ’21). Association for Computing Machinery, New
+     at Scale. In Proceedings of the 14th USENIX Symposium on Operating Systems               York, NY, USA, 243–262. https://doi.org/10.1145/3477132.3483568
+     Design and Implementation.
+TMO: Transparent Memory Offloading in Datacenters                                                          ASPLOS ’22, February 28 – March 4, 2022, Lausanne, Switzerland
+
+
+[27] Ian Neal, Gefei Zuo, Eric Shiple, Tanvir Ahmed Khan, Youngjin Kwon, Simon          [35] Jian Xu and Steven Swanson. 2016. NOVA: A Log-structured File System for
+     Peter, and Baris Kasikci. 2021. Rethinking File Mapping for Persistent Memory.          Hybrid Volatile/Non-volatile Main Memories. In 14th USENIX Conference on File
+     In 19th USENIX Conference on File and Storage Technologies (FAST 21). USENIX            and Storage Technologies (FAST 16). USENIX Association, Santa Clara, CA, 323–338.
+     Association, 97–111. https://www.usenix.org/conference/fast21/presentation/             https://www.usenix.org/conference/fast16/technical-sessions/presentation/xu
+     neal                                                                               [36] Zi Yan, Daniel Lustig, David Nellans, and Abhishek Bhattacharjee. 2019. Nimble
+[28] SeongJae Park, Yunjae Lee, and Heon Y Yeom. 2019. Profiling Dynamic Data                page management for tiered memory systems. In Proceedings of the Twenty-Fourth
+     Access Patterns with Controlled Overhead and Quality. In Proceedings of the 20th        International Conference on Architectural Support for Programming Languages and
+     International Middleware Conference Industrial Track. 1–7.                              Operating Systems. 331–345.
+[29] Persistent Memory Development Kit. [n. d.]. https://pmem.io/pmdk/.                 [37] Jian Yang, Juno Kim, Morteza Hoseinzadeh, Joseph Izraelevitz, and Steve Swanson.
+[30] Moinuddin K Qureshi, Vijayalakshmi Srinivasan, and Jude A Rivers. 2009. Scal-           2020. An Empirical Guide to the Behavior and Use of Scalable Persistent Memory.
+     able high performance main memory system using phase-change memory tech-                In 18th USENIX Conference on File and Storage Technologies (FAST 20). USENIX
+     nology. In Proceedings of the 36th annual international symposium on Computer           Association, Santa Clara, CA, 169–182. https://www.usenix.org/conference/
+     architecture. 24–33.                                                                    fast20/presentation/yang
+[31] Luiz E Ramos, Eugene Gorbatov, and Ricardo Bianchini. 2011. Page placement         [38] Jian Yang, Juno Kim, Morteza Hoseinzadeh, Joseph Izraelevitz, and Steven Swan-
+     in hybrid memory systems. In Proceedings of the international conference on             son. 2020. An Empirical Guide to the Behavior and Use of Scalable Persistent
+     Supercomputing. 85–95.                                                                  Memory. In Proceedings of the 18th USENIX Conference on File and Storage Tech-
+[32] Amanda Raybuck, Tim Stamler, Wei Zhang, Mattan Erez, and Simon Peter. 2021.             nologies (Santa Clara, CA, USA) (FAST’20). USENIX Association, USA, 169–182.
+     HeMem: Scalable Tiered Memory Management for Big Data Applications and Real        [39] Wangyuan Zhang and Tao Li. 2009. Exploring phase change memory and 3D
+     NVM. In Proceedings of the ACM SIGOPS 28th Symposium on Operating Systems               die-stacking for power/thermal friendly, fast and durable memory architectures.
+     Principles (Virtual Event, Germany) (SOSP ’21). Association for Computing Ma-           In 2009 18th International Conference on Parallel Architectures and Compilation
+     chinery, New York, NY, USA, 392–407. https://doi.org/10.1145/3477132.3483550            Techniques. IEEE, 101–112.
+[33] Thomas Shull, Jian Huang, and Josep Torrellas. 2019. AutoPersist: An Easy-         [40] Shengan Zheng, Morteza Hoseinzadeh, and Steven Swanson. 2019. Ziggurat: A
+     to-Use Java NVM Framework Based on Reachability. In Proceedings of the 40th             Tiered File System for Non-Volatile Main Memories and Disks. In 17th USENIX
+     ACM SIGPLAN Conference on Programming Language Design and Implementation                Conference on File and Storage Technologies (FAST 19). USENIX Association,
+     (Phoenix, AZ, USA) (PLDI 2019). Association for Computing Machinery, New                Boston, MA, 207–219. https://www.usenix.org/conference/fast19/presentation/
+     York, NY, USA, 316–332. https://doi.org/10.1145/3314221.3314608                         zheng
+[34] Zixuan Wang, Xiao Liu, Jian Yang, Theodore Michailidis, Steven Swanson, and        [41] Pin Zhou, Vivek Pandey, Jagadeesan Sundaresan, Anand Raghuraman, Yuanyuan
+     Jishen Zhao. 2020. Characterizing and Modeling Non-Volatile Memory Systems.             Zhou, and Sanjeev Kumar. 2004. Dynamic tracking of page miss ratio curve for
+     In 2020 53rd Annual IEEE/ACM International Symposium on Microarchitecture               memory management. ACM SIGPLAN Notices 39, 11 (2004), 177–188.
+     (MICRO). 496–508. https://doi.org/10.1109/MICRO50266.2020.00049                    [42] Zstandard. [n. d.]. https://en.wikipedia.org/wiki/Zstandard.
+                                                                                        [43] zswap. [n. d.]. https://www.kernel.org/doc/html/latest/vm/zswap.html.
+

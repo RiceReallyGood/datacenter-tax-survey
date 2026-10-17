@@ -1,0 +1,1274 @@
+      Extended User Interrupts (xUI): Fast and Flexible
+               Notification without Polling
+             Berk Aydogmus                                    Linsong Guo                              Danial Zuberi
+              Purdue University                                UC San Diego                              UC San Diego
+             West Lafayette, USA                               La Jolla, USA                             La Jolla, USA
+
+               Tal Garfinkel                                  Dean Tullsen                           Amy Ousterhout
+                UC San Diego                                   UC San Diego                              UC San Diego
+                La Jolla, USA                                  La Jolla, USA                             La Jolla, USA
+
+                                                             Kazem Taram
+                                                            Purdue University
+                                                           West Lafayette, USA
+
+Abstract                                                                Volume 2 (ASPLOS ’25), March 30–April 3, 2025, Rotterdam, Nether-
+Extended user interrupts (xUI) is a set of processor exten-             lands. ACM, New York, NY, USA, 17 pages. https://doi.org/10.1145/
+                                                                        3676641.3716028
+sions that builds on Intel’s UIPI model of user interrupts,
+for enhanced performance and flexibility. This paper de-
+constructs Intel’s current UIPI design through analysis and
+                                                                        1      Introduction
+measurement, and uses this to develop an accurate model                 With the rise of language-level concurrency and kernel by-
+of its timing. It then introduces four novel enhancements to            pass interfaces, user-level runtimes are increasingly respon-
+user interrupts: tracked interrupts, hardware safepoints, a             sible for tasks that once belonged to the OS—such as pre-
+kernel bypass timer, and interrupt forwarding. xUI is mod-              emption, synchronization, and scheduling (CPU and IO).
+eled in gem5 simulation and evaluated on three use cases                   User-level threads, goroutines (Go), and coroutines (C++)
+– preemption in a high-performance user-level runtime, IO               have allowed data center applications to scale to millions
+notification in a layer3 router using DPDK, and IO notifica-            of concurrent requests [17, 60] and support microsecond
+tion in a synthetic workload with a streaming accelerator               timescales [26, 37, 48, 52] by avoiding the high cost of kernel
+modeled after Intel’s Data Streaming Accelerator. This work             threads. This has increasingly shifted responsibility for CPU
+shows that xUI offers the performance of shared memory                  scheduling to user-level runtimes. Similarly, kernel-bypass
+polling with the efficiency of asynchronous notification.               interfaces such as DPDK [1] and SPDK [9] achieve high
+                                                                        performance I/O at microsecond timescales by bypassing the
+CCS Concepts: • Computer systems organization →                         kernel, shifting IO scheduling to user level.
+Pipeline computing; Processors and memory architec-                        However, user-level runtimes are missing a key support
+tures; • Hardware → Networking hardware.                                that operating systems rely on to coordinate these activities—
+                                                                        the interrupt system. The interrupt system delivers low-
+Keywords: Interrupt, User Space, Preemption, Processor Ar-              latency asynchronous notifications from devices, cores (IPIs),
+chitecture                                                              and timers. Asynchronous notification minimizes latency, as
+                                                                        it immediately changes the control flow on the receiving
+ACM Reference Format:
+                                                                        core, and maximizes efficiency, because it doesn’t require the
+Berk Aydogmus, Linsong Guo, Danial Zuberi, Tal Garfinkel, Dean
+Tullsen, Amy Ousterhout, and Kazem Taram. 2025. Extended User
+                                                                        receiver to waste cycles polling for notifications.
+Interrupts (xUI): Fast and Flexible Notification without Polling. In       Without this support, user-level runtimes are forced to
+Proceedings of the 30th ACM International Conference on Architec-       rely on expensive OS interfaces, or fall back to shared mem-
+tural Support for Programming Languages and Operating Systems,          ory polling that trades poor efficiency for lower latencies
+                                                                        and higher throughput [29]. This translates directly into
+                                                                        inefficiencies and functional limitations at user level.
+                                                                           For example, preemption is essential for enabling precise
+                                                                        control over scheduling. In server workloads, it can bound
+This work is licensed under a Creative Commons Attribution-             tail latency and increase useful throughput by mitigating
+NonCommercial-NoDerivatives 4.0 International License.
+ASPLOS ’25, Rotterdam, Netherlands.
+                                                                        head-of-line-blocking [37, 61], and it is mandatory for run-
+© 2025 Copyright held by the owner/author(s).                           ning untrusted code in multi-tenant settings such as server-
+ACM ISBN 979-8-4007-1079-7/25/03                                        less edge platforms [21, 59]. However, many programming
+https://doi.org/10.1145/3676641.3716028                                 languages and high-performance runtimes don’t support
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.                                                    Berk Aydogmus et al.
+
+
+preemption [48, 52], limit preemption frequency (e.g. Go          load, xUI reduces CPU consumption by 45% compared to
+preempts every 10ms), or will not preempt loops [6, 7, 10]        busy spinning (§6.2.2). We observe similar efficiency gains us-
+due to the high and unpredictable overheads that current          ing xUI for IO notification with simulated DSA; for example,
+user-level timing and notification mechanisms impose.             at 50K IPOS (20𝜇s average request latency), xUI maintains
+   Next, while kernel bypass interfaces are increasingly pop-     the same responsiveness as busy spinning while incurring
+ular for accessing high-performance network and storage           negligible CPU overhead (§6.2.3).
+(e.g., ultra-low latency (ULL) flash and NVMe), the only way
+to receive the microsecond-scale notifications these devices
+deliver is to poll. This can waste significant cycles and en-     2   Limitations of User-Level Notification
+ergy as cores busy-spin [29]. It also scales poorly, as each      Current options for asynchronous notification and timing
+queue being polled burns an additional cache line, and pro-       at user level have significant limitations, especially for high-
+cessors offer no way to idle (e.g. mwait) on more than a single   performance applications.
+queue. The growing use of specialized accelerators [63] (e.g.,    Signals: high overheads, imprecise. Signals are the only
+DSA [42], QAT [33]) will only make this more challenging.         option for asynchronous notification on most systems at
+   Other use cases where low-cost notifications would enable      user level today. Like interrupts, signals are free when no
+more efficient implementations include IPC notifications,         events occur, but are orders of magnitude more expensive
+syncing changes to shared data structures, and processing         than polling when events do arrive, making them unsuitable
+real-time tracing events.                                         for high-performance applications.
+   Intel’s recently released user-level interprocessor inter-        For example, we measured the impact of signal delivery on
+rupts (UIPI) offer a promising starting point for bringing        some common benchmarks (e.g., linpack2, base64 encoding)
+interrupt support to user space. For example, it offers signif-   and found each signal imposed roughly 2.4 𝜇s of overhead
+icant benefits for implementing preemption with low, pre-         at 2 GHz (without KPTI). About 1.4 𝜇s of this comes from
+dictable overheads [25, 35, 44]. However, our in-depth analy-     OS context switch overheads. The remainder is mostly due
+sis of its design and implementation (§3) and exploration of      to added branch mispredictions and cache misses caused by
+existing user-level notification mechanisms (§2) reveal sig-      contention with the kernel signal-handling code.
+nificant limitations in performance, precision, and support          This is expensive enough to make signals a impractical for
+for diverse notification types (i.e. timers and devices).         preemption and IO notification in high-performance applica-
+   To overcome these limitations, we present xUI, a set of        tions, where requests arrive on a microsecond timescale [29,
+processor extensions that build on UIPI to meet the needs of      30, 34], as signal delivery imposes a significant tax on through-
+user-level runtimes. xUI offers four key capabilities: tracked-   put. Even in common server workloads where requests are
+interrupts (§4.2)—reduce interrupt delivery overhead by 3x-       often in the 100s of microseconds or less [53, 56], they are
+9x vs. UIPI—closing the performance gap between interrupts        still a noticeable source of overhead.
+and memory-based notification (polling); hardware safepoints         Signals are also imprecise, that is, they change control flow
+(§4.4)—offer precise control over where interrupts are de-        at arbitrary points in the receiver code. This is a problem
+livered at near zero cost, reconciling the tension between        for runtimes that rely on precise garbage collection (e.g.,
+interrupts and precise garbage collection; the kernel bypass      most Java and .NET implementations), as precise GCs rely
+timer (§4.3)—enables low-cost user-space timers, eliminat-        on stackmaps. Stackmaps are metadata generated at compile
+ing the need for expensive OS-based timers, or dedicating         time that tell the GC which stack elements are pointers—each
+cores to polling high precision counters; interrupt-forwarding    map is valid only for a particular safepoint [45] in program
+(§4.5)—extends interrupt routing, allowing devices to send        code. Thus, if a thread is being preempted somewhere other
+interrupts to user-level threads.                                 than a safepoint, a GC cannot garbage collect it, as it has no
+   We simulate xUI (and UIPI) in gem5 (§5); and evaluate          way of identifying which objects that thread can reference.
+its performance for preemption and I/O notification in sev-          In recent years, Go developed a unique solution to this
+eral high-performance workloads (§6), including: serving          problem by moving from precise GC to a hybrid approach [10]
+database requests with RocksDB on Aspen [30]—a high-              that uses conservative GC for the most recent stack frame,
+performance user-level runtime; routing with l3fwd [19]—a         and precise GC for the rest. Unfortunately, this is not a solu-
+DPDK based layer 3 router; and offloading with a simulated        tion for most runtimes, as moving garbage collectors—which
+streaming accelerator based on Intel’s DSA [42].                  are quite popular—modify pointers on the stack [36]. Thus,
+   We find using xUI instead of UIPI for preemption in Aspen      they cannot tolerate the imprecision of conservative GC.
+improves RocksDB throughput by 10% (§6.2.1), and elimi-           Polling: unpredictable, inefficient, unscalable. User-
+nates the need to waste core(s) to provide high precision         level notification can also be implemented by polling a vari-
+timer(s) (§6.1). We find using xUI for IO notification in l3fwd   able in shared memory. When polling, each negative check
+achieves the same responsiveness (latency) as busy spinning,      is quite cheap (load with an L1 cache hit, and a correctly
+while significantly improving efficiency. For example, at 40%     predicted branch), and each notification is still relatively
+Extended User Interrupts (xUI): Fast and Flexible Notification without Polling               ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.
+
+
+cheap (load with an L2 cache miss, and a likely mispredicted                        In the absence of direct access to efficient hardware timers,
+branch), thus polling can support both low latency and high                      user-level runtimes [7, 30, 44, 54] implementing threads often
+bandwidth notification. Polling is also precise, as a program-                   designate one kernel thread (core) to act as a timer, and
+mer or compiler has total control over where polling occurs.                     notify other kernel threads when they need to be preempted,
+However, while signal costs scale in the number of notifica-                     either through signals, shared memory, and more recently
+tions arriving, polling costs scale in the number of checks                      UIPI. Unfortunately, OS overheads can add up quite quickly
+being performed, and it is hard to avoid wasting significant                     for the timer thread (see Figure 6). In higher performance
+cycles when no notifications are pending.                                        systems [30, 34, 44] it’s not uncommon to implement timer
+   For example, polling is a common way to implement pre-                        thread(s) by busy spinning on a high-precision timer (rdtsc),
+emption in a programming language. To implement this, the                        burning the entire core.
+compiler adds instrumentation that polls a shared variable                       UIPI: more expensive than polling, imprecise, narrow.
+at every function entry point and loop back-edge, ensur-                         Receiving a notification with UIPI is roughly 3x-5x cheaper
+ing a thread will yield, regardless of control flow. Unfortu-                    than signals— roughly 2800 cycles vs. 600-900 cycles on our
+nately, polling overheads can be quite high and workload-                        Saphire Rapids processor. Unfortunately, UIPI is still roughly
+dependent [30], as even a simple check can be quite expen-                       6x-9x slower than memory-based notifications, which are
+sive in tight loops.                                                             roughly 100 cycles.
+   To avoid this, Go did not preempt loops for its first ten                        The gap between UIPI and polling overheads will increase
+years. Instead, it required developers to insert explicit calls                  in future processors due to the growing size of speculation
+to runtime.Gosched() (the scheduler) in loops when nec-                          windows. To wit–the pipeline flush induced by UIPI is a
+essary. However, this was fragile, leading to hard-to-debug                      significant source of overhead (§ 3.5). As the number of in-
+slowdowns and program freezes [10] when overlooked. When                         flight instructions in future processors continues to increase,
+the Go team explored mitigating this by adding checks to                         this will become more expensive. This trend will also hurt
+loops, they found it slowed down programs by a geomean                           future polling performance, as the flush to handle branch
+of roughly 7%, and in the worst case, by up to 96% [7].                          mispredictions becomes more expensive.
+   Similarly, we measured the cost of preemption in Wasm-                           UIPI is also imprecise, similar to signals, thus it does not
+time, a WebAssembly runtime used to run serverless applica-                      play well with precise GC. Finally, UIPI only supports a
+tions by Fastly, Shopify, Microsoft, etc. that relies on polling                 narrow subset of the features APICs offer, i.e., no device
+for preemption. On some common benchmarks containing                             interrupts or timer interrupts, which limits its usefulness.
+tight loops or short functions (e.g., linpack2 [18]), we found it                Taken together, this makes UIPI a useful tool for some sit-
+imposed slowdowns of up to 50%. Unsurprisingly, when Java                        uations [25, 30, 35, 44], but still quite far from a substitute
+decided to add support for virtual threads in recent years [6],                  for all the interrupt system offers, and certainly not a viable
+they decided not to support loop preemption.                                     replacement for polling in high-performance systems.
+   Polling for IO poses its own set of challenges. As Golestani
+et al., observed “you can’t always spin to win” [29]. Busy                       3     Characterizing Intel UIPI
+spinning tends to waste significant cycles because I/O is un-                    Here, we provide the first in-depth analysis of Intel UIPI by
+predictable, and when I/O events are not arriving, the core                      reverse engineering its microarchitectural details. We discuss
+is wasted. Polling also scales poorly as overheads increase                      how xUI builds on this in section 4.
+linearly with the number of queues being polled, and each
+one burns a cache line. Wasting cycles translate to energy                       3.1    UIPI Overview
+inefficiency, and the primary tool that processors offer to                      User interprocessor interrupt (UIPI) support was recently
+mitigate this cost (mwait and its equivalents), only works                       introduced by Intel in their Sapphire Rapids processors.1 UIPI
+with a single queue. Less frequent polling can reduce these                      allows IPIs to be sent directly from one kernel thread (e.g.
+costs, but this forces a trade-off between overhead and re-                      pthread) to another at user level, avoiding the context-switch
+sponsiveness. In user-level runtimes, periodic polling is also                   overheads of signals.
+messy because it becomes intertwined with scheduling, i.e.,                         There are several challenges to enabling user-level IPIs on
+one can’t poll when a user thread is running.                                    existing hardware:
+Timers: expensive and complex. Timers enable many                                Adding access control. Access control is necessary to
+scheduling tasks including preemption, periodic device polling,                  prevent threads from sending IPIs to other non-consenting
+and synchronization timeouts. Unfortunately, user-level run-                     threads. UIPI delegates this task to the kernel via a new hard-
+times have limited options for microsecond-scale timing.                         ware interface—programmed through MSRs and in-memory
+Hardware timers are hidden behind expensive OS interfaces
+that rely on signals (setitimer(), timer_create()) and                           1 User interrupts have been shipping in both server and consumer class
+system calls (nanosleep(),select()) for notification.                            chips since Fall 2024 (e.g., Grand Rapids, Sierra Forest, Grand Ridge, Arrow
+                                                                                 Lake, Lunar Lake) [32].
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.                                                                                     Berk Aydogmus et al.
+
+
+ Table 1. User Posted Interrupt Descriptor (UPID) Fields.                                             Expanding on this, we begin by noting that each thread
+                                                                                                   that can receive UIPI’s has an associated UPID that is allo-
+ Name                             Description                                          Bit Range
+                                                                                                   cated by the kernel. Each UPID is a struct shared in memory
+ Outstanding Notification (ON)   if notification is outstanding for one or more UIs    0:0
+ Suppressed Notification (SN)    if the senders should avoid sending a notification    1:1         among all cores. We will refer to its fields, shown in Table 1,
+ Notification Vector (NV)        the interrupt vector on which the UI should be sent   23:16
+ Notification Destination (NDST) APICID of the core this thread running on             63:32
+                                                                                                   in our description below.
+ Posted Interrupt Requests (PIR) interrupts that have been posted to this thread       127:64         To start, before a UIPI can be sent, a user space program
+                                                                                                   asks the kernel to set up a route [5]. On the receiving thread,
+                                                                                                   the register_handler(...) system call allocates a UPID,
+                                                                                                   and stores a pointer to a user-level interrupt handler that
+                                                                                                   will be invoked when a UIPI is received. On the sending
+tables—called the User Interrupt Target Table (UITT). A UITT
+                                                                                                   process, the register_sender(...) system call allocates
+is a per-process table that specifies which other threads a pro-
+                                                                                                   a new entry in the UITT, and stores a pointer there to the
+cess (and all of its threads) can send UIPIs to. At a high level,
+                                                                                                   appropriate UPID and a user-supplied vector.
+each entry is a tuple ⟨𝑈 𝑃𝐼 𝐷, 𝑣𝑒𝑐𝑡𝑜𝑟 ⟩—where UPID (User
+                                                                                                      User interrupts are sent using the new senduipi instruc-
+Posted Interrupt Descriptor) is a thread-specific, in-memory
+                                                                                                   tion, which takes one operand, an index into the UITT. To
+descriptor. The presence of a UPID pointer in the UITT of
+                                                                                                   send a UIPI, the sending core looks up the UPID and vector in
+a process implicitly grants it permission to send interrupts
+                                                                                                   the UITT, sets the bit in the PIR field of the UPID to indicate
+to the thread associated with that UPID. The kernel lets au-
+                                                                                                   which vector was posted, and sets the ON-bit indicating an
+thorized processes set up these mappings with system calls.
+                                                                                                   interrupt is pending. It then sends a conventional IPI to the
+As we discuss later, the UITT and its UPID entries are also
+                                                                                                   core where the thread is running (the address in NDST), with
+essential for UIPI routing.
+                                                                                                   the vector (NV) to indicate that there is a pending UIPI.
+Routing interrupts at user level. The interrupt system
+                                                                                                      When this IPI arrives, the receiver core compares the vec-
+is responsible for routing messages from sources (devices,
+                                                                                                   tor it received with a field of an MSR (UINV) that stores
+cores, timers) to destinations. Destinations are cores (ad-
+                                                                                                   the vector for UIPI notifications. If they match, the receiver
+dressed by APICID), and messages are 8-bit values (vectors)
+                                                                                                   then consults the PIR field of the UPID of the current thread
+that uniquely identify the cause of the interrupt. By design,
+                                                                                                   to determine if the UIPI should be delivered to the current
+routing is quite static—APICIDs are typically assigned to
+                                                                                                   thread or if it needs to be handled by the OS.
+cores at startup time, and rarely change.
+                                                                                                      If the UIPI is destined for the currently running thread
+   To extend x84-64 with user interrupts, there were several
+                                                                                                   (fast path), it delivers it by invoking the handler registered by
+limitations of the existing interrupt routing scheme to over-
+                                                                                                   the receiver, which returns using the new uiret instruction
+come: (1) there was no notion of addressing threads—which
+                                                                                                   when it completes. Otherwise, it is delivered later by the
+are dynamically created, destroyed, and migrated between
+                                                                                                   kernel on the slow path. On the slow path, when the kernel
+cores. (2) the x86 per-core (APICID) vector space is quite
+                                                                                                   resumes the thread an interrupt was destined for, it will
+small (256 possible values), and parts of it are already dedi-
+                                                                                                   repost the captured UIPI as a self-UIPI through the local
+cated to other purposes—so sharing this space with user IPIs
+                                                                                                   APIC.
+would be quite limiting. (3) cores are always available, but
+                                                                                                      However, it might slow down other programs running on
+threads are not; when an interrupt arrives, the destination
+                                                                                                   the receiver core if we frequently receive and process inter-
+thread may be context-switched out.
+                                                                                                   rupts that are destined for out-of-context processes (slow
+   To address these limitations, UIPI creates its own orthogo-
+                                                                                                   path). To mitigate this, UIPI includes a “suppressed notifica-
+nal virtual namespace (thread IDs) and vector space (a 6-bit
+                                                                                                   tion” (SN) bit field in the UPID, indicating when the receiver
+user vector, or UV). To deliver interrupts in this new names-
+                                                                                                   is not ready, thus preventing the sender from continuing to
+pace, it introduces two new types of data structures that are
+                                                                                                   send interrupts to that thread. When a thread gets context
+shared in memory between cores—the per-process UITTs
+                                                                                                   switched out, the kernel sets the SN bit, halting further UIPIs
+and per-thread UPIDs previously mentioned. Next, we look
+                                                                                                   from sender threads.
+at these data structures in more detail and how UIPI uses
+                                                                                                      Threads can also manually toggle interrupt delivery using
+them to send and receive interrupts.
+                                                                                                   the new clui and stui (clear and set user interrupt flag, re-
+                                                                                                   spectively), which work similarly to their kernel-mode coun-
+3.2     Sending and Receiving UIPIs                                                                terparts, and use testui to query if interrupts are blocked.
+At a high level, when a UIPI is sent, the sending core looks                                          Finally, a receiver thread might migrate from one physical
+up the UPID of the destination thread in the UITT, modifies                                        core to another. Thus, a sending core must correctly deter-
+the UPID for the destination thread, and then sends a con-                                         mine which destination core it should send the IPI to. To
+ventional IPI to the receiving core to notify it of a pending                                      solve this, the sending core reads the NDST field of the UPID
+UIPI. The receiving core then uses the state in the UPID to                                        that stores the APICID of the core the thread is currently
+deliver the request.
+Extended User Interrupts (xUI): Fast and Flexible Notification without Polling                                      ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.
+
+
+Sender                                Mem            Receiver                                                     Table 2. Key performance metrics of UIPIs.
+ Processor Core                  1    UPID           Processor Core
+  Program Code                                        Micro Seq ROM (MSROM)      Program Code
+
+
+
+
+                                      notificatin
+                                       outstanding
+  reg_sender(fd,flags);                               UI_NOTIFICATION: 4          uipi_handler(vec){       End-to-End Latency   Receiver Cost   SENUIPI    CLUI       STUI
+  SENDUIPI                                              update(UPID,UIRR);          //handler code 6
+                                                      UI_DELIVERY: 5                UIRET 7
+  ...
+                                                        save_state;               }
+                                                                                                           1360 cycles          720 cycles      383 cycles 2 cycles   32 cycles
+                                                        UIF=0;
+                                                        JMP HANDLER;
+              2                                                                          UIRR       UIF
+                                          ...
+ Local Apic                                          Local Apic                                           3.5   Deconstructing the UIPI Microarchitecture
+                                        ...
+                                        PIR
+
+   Interrupt Command Register (ICR)                               End of Interrupt Register (EOI)
+                                                                                                          Interrupt handling strategy. The first step processors
+                                        System Bus
+                      3                                                                                   take when handling interrupts is to redirect control flow
+                                                                                                          to the interrupt handler. However, with reorder buffers in
+                                                                                                          modern processors capable of holding 500 or more in-flight
+Figure 1. Architecture View of UIPI: UIPI is largely im-
+                                                                                                          instructions, the strategy they choose in dealing with those
+plemented in microcode. The sender communicates the UIPI
+                                                                                                          in-flight instructions has significant performance implica-
+vector through shared memory (UPID). Steps described in §3.3.
+                                                                                                          tions. Flushing all in-flight program instructions is the con-
+                                                                                                          ventional solution, as it minimizes latency to handle the
+running on. Thus, to migrate a thread to a different core, the                                            interrupt. But draining all in-flight instructions is also an
+OS simply updates this field.                                                                             option. Here, all (correctly fetched) in-flight instructions
+                                                                                                          would be allowed to retire. Once the pipeline is empty of
+3.3      Architecture View                                                                                pre-interrupt instructions, the program counter points to
+To support our analysis in 3.5 and design discussion in sec-                                              the last instruction in the program before the interrupt. The
+tion 4, let’s zoom in on the UIPI sending/receiving path at the                                           PC for the next instruction can be saved, designating where
+architecture level. Figure 1 illustrates the end-to-end process                                           the processor should resume execution after the interrupt
+of sending and receiving a posted UIPI. Let’s examine each                                                handler. This approach introduces greater latency (waiting
+step: ( 1 ) The sending core looks up the receiver’s UPID in                                              for the pipeline to drain), but minimizes the wasted work.
+the UITT, updates the UPID (PIR) to reflect the vector being                                                 To discover what our Sapphire Rapids processor does, we
+sent, and sets its outstanding interrupt (ON) bit, indicating                                             built two test programs that expose the effects of this feature.
+an interrupt is pending. ( 2 ), The sending core reads the                                                We exploit the fact that with flushing, the end-to-end latency
+APICID and vector of the receiving core from the UPID, and                                                of a UIPI is independent of the in-flight instructions on the
+writes it to interrupt command register (ICR). This causes                                                receiving core. With a drain strategy, latency depends on
+the local APIC to send an interrupt to the receiving core.                                                what type of instructions are in flight.
+( 3 ) The IOAPIC sends the interrupt message over the sys-                                                   Our first test program does pointer chasing, allowing us
+tem bus to the local APIC on the receiver. The local APIC                                                 to vary the time it would take to resolve/drain the chain.
+notifies the core by raising an interrupt signal line [4]. ( 4 )                                          We gradually increase the size of the workload, increasing
+The receiving core issues a full pipeline flush and starts exe-                                           the percentage of pointers that miss in the cache, and thus
+cuting a microcode procedure called notification processing                                               the length of time it would take to drain the chain of de-
+that reads the user interrupt vector from the UPID of the                                                 pendent fetched instructions from the pipeline. We observe
+current thread, saves it in a dedicated register (UIRR), and                                              the change in the end-to-end UIPI latency, expecting that
+clears the outstanding notification bit in the current thread’s                                           as cache misses increase, this would affect the end-to-end
+UPID. ( 5 ) The core executes the user interrupt delivery mi-                                             UIPI latency if a drain strategy is employed. However, such
+crocode procedure. It pushes the stack pointer, PC, and user                                              latency variations were not observed, suggesting that our
+vector onto the stack. It clears the user interrupt flag (UIF)                                            processor employs a flush strategy. Our next test program
+disabling interrupt delivery for the handler. It updates the                                              used Intel’s hardware performance counters to measure the
+UIRR to show the interrupt has been processed. And finally,                                               number of instructions that are dispatched but not commit-
+it jumps to the user-level interrupt handler specified in the                                             ted (i.e., flushed) when we receive interrupts. We find that
+UINT_Handler register. ( 6 ) The handler executes. ( 7 ) The                                              flushed micro-ops increase exactly linearly with the number
+handler executes a uiret, popping the stack pointer and                                                   of interrupts received, again, implying a flush strategy.
+PC from the stack, and sets the user interrupt flag (UIF), re-                                            Where are the receiver overheads coming from? To
+enabling interrupt delivery, and resuming normal control                                                  understand the cost of receiving a user interrupt, we design
+flow on the receiver.                                                                                     a measurement program that records the costs of each indi-
+                                                                                                          vidual step of receiving a UIPI as described in §3.3. As each
+3.4      UIPI Performance                                                                                 step has an observable effect on a shared data structure (e.g.,
+Table 2 summarizes the key performance metrics of UIPI.                                                   UPID), our test program running in a parallel thread can
+The setup for measuring these is described in §5. Next, we                                                monitor these locations for changes made by the receiver
+describe the experiments we use to reverse engineer UIPI.                                                 core and measure the duration between the occurrence of
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.                                                                                                                            Berk Aydogmus et al.
+
+                                        Lost Cycles (Flush, Reﬁll, etc.) = 424 Cycles
+                    SENDUIPI
+                                                                                                                                          for 279 cycles per senduipi due to serializing operations.
+Receiver Sender
+
+
+
+
+                                                       Receiver Overhead = 696 Cycles
+                          APIC                                                                                                            Some of the micro-ops of senduipi write to MSRs (e.g., the
+
+
+
+
+                                                                                                          1036 Save vector
+                                                                                 Notiﬁcation
+                                                                             866 Processing
+
+
+
+
+                                                                                                          1007 Save RSP
+                                                                                               Delivery
+
+
+
+
+                                                                                                                 Handler
+                                   APIC           Pipeline Flush                                                        Norm
+
+                  Normal Program Flow
+                                                                                                                        Flow
+                                                                                                                                Time
+                                                                                                                                          one that actually writes to the ICR register), and we know
+                                                            Update UPID
+                                                                                                                               (cycles)   that writes to MSRs are serializing operations [31], which
+
+
+
+
+                                                                                                          1066
+                                                                                                          1076
+                                        380
+
+
+
+
+                                                                             804
+                                  310
+                                                                                   Update
+        0
+
+
+
+
+                                                           outstanding bit          PIR                                                   explains the stall cycles. Our measurements also show that
+                                                                      Notiﬁcation and Delivery = 262 Cycles
+                                                                                                                                          the senduipi is implemented using microcode, as we see
+                                                                                                                                          57 micro-ops delivered through the Micro Sequencing ROM
+Figure 2. UIPI Latency Timeline: The average latency for
+                                                                                                                                          (MSROM) for each senduipi.
+each step of delivering a UIPI as inferred by our measurements.
+
+                                                                                                                                          4     xUI: Extended User Interrupts
+these events. As these changes take place in kernel mode, our
+measurement program is implemented as a kernel module.                                                                                    xUI attempts to meet the following design goals.
+                                                                                                                                           ▶ Fast: faster is better; notification is a basic building block
+   If our measurement program and the observed receiver
+thread run on different physical cores, memory writes to                                                                                     for IO, preemption, synchronization, etc. xUI aims to offer
+the UPID must traverse the last-level cache— introducing                                                                                     performance on par with shared memory notification to
+unpredictable overheads into our measurements. To avoid                                                                                      eliminate the need for polling.
+this, we pin our measurement kernel module to the sibling                                                                                  ▶ Non-intrusive: xUI should be adoptable with minimal
+                                                                                                                                             changes in existing high-performance processors. Thus,
+SMT context of the receiver thread.
+                                                                                                                                             it should have a small bill of materials, require minimal
+   To determine when an interrupt begins, we need to record
+the timestamp of the last instruction in the normal program                                                                                  changes to the existing ISA and microarchitecture, and
+flow to be executed before the interrupt is processed. To                                                                                    not impose a performance tax on other features.
+facilitate this, the receiver process executes the rdtsc in-                                                                               ▶ Simple and compatible: xUI should work with existing
+struction within a loop to record the current time. In the                                                                                   software and enable simpler solutions than current user-
+                                                                                                                                             level notification.
+interrupt handler, this recorded value is saved as the final
+                                                                                                                                           ▶ General Purpose: xUI should support all forms of noti-
+point in the pre-interrupt execution.
+   We repeat these measurements 400K times and report the                                                                                    fication offered by the interrupt system including timers,
+average of each time interval. Figure 2 summarizes the results                                                                               device interrupts, and IPIs.
+of our measurements. On the sender, we start measuring the
+time right before we execute the senduipi instruction that                                                                                4.1   Overview
+marks time 0 in Figure 2. The senduipi instruction causes an                                                                              Tracked interrupts: closing the memory gap. Tracked
+interrupt to be sent from the sender’s APIC to the receiver’s                                                                             interrupts offer an alternative approach to interrupt deliv-
+APIC which then interrupts the receiver program flow at cy-                                                                               ery that avoids the high costs of flushing the pipeline. This
+cle 380. After that, the next observable event on the receiver                                                                            enables notification with latency and performance costs
+side is the update to the outstanding notification bit in the                                                                             comparable to memory-based notification (polling), with
+UPID during the notification processing. Our observations                                                                                 the efficiency and responsiveness of asynchronous notifica-
+indicate that a significant portion of the time on the receiver                                                                           tion. Tracked interrupts improve on the overhead of UIPI by
+side–424 cycles–is spent between the last program instruc-                                                                                roughly 3x-9x, with a notification taking 231 or 105 cycles,
+tion and the first notification processing event—we believe                                                                               depending on interrupt type (IPI, device, timer interrupt).
+this latency is a combination of: (1) the latency of the pipeline                                                                         This offers significant benefits for performance and efficiency
+flush—as the processor can only flush a limited number of                                                                                 in high-performance applications (§6).
+micro-ops per cycle, flushing all the in-flight instructions                                                                              HW safepoints: precise interrupts for precise GC. Hard-
+might take time, (2) the latency of filling the pipeline with                                                                             ware safe points provide an explicit safepoint instruction.
+the interrupt notification processing micro-ops, and (3) the                                                                              This allows compilers to communicate precisely where it is
+latency of executing any interrupt notification processing                                                                                safe to deliver an interrupt. Safepoints address the needs of
+micro-op that precedes the observable event that we monitor.                                                                              languages with precise GC at near zero cost, with minimal
+   The notification and delivery take at least 262 cycles, while                                                                          architectural complexity. While UIPI could implement this
+executing the uiret is relatively quick, taking only 10 cycles.                                                                           with clui and stui, this pair of instructions costs 34 cycles
+Where do the costs of senduipi come from? We ran a                                                                                        together (Table 2), expensive enough that when used in a
+test program that repeatedly executes successful senduipi                                                                                 tight loop or hot code path they are prohibitively expen-
+instructions (we found that unsuccessful UIPIs show dif-                                                                                  sive. For example, using them to protect a critical section in
+ferent performance characteristics) and measured available                                                                                malloc() in RocksDB incurred a 7% throughput penalty.
+hardware performance counters. Averaging across 300 mil-                                                                                  KB_Timer: fast efficient user-level timer interrupts.
+lion runs, we observe that each successful senduipi takes a                                                                               The KB_Timer (Kernel Bypass timer) eliminates the cost and
+total of 383 cycles. Out of those cycles, the processor stalls                                                                            complexity of OS-based timers and dedicated timer threads.
+Extended User Interrupts (xUI): Fast and Flexible Notification without Polling             ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.
+
+
+With KB_Timer, each timer interrupt is 105 cycles. As each                           Tracking exploits the fact that the precise point in the
+core gets its own timer, it eliminates the added notification                    instruction stream when an interrupt is detected isn’t seman-
+overheads that scale with the number of cores (Figure 6).                        tically meaningful—interrupts are inherently asynchronous,
+KB_Timers are also directly programable from user space,                         thus the processor can choose where to issue the interrupt
+allowing efficient access to change the timer frequency, dis-                    handler to achieve the best possible latency, without sacri-
+able the timer, or use a different mode of operating (one-shot                   ficing throughput.
+vs. periodic).                                                                       Even though Tracking appends instructions to the end of
+Interrupt forwarding: device interrupts for threads.                             the inflight instruction stream, like Draining, we do not expe-
+Kernel bypass interfaces for NICs and accelerators force                         rience the same latency. Because we are (immediately) inject-
+user-level code to poll for IO completion events. xUI aims                       ing instructions without dependences on prior instructions,
+to mitigate this inefficiency. Device interrupts are normally                    we expect them to enter execution quickly with minimal la-
+routed to cores (by APICID) rather than threads, and UIPI                        tency cost, even in the presence of a non-empty instruction
+offers no solution. Interrupt forwarding (§4.5) overcomes                        window.
+this limitation by routing interrupts destined for a particular                  Microarchitecture design. In contrast to flushing or drain-
+APICID/vector to a user-level thread/vector, allowing user-                      ing, tracking is primarily implemented at the front-end of the
+level code to enjoy the benefits of xUI with devices.                            processor (the fetch unit), rather than the back-end (commit
+                                                                                 unit).
+                                                                                     At a high level, tracking delivers an interrupt in two steps.
+                                                                                 To start, as soon as an interrupt is received and accepted
+4.2   Tracked Interrupts                                                         by the local APIC, tracking forces the instruction fetch unit
+Current strategies for interrupt handling in CPU pipelines                       to redirect control flow to MSROM, where the micro-ops
+require difficult trade-offs, forcing a choice between either a                  for interrupt notification processing are stored—effectively
+loss of instruction throughput, or high latency. Tracked in-                     injecting these instructions into the micro-op stream. Next,
+terrupts offer a new strategy for coping with the challenges                     it tracks whether these micro-ops are committed or not, en-
+of speculative execution (§3.5) that minimizes interrupt han-                    suring that: (1) they will be reissued if the processor flushes
+dling latency without sacrificing throughput.                                    the younger in-flight instructions on mispredictions, and
+   To recap, Flushing—the common approach on modern                              (2) we can accurately identify and save the last program
+out-of-order processors—flushes the pipeline immediately                         instruction—the place execution will resume after the in-
+when an interrupt is received. This throws away all in-flight                    terrupt handler runs, i.e. after an (iret) instruction. This
+work, which hurts throughput but minimizes latency. In                           method guarantees that the interrupt will eventually be de-
+modern architectures with over 500 in-flight instructions,                       livered, even if an in-flight branch is misspeculated, without
+the lost throughput (for the interrupted thread) on every in-                    throwing away useful work. Figure 3 provides an overview
+terrupt can represent hundreds or thousands of cycles of lost                    of the architectural changes introduced by our approach.
+progress. There can also be a latency cost as many architec-                         Now let’s examine tracking in more detail. To start, when
+tures will have a limit on the number of micro-ops that can                      an interrupt arrives from the local APIC, the “next PC logic”
+be squashed in a cycle. Another possible approach would be                       in the front-end checks if it is at an instruction boundary—
+Draining—retiring all in-flight instructions before delivering                   ensuring it is not in the midst of decoding micro-ops for a
+an interrupt. This does not waste work, but it adds signif-                      single instruction. Once this condition is satisfied, it then
+icant latency. The latency is necessary because we cannot                        immediately sets the micro-PC to the beginning of the inter-
+begin fetching until all sources of speculation are resolved;                    rupt notification processing micro-routine in the MSROM
+otherwise, we risk losing the interrupt. The cost of both                        and continues execution.
+methods is only increasing, as successive generations of pro-                        Next, because we neither flush nor drain, we have several
+cessors increase the size of instruction windows—enabling                        new challenges to cope with:
+more in-flight work.                                                                 First, we have to deal with the possibility of misspecuala-
+   Our approach, Tracking, avoids both of these compromises                      tion. For example, on a branch misprediction, the processor
+by exploiting the observation that interrupts are inherently                     normally recovers by flushing all the instructions younger
+asynchronous, and thus the processor has some flexibility as                     than the branch, then resuming execution. However, this
+to where in the instruction stream the interrupt handling                        will also flush our interrupt processing code, causing us to
+code issues. To wit—both flushing and draining treat the                         lose an interrupt.
+precise point in the instruction stream where the interrupt                          To prevent this, we implement a state machine in the front-
+signal was detected as meaningful, i.e., as a synchronous                        end to track if we are in the middle of handling an interrupt.
+event, and issue the interrupt handling micro-ops immedi-                        If there is a flush due to a misspeculation while an interrupt
+ately after that instruction (either the last instruction retired                is being handled, we immediately redirect the fetch unit
+or the last instruction fetched, respectively).
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.                                                                            Berk Aydogmus et al.
+
+                                                                    Frontend                                              Commit Unit
+to our interrupt processing microcode—re-injecting these            Fetch PC Next PC Logic                                                    Src
+                                                                                                                          Head
+micro-ops before resuming execution.                                  PC
+                                                                               if (interrupt is active){
+                                                                                 if (µpc==0){ //instr boundary                     ROB
+                                                                                    (npc, nµpc) = notif_proc_start_µop;      0    …    P   Program
+   The interrupt processing microcode will remain the de-            µPC            state = interrupt_initiated;
+                                                                                                                                             µops
+                                                                                 }                                           1    …    P                 Src
+fault misspeculation recovery path until the first interrupt                   } else if (mispred_event &&
+                                                                                           state==interrupt_initiated)       2    …    I   Interrupt   Change?
+                                                                                 (npc, nµpc) = notif_proc_start_µop;
+micro-op commits. It is possible that the processor misspecu-                  else
+                                                                                 (npc, nµpc) = regular_next_pc();
+                                                                                                                             3    …    I     µops          Yes
+
+lates and then restarts multiple times, however, the interrupt                 if (interrupt_committed)
+                                                                                   state = interrupt_committed;                  Commit PC             Save PC
+
+processing microcode—and the interrupt handler, will even-                            Interrupt                                            Interrupt Committed
+tually get committed. Subsequent restarts may end up being                            Line          Misprediction Signal/ Correct PC
+
+faster, as the interrupt handler’s code/data may already be
+in the cache.                                                       Figure 3. Tracking Architecture: High-level overview of
+   Second, we need to be able to identify the next_pc value         the Tracking architecture, which avoids flushing or draining
+following the last committed program instruction before the         when delivering an interrupt. The architectural changes are
+interrupt, to return to the correct address on an iret (return      limited to the next PC logic and minor modifications to the
+from the interrupt handler). This correct return address may        commit logic.
+change as we handle misspeculations. However, our solu-
+tion to misspeculation also handles this seamlessly, without
+significantly changing interrupt processing microcode. To           and complexity in existing high-performance CPU pipelines.
+start, we read the next_pc from the front-end when we redi-         For example, current processors don’t support partial flushes,
+rect execution. If we observe no misspeculations, then this         thus xUI does not rely on them. Thus, if a misspeculation
+value is correct. If there is a recovery from a misspeculation,     on an instruction that was fetched before an interrupt is
+the front-end will (as always) calculate a new next_pc value        detected, the normal misspeculation recovery logic flushes
+which our restarted interrupt process microcode will again          all the instructions after the misspeculation, including those
+use.                                                                from the interrupt path, even though we will need to reissue
+Cheaper than shared memory notification? Our results                these later. While a partial flush could potentially offer some
+suggest that tracked interrupts could be cheaper than shared        performance benefits, the improvements appear negligible,
+memory notifications on the receiver side for reasons similar       and not worth the added complexity [15, 20].
+to why they are cheaper than normal interrupts—shared                  Our bill of materials includes: one bit per ROB entry to
+memory notification is inherently synchronous, thus it can          indicate if a micro-op’s source is from normal program ex-
+introduce unexpected control flow.                                  ecution or an interrupt path (i.e. the interrupt processing
+   To wit—polling typically involves a read of a shared vari-       microcode or interrupt handler), and a bit per micro-op from
+able, with the common path being a cache hit and no pending         the front-end to the back-end to carry this source informa-
+notifications. When a notification does arrive, it will typically   tion to the ROB; a handful of logic gates to implement next-pc
+involve both a long memory operation (cache miss due to an          logic to steer instruction fetch to the interrupt notification
+invalidation event by the remote write, followed by a slow          microcode on an interrupt (Figure 3); a handful of logic gates
+read of the remote line) and a branch mispredict—resulting in       and a wire, to extend the commit logic to detect if an inter-
+a flush of instructions younger than the mispredicted branch.       rupt has been committed and to signal the front-end, so it
+Further, these steps will be serialized, because only when the      knows the interrupt does not need to be issued again.
+long-latency load retrieves its value will the branch mispre-
+dict resolve and recovery begin. Again, similar to interrupts,      4.3    The Kernel Bypass (KB) Timer
+this cost will increase as speculation windows grow in future       The Kernel bypass timer (KB_Timer) offers a per-thread user-
+processors.                                                         level timer, similar to the local APIC timer. As with the APIC
+   At present, whether tracked interrupts are as cheap (or          timer, it is not intended for direct use by application devel-
+cheaper) than polling depends on the cost of interrupt rout-        opers. Instead, it offers a low-level primitive that user-level
+ing. Recall the steps for delivering a UIPI described in §3.3.      runtimes can use to implement software timers for tasks like
+Without the costs of flushing, the next major overhead of           preemption, periodic polling, timeouts, etc.
+UIPI is reading the UPID, which is equivalent to polling, as           The timer is used through two new instructions: set_-
+this will similarly miss the cache if a remote core has updated     timer(cycles, mode) and clear_timer(). cycles is a 64-
+the UPID to send an IPI. However, as we discuss next, nei-          bit unsigned integer and the mode is a one-bit flag, indicating
+ther timers (§4.3), nor device (§4.5) interrupts with xUI need      if the timer is a periodic or a one-shot timer. If the mode is
+to modify this structure. Thus, the microcode for interrupt         periodic, cycles is interpreted as a period in cycles. If the
+delivery can start at step 5 of our description in §3.3, that       mode is one-shot, cycles is interpreted as a deadline, again, in
+takes only 105 cycles to execute.                                   keeping with the traditional APIC design that makes it simple
+Hardware cost and complexity. Our approach to imple-                to specify the next deadline when implementing multiple
+menting tracked interrupts aims to minimize additional cost         software timers.
+Extended User Interrupts (xUI): Fast and Flexible Notification without Polling             ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.
+
+
+Microarchitecture design. There is one KB_Timer per                              using an x86 instruction prefix [4], effectively transforming
+physical core, which is multiplexed among multiple threads                       any instruction into a hardware safepoint and eliminating
+by the operating system (as discussed below). The KB_Timer                       the need for a separate instruction. Since safepoints are a
+has its own physical timer, rather than simply re-using the                      common primitive in compilers for languages with precise
+local APIC timer, as that is already in use by the kernel.                       GC (e.g., they are supported in LLVM IR [45]), compilers
+Similar to modern local APIC timers, the timer uses the                          can be modified to emit safepoints with minimal changes.
+system clock to offer high resolution.                                           xUI’s safepoint mode—where interrupts are only delivered
+   KB_Timer interrupts are delivered by invoking the user-                       at safepoints—is toggled via a system call.
+level interrupt handler, and passing it the vector that was                      Microarchitecture design. To enable safepoints, we added
+assigned by the kernel. KB_Timer interrupt delivery is very                      a one-bit flag register—implemented as an MSR similar to
+inexpensive (105 cycles), as it can skip the microcode steps                     UIPI’s UIF flag—to indicate whether safepoint mode is en-
+related to the UPID and routing (notification_process)                           abled. When the safepoint flag is set, the processor delivers
+(§3.3) and invoke the interrupt_delivery microcode di-                           interrupts only at safepoint instructions.
+rectly.                                                                             Our tracked interrupts (§4.2), like normal processor inter-
+   Unlike IPIs, there is no special slow path support, i.e., it                  rupts, are delivered only at an instruction boundaries, ensur-
+is not intended to fire when either the kernel or any thread                     ing they are not delivered in the middle of the micro-ops for a
+other than the owner is executing. If the timer reaches its                      single instruction. Therefore, implementing safepoints only
+target in kernel mode, it will trap. If it is in user mode, it will              required a minor modification to the existing instruction
+deliver an interrupt to whatever thread is currently executing.                  boundary check.
+Consequently, it is up to the kernel to manage the timer state.                     To wit—we extended this check with an additional con-
+Multiplexing the KB_Timer. The kernel enables and dis-                           dition: if safepoint mode is enabled, the processor verifies
+ables the KB_Timer, and sets the timer interrupt vector by                       if the instruction currently being decoded is a safepoint
+writing into the kb_config_MSR. Similar to UIPI, this allows                     instruction, and only then delivers an interrupt. Specula-
+the kernel to control access to this mechanism through sys-                      tion adds some complexity here, as we must handle cases
+tem calls (enable_kb_timer(), disable_kb_timer()).                               where a safepoint is speculatively fetched and decoded on
+   To keep a consistent model for each kernel thread, on a                       an incorrect path.
+context switch the OS saves the current timer by reading the                        During recovery from a misspeculation, normally with
+kb_timer_state_MSR which returns the timer deadline (time                        tracking, if an interrupt is pending, the processor redirects
++ the current timestamp), and saves it along with the assigned                   to the interrupt processing path instead of the tracked pro-
+vector, period, and mode so the timer can be restored when                       gram PC. However, if the processor is in safepoint mode, it
+the thread is resumed.                                                           cannot take the interrupt immediately after recovery since
+   On the slow path (i.e., delivering an interrupt from the                      the safepoint was on the misspeculated path. In such cases,
+kernel), we opt to simply check if the deadline has been ex-                     the processor goes into a state where normal execution con-
+ceeded on context restore and deliver the interrupt—similar                      tinues until another safepoint is encountered, then the
+to the normal UIPI slow path. However, the kernel could                          tracked interrupt logic redirects the processor to the inter-
+also continue tracking the timer using a kernel timer (which                     rupt processing path.
+ultimately uses the local APIC timers) while the thread is                          Another complication arises when the safepoint instruc-
+not running, and immediately reschedule the thread when                          tion is decoded through optimized frontend paths, such as the
+the timer expires.                                                               micro-op cache or the loop stream detector in Intel architec-
+                                                                                 tures. To ensure that safepoints function correctly alongside
+4.4   Hardware Safepoints                                                        these optimizations, we add a bit to the encoding of each
+As discussed in §2, the lack of precise control over where                       micro-op to indicate whether it is a safepoint. If the proces-
+interrupts are delivered with UIPIs and signals conflicts with                   sor is in safepoint mode and an interrupt is pending, and it is
+the needs of precisely garbage-collected languages, that ex-                     executing micro-ops on one of these optimized paths, it uses
+pect to be preempted at safepoints. To recap, safepoints                         this bit to detect if it is at a safepoint, and thus is allowed to
+are precise locations in code—determined at compile time                         deliver the interrupt.
+through static analysis—where precomputed stack maps re-
+quired for precise GC are valid [10]
+   Hardware safepoints address this by providing a precise                       4.5 Interrupt Forwarding: Routing Device Interrupts
+and near-zero-cost mechanism for the compiler to indicate                        We want the benefits of xUI for device I/O, however, UIPI
+where the processor can safely deliver an interrupt. Con-                        has its own delivery scheme using UPIDs that the rest of the
+ceptually, safepoints can be thought of as a special form of                     interrupt system knows nothing about. It only knows how
+NOP—a safepoint instruction. Their actual implementation                         to route interrupts to APICIDs, that are generally assigned
+is architecture-dependent. On x86, safepoints can be encoded                     to cores at boot time.
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.                                                                 Berk Aydogmus et al.
+
+
+   Interrupt forwarding solves this by extending the local            Table 3. Architecture Detail for the Baseline x86 Core
+APIC, allowing it to forward interrupts destined for the core                                     Baseline Processor
+                                                                           Frequency      2.0 GHz        I cache        32 KB, 8 way
+directly to the current thread. If the destination thread is               Fetch Width    6 𝜇 ops        D cache        32 KB, 8 way
+                                                                           Issue Width    10 𝜇 ops       Retire Width   10 𝜇 ops
+not running, the local APIC will tell the OS to handle the                 Squash Width   10 𝜇 ops       Decode Width   6 𝜇 ops
+notification, similar to UIPI. To implement this, Interrupt                SQ Size        72 entries     IQ             168 entries
+                                                                           LQ Size        128 entries    Functional     Int ALU(6), Mult(2),
+Forwarding allows the kernel to set up mappings between                    ROB Size       384 entries    Units          FPALU/Mult(3)
+per-core (APICID) vectors and user-level vectors. Thus, when
+an interrupt arrives on a mapped vector, the interrupt is         5     Experimental Methodology
+forwarded, rather like port forwarding in a network.
+                                                                  5.1    Hardware Platform
+   To set up a mapping, a thread registers through the OS
+to receive interrupts from a device, and is assigned a noti-      We ran all of our experiments on an Intel Xeon Gold 5420+
+fication vector. Interrupts are delivered as normal through       processor with 28 Sapphire Rapids cores, using Intel’s fork of
+the interrupt handler. However, similar to the KB_Timer,          Linux v6.0.0 with their UIPI patches [5]. We ran our processor
+the UPID is never touched, thus fast path interrupt delivery      at 2 GHz with TurboBoost, frequency scaling, and c-states
+(where the receiving thread is running) is faster and free of     disabled to ensure controlled measurements. We used both
+contention for shared memory.                                     Linux perf [23] and Agner tools [22] to read performance
+Microarchitecture design. Interrupt forwarding extends            counters. To estimate the number of flushed micro-ops we
+the local APIC with two new 256-bit registers, forward-           calculated the difference between the number of committed
+ing_enabled and forwarded_active. Each bit in these reg-          micro-ops and decoded instructions—as there is no direct
+isters corresponds to a vector. forwarding_enabled indi-          performance counter for flushed micro-ops.
+cates which interrupts to forward on the current core. for-
+warded_active indicates which interrupts should be for-           5.2    gem5 Simulation
+warded to the currently running thread.                           Our simulation is based on gem5 (version 23) [46] and ex-
+   For example, if an interrupt arrives with 𝑣𝑒𝑐𝑡𝑜𝑟 == 8. If      tends the out-of-order CPU model. We configured the base-
+bit 8 is set in forwarding_enabled the APIC will set bit 8        line architecture to model an Intel Sapphire Rapids processor
+in the UIRR MSR. From here there are two choices, the fast        such as the Intel Xeon Gold 5420+, using the parameters
+path and the slow path.                                           shown in Table 3. We ran gem5 in full-system mode, again
+   If bit 8 is set in forwarding_active, the APIC will notify     with the Intel fork of the v6.0.0 Linux Kernel [5]. We imple-
+the core to deliver an interrupt—this is our fast path, the       mented UIPI support in gem5, and used our characterization
+interrupt goes straight to the user-level thread. If bit 8 is     study (§3) to provide accurate costs for flushing, notification,
+not set, this means that the thread this is destined for is not   and delivery, and built support for xUI on top of this. We also
+currently running—this is our slow path. In this case the         verified that the receiver overhead of our UIPI simulation in
+APIC issues a regular conventional interrupt, the kernel trap     gem5 closely matches the overhead of UIPIs on our Sapphire
+handler looks at the cause, then reads the vector from UIRR       Rapids processor (Table 2), with both around 720 ns. To sup-
+and stores it for later delivery in the DUPID (see below).        port our I/O notification experiments (§5.4), we ported the
+Multiplexing interrupt forwarding. Each kernel task               gem5-dpdk [58] device model from ARM to x86, and added
+(thread) has it’s own 256-bit vector indicating which inter-      support for delivering I/O completions using xUI.
+rupts are forwarded to it. This vector is written to for-            One interesting discovery was that gem5’s model of in-
+warded_active when a thread resumes execution.                    terrupt performance is quite different from real hardware.
+   During registration, the OS also allocates a data struc-       For example, it drains the pipeline instead of flushing it, and
+ture similar to the UPID for handling the slow path on each       a fixed 13 cycles was artificially added after each drain. To
+receiver—i.e when the destination thread is not running, that     remedy this, we plan to upstream our improved interrupt
+we call Device User Interrupt Posted Descriptor (DUPID).          model to gem5.
+When a forwarded interrupt arrives that the current thread
+is not waiting for, the kernel updates the DUPID and delivers     5.3    Preemptive Scheduling with UIPI and xUI
+the interrupt via the normal slow path, similar to a UIPI.        To evaluate UIPI and xUI with preemptive scheduling, we
+   Our interrupt forwarding scheme, while efficient and min-      run Aspen [30] in gem5. Aspen is a user-level runtime based
+imally intrusive, is constrained by the limited vector space of   on Caladan [26]. It supports lightweight user-level thread-
+the underlying core as this must be shared by threads on the      ing and kernel-bypass I/O. Aspen implements preemptive
+host. This limitation restricts the number of device/user pairs   scheduling via user interrupts and balances threads across
+that can be supported simultaneously. One could imagine           cores using work stealing.
+adding a new field to the message format of the interrupt            For the application, we run RocksDB [8] (v5.15.10), a pop-
+system, or repurposing unused bits in the existing message        ular key-value store, using a bimodal workload consisting
+format (e.g. the clusterID) to avoid this limitation.             of 99.5% GET (1.2 𝜇s) and 0.5% SCAN (580 𝜇s) requests. We
+Extended User Interrupts (xUI): Fast and Flexible Notification without Polling                           ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.
+
+
+                                                                                                         UIPI SW Timer         xUI (SW Timer +             xUI (KB_Timer + Tracking)
+generate requests using Caladan’s open-loop load generator,                                                                     Tracking)
+                                                                                            50%                              50%                           50%
+configured to use UDP with a Poisson arrival distribution.                                  40%    fib                       40%  linpack                  40%    memops
+
+
+
+
+                                                                                 Slowdown
+The load generator and the RocksDB server each run in an                                    30%                              30%                           30%
+Aspen runtime on a single core.                                                             20%                              20%                           20%
+                                                                                            10%                              10%                           10%
+  To enable us to run this workload in gem5, we adapted
+                                                                                             0%                               0%                            0%
+Aspen in three ways. First, to simulate network traffic in                                        100 50 20 10 5 3       1         100 50 20 10 5 3    1         100 50 20 10 5 3   1
+gem5, we added an additional core that forwards packets                                                                      Interrupt Interval ( s)
+between the load generator and the RocksDB server. Second,
+                                                                                   Figure 4. Reducing Receiver Overheads: UIPI-based no-
+we disabled core reallocation to reduce noise and removed
+                                                                                   tifications impose the most overhead, due to their impact on
+the kernel module that implements it (ksched). Instead, we
+                                                                                   the receiver pipeline and routing costs. Switching to notifica-
+pin each kernel thread to a specific CPU core. Finally, we ex-
+                                                                                   tion using xUI tracked interrupts eliminates pipeline overheads.
+tended Aspen to use our KB_Timer. With KB_Timer enabled,
+                                                                                   Switching to KB_Timers eliminates routing costs, for an over-
+each core gets its own timer.
+                                                                                   head reduction of 6.9x vs. UIPI.
+
+
+                                                                                   6              Evaluation
+                                                                                   We begin by evaluating xUI’s features individually, then
+5.4 IO Notification: L3Fwd & Simulated Accelerators                                explore xUI in end-to-end benchmarks in §6.2.
+DPDK-based L3 forwarding. We adopted a methodology
+similar to prior work to measure the inefficiencies associated                     6.1             xUI Features
+with spin polling using DPDK [29] . In our experiments, we                         Below we evaluate the receiver-side overheads with xUI,
+use DPDK’s Layer 3 Forwarding (L3Fwd) application, with                            contrast receiver-side overheads for two precise mechanisms,
+the Longest Prefix Match (LPM) algorithm, a routing table                          i.e., hardware safepoints and polling, examine the reduction
+containing 16,000 entries, and 64-byte IPv4 UDP packets. We                        in sender-side overheads and core counts from KB_Timers,
+model a system with 1, 2, 4, or 8 different NICs, each with its                    and explore the maximum latency of interrupts with xUI.
+own receive queue. Packets are sent back to the same NIC                           Receiver-side overheads: UIPI and xUI. To start, we
+in the 1 NIC case, similar to [29].                                                look at how xUI reduces the overhead of receiving inter-
+   We used a dedicated external device and an open-loop                            rupts when compared to UIPI. Figure 4 shows how periodic
+packet generator that are part of gem5-dpdk [58] to generate                       interrupt delivery impacts three different benchmarks (fib,
+our experimental workloads. We modified the packet gen-                            linpack, and memops).
+erator to use an exponential distribution for inter-packet                            Our experiment sends periodic interrupts to the running
+arrival times to more accurately model the burstiness of real                      application and measures how much longer it takes to com-
+network traffic [14, 27].                                                          plete. We examined three different strategies to isolate the
+On-chip accelerators. We built a simulated on-chip ac-                             benefits of different xUI mechanisms: a dedicate timer core
+celerator similar to Intel’s DSA [42], with a configurable                         sending UIPIs (UIPI SW Timer), xUI (SW Timer + Tracking)—
+distribution of offload latencies. The accelerator is connected                    tracked interrupts also being sent with a dedicated timer
+to our gem5 system via a simulated PCIe bus. User programs                         core, and xUI (KB_Timer + Tracking)—tracked interrupts
+submit offloads to the simulated accelerator using an asyn-                        being sent by the KB_Timer.
+chronous interface similar to SPDK [9]. We evaluated our                              To start, we can see that tracked interrupts reduce the
+accelerator with a synthetic closed-loop workload that busy-                       per-event cost of delivering an interrupt from an average of
+spins while it waits for requests to complete.                                     645 cycles with the UIPI baseline to 231 cycles with tracking.
+   Real offload latencies vary as a function of the requested                      Switching to KB_Timer as our time source eliminates the
+operation, the request (buffer) size, and contention for the                       added delivery costs of accessing the UPID, as discussed
+accelerator. To capture this variability, we model offload                         in §4.3, further reducing the per-event cost of an interrupt
+latencies by adding random noise with varying magnitude                            to an average of 105 cycles. Thus, the cost of delivering
+to the response time of the accelerator. We model two types                        interrupts at a 5 𝜇s interval decreases by roughly 6.9x from
+of requests with response times of 2 𝜇s and 20 𝜇s. According                       6.86% with UIPIs to just 1.06% with KB_Timers and tracking.
+to prior work [42] and our own measurements, examples                              Hardware safepoints vs. polling-based preemption. We
+of operations and data sizes that have these mean offload                          compare the overhead of thread preemption with two precise
+latencies include: (1) for 2 𝜇s latency: copying one 16 KB                         mechanisms—xUI hardware safepoints and polling— as well
+buffer using DSA [42] or copying a batch of 8 buffers of up                        as UIPIs. Our experiment preempts two programs: matmul
+to 2048 bytes each; (2) for 20 𝜇s latency: copying one 1 MB                        and base64. To implement polling-based preemption, we use
+buffer using DSA [42].                                                             Concord [34], a state-of-the-art system for compiler-based
+ ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.                                                                                           Berk Aydogmus et al.
+
+                                                                                                                3 s     5 s     10 s      20 s      50 s     100 s
+                   Polling       UIPI       xUI: Hardware Safepoints                                                                             nanosleep    itimer
+
+
+
+
+                                                                                  Timer Core CPU Usage (%)
+           15%                               15%                                                             100%
+                  matmul                           base64
+                                                                                                              80%
+Slowdown
+
+
+
+           10%                              10%
+                                                                                                              60%
+           5%                                5%                                                               40%
+                                                                                                              20%
+           0%                                0%
+                 200 100 50   20 10 5   2         200 100 50   20 10 5   2                                     0%
+                                                                                                                    0           6              12             18 19
+                              Preemption Quantum ( s)                                                                         Number of Application Cores
+
+ Figure 5. Preemption with Hardware Safepoints: Pre-                         Figure 6. The Cost of a Timer: OS overheads become in-
+ emption with xUI (tracking + KB_Timer) using hardware safe-                 creasingly costly for fine grain timing. Here we see CPU use
+ points is precise and near zero-cost—visible overheads are pri-             on a single core to get time from the OS (using setitimer() or
+ marily due to context switch costs. UIPI is imprecise and scales            nanosleep()) and then preempt application cores with UIPI.
+ less gracefully due to its higher per-event cost. Polling is precise        Lines correspond to different preemption frequencies. The costs
+ and scales better with increased preemption rates, but imposes              of OS timer notifications initially dominate, but the overhead
+ up to 10x more overhead than UIPI or xUI.                                   of sending UIPIs increases with the number of receiving appli-
+                                                                             cation cores. xUI eliminates these costs, as each core gets its
+                                                                             own low-overhead high-resolution KB_Timer.
+instrumentation (polling) preemption as a representative
+system. To evaluate hardware safepoints, we modified Con-
+cord’s compiler instrumentation passes to insert safepoint                   KB_Timer eliminates the need to use expensive OS interfaces
+instructions rather than polling checks.                                     (with multiple context switches per timer event), and each
+   Figure 5 shows that hardware safepoints have much lower                   core can have its own timer, eliminating the need for IPIs.
+overhead than the other two approaches for both programs at                     Higher performance system [30, 34, 44], will sometimes
+any preemption quantum. With a quantum of 5 𝜇s, our hard-                    dedicate an entire core to spinning on a high-precision timer
+ware safepoints show a slowdown of only 1.2%-1.5%—largely                    (e.g., rdtsc) to avoid OS overhead. Using this approach, we
+attributable to the overhead of context switching—while the                  found we could support up to 22 application cores at a 5 𝜇s
+compiler-based approach imposes 8.5%-11% overhead. This                      preemption interval [30]. As the number of receiver cores
+improvement is mainly due to (1) xUI’s lower receiver costs,                 increases, notification costs (senduipi) become dominant.
+and (2) the near-zero costs of our safepoint instructions as                 Using KB_Timer, we can eliminate the need for a dedicated
+they are just interpreted as NOPs when there is no event.                    timer core entirely, thus, as a baseline, it saves us 1 core for
+Note that as we return to the same thread after handling a                   every 22 workers at 5𝜇s.
+preemption, the costs of context switches are minimized vs.                     Of course, the benefits of the KB_Timer depend on the
+context switching to different threads, an I/O handler, etc.—                number of available cores and the workload. For example, in
+which would pollute the microarchitectural state. While this                 the most optimal case, if we have two cores and can fully uti-
+has the benefit of isolating the improvements due to noti-                   lize an extra core to improve throughput, KB_Timer doubles
+fication costs, it doesn’t illustrate how these benefits are                 throughput. In the least optimal case, i.e., 22 other worker
+amortized in more complex settings. Our end-to-end eval-                     cores fully utilized, it only improves throughput by 4.5%.
+uations on RocksDB in §6.2.1 capture these more realistic,                   KB_Timer also offers significant per-event performance ben-
+higher context switching costs.                                              efits vs. UIPI (Figure 4).
+Benefits of eliminating timing cores with KB_Timers.                         Maximum interrupt latency. Tracking offers the ben-
+As discussed in §2, to amortize the costs of OS timers and                   efit of maximizing throughput as it never discards work,
+avoid contention [55], user-level runtimes [3, 30, 44, 54] of-               however, latency depends on the nature of the in-flight in-
+ten rely on notifications from a core that is partially or totally           structions when an interrupt arrives.
+dedicated to timing. In Figure 6, we show the CPU utilization                   To explore the limits of this, we sought to understand the
+of a timer core using two different OS timer interfaces. In our              potential worst-case latency. To measure this we constructed
+experiment, we use setitimer(), which delivers a signal                      an example that fills the pipeline with a chain of long-latency
+each interval, and nanosleep(), where a thread goes to sleep                 load instructions that miss the CPU caches—and then our
+and is then woken up each interval. UIPIs are used to send                   dependency chain ultimately produces the value for the stack
+notifications to other cores, and we show how overheads                      pointer register. Note that that this is an extreme pathological
+scale on the sender (timer core) as there are more cores to no-              case, where the interrupt code is in fact dependent on a long
+tify. As we can see OS timers exert a small, but still noticeable            chain of inflight instructions. While it is not unlikely that
+overhead at lower notification rates. And as the notification                the interrupted thread has a long chain, or that it modifies
+rate increases, they consume an increasingly large percent-                  the stack pointer, it is highly unlikely the latter depends on
+age of the core. xUI eliminates these costs entirely as the                  the former.
+Extended User Interrupts (xUI): Fast and Flexible Notification without Polling                                                         ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.
+
+
+   With tracked interrupts, this case delays the execution                                                                       Non-preemptive            UIPI SW Timer           xUI (KB_Timer + Tracking)
+of the interrupt delivery procedure (§3.3) as there is an in-                                                                     1                                       30
+
+
+
+
+                                                                                                              99% Latency (ms)
+struction in the delivery that reads the value of the stack                                                                                GET                                      SCAN
+                                                                                                                                                                          20
+pointer register (to save it on the stack). The value remains                                                                    0.5
+unavailable until the dependency chain completes, poten-                                                                                                                  10
+tially delaying interrupt delivery by hundreds of cycles.                                                                         0                                        0
+   When we run this experiment, we do see an absolute worst-                                                                           0     40       80      120   160        0        0.3       0.6       0.9
+                                                                                                                                                    KRPS                                      KRPS
+case latency close to 7000 cycles with a chain of 50 or more
+long-latency loads. Utilizing Intel’s flush mechanism has a                        Figure 7. Improving RocksDB Throughput: RocksDB
+worst-case latency an order of magnitude less (because all of                      throughput with a mix of 99.5% GET (1.2 𝜇s) and 0.5% SCAN
+those instructions just get squashed). However, experiments                        (580 𝜇s) requests. We compare no-preemption and preempting
+with our more typical benchmarks (e.g., linpack2, memops,                          every 5us with UIPI and xUI. Both UIPI and xUI significantly
+fib) (in addition to our end-to-end workloads), confirm this                       improve GET throughput by mitigating head-of-line blocking.
+is indeed an anomalous result. In these cases, tracking la-                        However, xUI achieves 10% higher throughput than UIPI, and
+tencies were substantially better than flushing, owing to the                      also free’s up an extra core (not shown) that UIPI-based pre-
+fact that often there is no delay between when an interrupt                        emption requires as a time source.
+arrives and when it issues with tracking, whereas flushing
+introduces an additional delay before an interrupt can issue.
+That said, we believe this is an area where we are up against                                                                                    Interrupt Overhead                Networking Cycles
+                                                                                                                                                 Free Cycles                       Polling Overhead
+the limits of what is knowable through reverse engineering
+                                                                                                                                       %0 Load     %20 Load    %40 Load   %60 Load     %80 Load      %100 Load
+and simulation. Thus, we refrain from drawing more definite                                                   100%
+conclusions.                                                                                                   80%
+
+
+
+
+                                                                                                                                                                                                                  1 queue
+                                                                                                               60%
+6.2   End-to-End Evaluation                                                                                    40%
+                                                                                                               20%
+Here we evaluate xUI end-to-end in three use cases.
+                                                                                 Percentage over all Cycles
+
+
+
+                                                                                                                0%
+                                                                                                              100%
+6.2.1 Preemption for RocksDB in Aspen. Preemption                                                              80%
+
+
+
+
+                                                                                                                                                                                                                  4 queues
+reduces head-of-line blocking and tail latency in workloads                                                    60%
+where request service times vary significantly [30, 37], lead-                                                 40%
+ing to higher useful throughput. We evaluated these benefits                                                   20%
+for RocksDB in Aspen (§5.3) using three configurations: pre-                                                    0%
+emption with UIPI SW Timer (UIPI + dedicated timer core)                                                      100%
+and xUI (KB_Timer + Tracking), and a non-preemptive base-                                                      80%
+
+
+
+
+                                                                                                                                                                                                                  8 queues
+line. Again, our workload is a mix of 99.5% GET (1.2 𝜇s) and                                                   60%
+0.5% SCAN (580 𝜇s) requests. We choose a preemption quan-                                                      40%
+tum of 5 𝜇s to optimize GET throughput with a 1 ms tail                                                        20%
+latency target.                                                                                                 0%
+                                                                                                                                       Polling
+
+
+                                                                                                                                                   Polling
+
+
+                                                                                                                                                               Polling
+
+
+                                                                                                                                                                           Polling
+
+
+                                                                                                                                                                                        Polling
+
+
+                                                                                                                                                                                                     Polling
+                                                                                                                                           xUI
+
+
+                                                                                                                                                       xUI
+
+
+                                                                                                                                                                   xUI
+
+
+                                                                                                                                                                               xUI
+
+
+                                                                                                                                                                                            xUI
+
+
+                                                                                                                                                                                                         xUI
+   Figure 7 shows the tail latency for GET and SCAN requests
+as we vary the offered load. Without preemption, the tail
+latency for GET requests is hundreds of microseconds, even                           Figure 8. Improving l3fwd Efficiency: Our layer 3 for-
+under very low load. In contrast, with preemption via UIPIs,                         warding workload shows how polling always utilizes the entire
+Aspen is able to maintain low tail latency for GET requests                          core, while xUI frees up cycles that can be used for other useful
+(at most a few hundred microseconds) up to throughputs                               work or power savings. At 0% load, xUI frees up 100% of cycles,
+of over 100,000 requests per second. The addition of KB                              at 40% load with one queue xUI leaves 45% free, etc.
+Timers and tracking further increases throughput for GETs
+by 10%, due to the lower overhead of receiving UIs. In both
+cases, preemption comes at the cost of slightly elevated tail                       from simulated high-performance NICs to a layer 3 router
+latencies for SCAN requests at high load. This is because each                      (DPDK’s l3fwd).
+SCAN request takes hundreds of microseconds to complete                                We observe that the throughput of both approaches is
+and is thus preempted many times.                                                   nearly identical, with xUI throughput falling short of polling
+                                                                                    by 0.08%. This is because with device UIs, the interrupt han-
+6.2.2 IO notification in l3fwd. Here we compare the                                 dler polls the network queue again before returning; at high
+performance and efficiency of polling vs. xUI (tracked inter-                       loads the handler never returns, yielding the same through-
+rupts + interrupt forwarding) for delivering device interrupts                      put as with polling. xUI achieves a 95th percentile tail latency
+     ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.                                                                                                   Berk Aydogmus et al.
+
+
+                                   Busy Spinning                       Periodic Polling                 xUI           in §5.4. Figure 9 shows the free CPU cycles and average
+                                                                           100%                                       latency for the offloaded tasks.
+                  80%                                                      80% 20 s requests                             Here we see our three strategies and their results: Busy
+                          2 s requests
+Free Cycles (%)
+
+
+
+
+                                                         Free Cycles (%)
+                  60%                                                      60%                                        spinning— busy spin continuously polls the completion queue,
+                  40%                                                      40%                                        this offers excellent responsiveness (latency), but wastes all
+                  20%                                                      20%                                        the CPU cycles not spent handling notifications.
+                  0%                                                          0%                                         Periodic polling—periodically check for completions—in
+                          0    2      4     6        8                                 0     2     4     6        8   our experiment, we implement these checks with the OS
+                              Noise Magnitude ( s)                                         Noise Magnitude ( s)
+                                                                                                                      interval timer (setitimer()). Here we see that this frees
+                     12                                                           40
+                                                                                                                      up a significant portion of cycles, but may also hurt the
+                     10   2 s requests                                                 20 s requests
+      Latency ( s)
+
+
+
+
+                                                                   Latency ( s)
+                                                                                  35                                  latency of the offloaded tasks, as the arrival time of responses
+                      8
+                                                                                  30                                  becomes less periodic/more noisy. For example, with 20 𝜇s
+                      6
+                                                                                  25                                  requests, the latency of periodic polling increases sharply as
+                      4
+                                                                                  20
+                                                                                                                      unpredictability rises. This is because the additional response
+                          0    2      4     6        8                                 0     2     4     6        8   latency prevents periodic polling from occurring precisely
+                              Noise Magnitude ( s)                                         Noise Magnitude ( s)
+                                                                                                                      when requests finish, causing processing to wait until the
+                                                                                                                      next timer event. We don’t see the same effect for shorter
+     Figure 9. Optimizing Latency and Efficiency of DSA
+                                                                                                                      requests as the timer frequency is already very high (2 𝜇s),
+     Response Delivery: Here we see free cycles (top graphs)
+                                                                                                                      almost at the limit of the OS interval timer, and missing one
+     and latency (bottom graphs) while delivering responses from
+                                                                                                                      event does not significantly hurt latency.
+     our DSA accelerator using busy spinning, periodic polling (OS
+                                                                                                                         With, xUI, in contrast, latency remains constant and within
+     interval timer), and xUI: Busy spinning burns the entire core
+                                                                                                                      0.2 𝜇s of the latency achieved by polling for both types of
+     waiting for DSA responses, i.e. no free cycles (top graph), but
+                                                                                                                      requests. Overall xUI is able to achieve the best CPU effi-
+     minimizes latency (bottom graph). Periodic polling sacrifices
+                                                                                                                      ciency with only a small latency penalty. For example, for
+     latency, especially as response times become less regular, but
+                                                                                                                      2 𝜇s requests with no unpredictability (zero added noise),
+     frees up many cycles compared to polling. xUI provides optimal
+                                                                                                                      tracked interrupts free up 75% of CPU cycles.
+     responsiveness (latency), while minimizing CPU consumption,
+     i.e., maximizing free cycles that can be used for other useful
+     work or power savings.                                                                                           7   Related Work
+                                                                                                                      Tracked interrupts. xUI’s tracked interrupts improve per-
+                                                                                                                      formance by reducing the impact of unpredicted control flow
+     within +2%, -8%, and +65% of polling’s latency for 1, 4, and 8                                                   that undermines the benefits of speculative execution. In this
+     NICs, respectively.                                                                                              sense, they are similar to techniques like predicated execu-
+        We also see how xUI reduces CPU consumption, i.e., leaves                                                     tion [50] or selective flushing mechanisms [20] that attempt
+     more “free cycles” that could be spent on other useful work                                                      to retain instructions when a mispredicted branch direction
+     or power savings. We see in Figure 8, with polling, all CPU                                                      reconverges with the correct path.
+     cycles are spent either handling packets (“Networking Cy-                                                        Hardware support for user interrupts. Prior research
+     cles”) or polling the network stack. In contrast, with device                                                    made the case for the value of user-level handling of inter-
+     interrupts polling becomes unnecessary. Thus, there are free                                                     rupts [51] and exceptions [57]. To the best of our knowledge,
+     cycles. For example, with 1 queue and 40% load, xUI 45%                                                          Intel’s Sapphire Rapids processor, released in 2023, is the first
+     of cycles are free cycles, compared to polling which always                                                      commodity high-performance processor to offer hardware
+     consumes all cycles.                                                                                             support for user-level interrupts.
+                                                                                                                         Early versions of the RISC-V spec featured user interrupt
+     6.2.3 IO notification in DSA. Here we explore the per-                                                           support, but this extension was later dropped [24]. More re-
+     formance and efficiency benefits of xUI for delivering I/O                                                       cently, RISC-V added the CLIC extension [16], to support fast
+     completion events from our simulated accelerator modeled                                                         interrupts for embedded and real-time applications. While
+     after DSA. We consider two criteria: latency—how long after                                                      xUI builds on UIPI, most of it is applicable to other ISAs.
+     a completion arrives is it delivered, and free cycles—how                                                        Accelerators and killer microseconds. Barroso et al. in
+     many cycles are left on the core after the cost of the notifi-                                                   their “Attack of the Killer Microseconds” [11] noted a grow-
+     cation mechanism. We evaluate three options for receiving                                                        ing number of high-performance IO devices (e.g., NICs, flash,
+     I/O competitions: busy spinning, periodic polling, and xUI                                                       non-volatile memory, accelerators) in the datacenter will
+     device interrupts.                                                                                               be operating at microsecond timescales, and that current
+        To evaluate these different approaches, we offload tasks                                                      processor architectures and software were missing the abil-
+     with two different response time distributions as described                                                      ity to deliver event notifications, hiding latency, etc. at this
+Extended User Interrupts (xUI): Fast and Flexible Notification without Polling             ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.
+
+
+scale. They further predicted the growing use of accelerators                    threads. Thus, when a thread then calls senduipi to send a
+to reduce the “datacenter tax”, i.e., common microsecond                         UIPI to itself, the PIR will be set, but no UIPI will be delivered.
+scale tasks such as encryption, compression and serializa-                       Consequently, when a timer interrupt arrives, it will be deliv-
+tion that consume 20-25% of the CPU cycles in Google’s                           ered as expected. Finally, Skyloft repeats this self-senduipi
+datacenters [40], would only exacerbate this problem.                            trick in their interrupt handler after every interrupt to ensure
+   Intel introduced UIPI to efficiently interface [38] with a                    the PIR is set before the next timer interrupt.
+whole range of new accelerators [63] —such as DSA [42]—                             Unfortunately, this trick has significant limitations. First,
+that are intended to address the data center tax. xUI directly                   because there is only one local APIC timer, the kernel no
+addresses some of the challenges raised in “attack of the killer                 longer has use of the local APIC timer for scheduling, time-
+microseconds”, and builds on the vision behind UIPI [38].                        keeping, etc. Next, this also disables all other uses of user
+Hardware virtualization at user level. Dune [12] lever-                          interrupts, first because the SN bit must be set for the self-
+aged hardware virtualization features (VT [4] and EPT [4])                       senduipi trick, and more generally because overloading
+to provide user-level access to low-level hardware features,                     UINV for timer interrupts means the processor cannot disam-
+including the interrupt system. Shinjuku [37] built on this                      biguate other UIPI’s from timer interrupts. For these reasons,
+approach, enabling direct use of IPIs for preemption (rather                     as well as others, e.g. direct user-space programmability, this
+than signals) before UIPI became available. However, this                        trick is not a substitute for xUI’s KB_Timer support.
+approach introduces additional performance overhead and
+deployment challenges; as a result, user-level access to vir-                    8     Conclusion
+tualization has never seen widespread adoption.                                  xUI offers first class support for asynchronous notification
+High-performance IO and polling. High-performance                                at user level. It significantly improves on the performance
+user-space IO stacks rely almost exclusively on polling to                       and flexibility of UIPI, and offers a simpler and more efficient
+detect IO events [13, 26, 37, 39, 41, 48, 49, 52, 62]. However,                  alternative to shared memory polling.
+polling is often quite wasteful especially when traffic is un-
+predictable and as the number of queues increases [29, 43].                      Acknowledgments
+Hyperplane [47] reduces polling overheads with a dedicated                       This work was supported by gifts from Cisco, Intel, and
+accelerator that offers a multiqueue mwait-type primitive.                       Google. Thanks to Chris Fallin, Shravan Narayan, Hosein
+With xUI, we explore how polling can be eliminated entirely,                     Yavarzadeh, and Brendan Sweeney for insightful discussions
+demonstrating that interrupts can achieve low latency and                        and feedback on this work. We also thank the anonymous
+high performance without sacrificing efficiency.                                 reviewers and our shepherd, Gabriel Parmer. And finally
+User-level preemption. Preemption is a well-known tech-                          thanks to our families, without their support this work would
+nique for achieving more precise scheduling control. With                        not be possible.
+preemption, schedulers can improve throughput while bound-
+ing tail latency [34, 37]. Systems that have used UIPI to en-                    A     Artifact
+able this [25, 30, 35, 44] could benefit from the improved                       A.1    Abstract
+performance and efficiency offered by xUI.
+   The tension between precise GC and efficient preemp-                          This artifact includes 7 different modules, 5 of which are
+tion has long been known in the Java runtime developer                           based on our extended user interrupt model implemented
+community [28], and was extensively explored by the Go de-                       in the gem5 simulator. We help reproduce l3 forwarding
+velopers [2, 10]. The lack of support for loop preemption in                     (Figure 8), accelerator (Figure 9), overhead (Figure 4), rocksdb
+Java’s virtual threads [6] is simply the latest example. xUI’s                   preemption (Figure 7), and safepoint preemption (Figure
+hardware safepoints offer a simple and efficient solution to                     5). There are two other modules one of which measures
+this decades-old problem.                                                        core utilization of timers on a physical cpu (unlike the gem5
+Hacking around UIPI limitations. UIPI does not offi-                             models, Figure 6), and the other one is a reverse engineering
+cially support timer interrupts. However, Skyloft [35] re-                       program to uncover latencies of user interrupts, again on a
+cently demonstrated a trick to get around this limitation,                       physical cpu (Figure 2).
+albeit in a very constrained way. Their approach starts by
+                                                                                 A.2    Artifact check-list (meta-information)
+setting the UINV field of the IA32_UINTR_MISC MSR that a
+                                                                                  ▶ Program: gem5, dpdk
+core uses to discriminate conventional interrupts and UIPIs,
+                                                                                  ▶ Compilation: gcc,clang
+to match the vector of the local APIC timer. Thus, timer in-                      ▶ Transformations: compiler insertion
+terrupts are forwarded to the current thread. However, the                        ▶ Hardware: Intel Sapphire Rapids Processor
+local APIC will not set the PIR (posted interrupt) register on                    ▶ How much time is needed to prepare workflow (approxi-
+the local core on a timer interrupt, which is required to de-                       mately)?: 4 hours
+liver a UIPI. To get around this, Skyloft abuses senduipi in a                    ▶ How much time is needed to complete experiments (ap-
+novel way. At startup, its sets the SN bit on the UPIDs for all                     proximately)?: 3 days
+ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.                                                                           Berk Aydogmus et al.
+
+
+ ▶ Publicly available?: Yes                                                     [13] Adam Belay, George Prekas, Mia Primorac, Ana Klimovic, Samuel
+                                                                                     Grossman, Christos Kozyrakis, and Edouard Bugnion. 2016. The IX
+A.3    Description                                                                   operating system: Combining low latency, high throughput, and ef-
+                                                                                     ficiency in a protected dataplane. ACM Transactions on Computer
+A.3.1 How to access. https://github.com/ArchSecLab/xui                               Systems (TOCS) 34, 4 (2016), 1–39.
+A.3.2 Hardware dependencies. These tests require a pro-                         [14] Balakrishnan Chandrasekaran. 2009. Survey of network traffic models.
+                                                                                     Waschington University in St. Louis CSE 567 (2009).
+cessor with Intel Sapphire Rapids Microarchitecture.                            [15] Jamison D Collins, Dean M Tullsen, and Hong Wang. 2004. Control
+                                                                                     flow optimization via dynamic reconvergence prediction. In Interna-
+A.4    Installation                                                                  tional Symposium on Microarchitecture (MICRO). IEEE.
+Please follow the step of the README.md in the reposi-                          [16] RISC-V Community. 2025. RISC-V Fast Interrupts and Core-Local
+tory. There are 7 folders in the xui repository, each of them                        Interrupt Controller (CLIC).       https://github.com/riscv/riscv-fast-
+                                                                                     interrupt/blob/master/src/clic.adoc
+has its own README.md that explains how to generate                             [17] Russ Cox, Robert Griesemer, Rob Pike, Ian Lance Taylor, and Ken
+the experiment results. The folders are: rocksdb, accel, l3,                         Thompson. 2022. The Go programming language and environment.
+overhead, safepoint, timer, and profile. The measurements                            Commun. ACM 65, 5 (2022), 70–78.
+on real hardware require a Sapphire Rapid processor, and at                     [18] Jack J Dongarra, Piotr Luszczek, and Antoine Petitet. 2003. The LIN-
+least a 40-core machine is suggested. There are a few Ubuntu                         PACK benchmark: past, present and future. Concurrency and Compu-
+                                                                                     tation: practice and experience 15, 9 (2003), 803–820.
+disk images for use with the full system mode of gem5 sim-                      [19] DPDK Project. [n. d.]. L3 Forwarding Sample Application User Guide.
+ulator, you will find a link to download those disks on the                          Accessed: 2024-18-10.
+README.md pages.                                                                [20] Stijn Eyerman, Wim Heirman, Sam Van Den Steen, and Ibrahim Hur.
+                                                                                     2021. Enabling Branch-Mispredict Level Parallelism by Selectively
+A.5    Evaluation and expected results                                               Flushing Instructions. In MICRO-54: 54th Annual IEEE/ACM Interna-
+                                                                                     tional Symposium on Microarchitecture (Virtual Event, Greece) (MI-
+We expect the experiments to closely match those in the                              CRO ’21). Association for Computing Machinery, New York, NY, USA,
+paper.                                                                               767–778. doi:10.1145/3466752.3480045
+                                                                                [21] Fastly. [n. d.]. Fastly Compute. https://www.fastly.com/resources/
+A.6    Methodology                                                                   datasheets/edge-compute/fastly-compute/. Accessed: 2024-10-18.
+Submission, reviewing, and badging methodology:                                 [22] Agner Fog. 2024. Test programs for measuring clock cycles and per-
+                                                                                     formance monitoring. https://www.agner.org/optimize/
+ ▶ https://www.acm.org/publications/policies/artifact-review-                   [23] Linux Kernel Foundation. [n. d.]. Performance Counters for Linux
+   and-badging-current                                                               (perf). https://perf.wiki.kernel.org/index.php/Main_Page. Accessed:
+ ▶ https://cTuning.org/ae                                                            2024-18-10.
+                                                                                [24] RISC-V Foundation. 2017. Document ’N’ extension. https://github.
+References                                                                           com/riscv/riscv-isa-manual/issues/16. Accessed: 2025-02-08.
+                                                                                [25] Joshua Fried, Gohar Irfan Chaudhry, Enrique Saurez, Esha Choukse,
+ [1] [n. d.]. DPDK. https://www.dpdk.org/.
+                                                                                     Íñigo Goiri, Sameh Elnikety, Rodrigo Fonseca, and Adam Belay. 2024.
+ [2] [n. d.]. Go Preemption Issue 10958. https://github.com/golang/go/
+                                                                                     Making kernel bypass practical for the cloud with Junction. In 21st
+     issues/10958.
+                                                                                     USENIX Symposium on Networked Systems Design and Implementation
+ [3] [n. d.]. The Go Programming Language. https://go.dev/.
+                                                                                     (NSDI 24). 55–73.
+ [4] [n. d.]. Intel® 64 and IA-32 Architectures Software Developer’s Man-
+                                                                                [26] Joshua Fried, Zhenyuan Ruan, Amy Ousterhout, and Adam Belay. 2020.
+     ual. https://www.intel.com/content/www/us/en/developer/articles/
+                                                                                     Caladan: Mitigating interference at microsecond timescales. In 14th
+     technical/intel-sdm.html.
+                                                                                     USENIX Symposium on Operating Systems Design and Implementation
+ [5] [n. d.]. Linux Support For Sapphire Rapids’ User Interrupts Still Await-
+                                                                                     (OSDI 20). 281–297.
+     ing Mainline. https://www.phoronix.com/news/Linux-SPR-Intel-User-
+                                                                                [27] V.S. Frost and B. Melamed. 1994. Traffic modeling for telecommunica-
+     Interrupts.
+                                                                                     tions networks. IEEE Communications Magazine 32, 3 (1994), 70–81.
+ [6] [n. d.]. Loom - Fibers, Continuations and Tail-Calls for the JVM. https:
+                                                                                     doi:10.1109/35.267444
+     //openjdk.org/projects/loom/.
+                                                                                [28] Go Team. 2015. runtime: tight loops should be preemptible. https:
+ [7] [n. d.].       Proposal: Non-cooperative goroutine preemption.
+                                                                                     //github.com/golang/go/issues/10958 GitHub issue #10958, accessed
+     https://go.googlesource.com/proposal/+/master/design/24543-
+                                                                                     on 2025-02-08.
+     non-cooperative-preemption.md.
+                                                                                [29] Hossein Golestani, Amirhossein Mirhosseini, and Thomas F Wenisch.
+ [8] [n. d.]. RocksDB: A Persistent Key-Value Store for Flash and RAM
+                                                                                     2019. Software data planes: You can’t always spin to win. In Proceedings
+     Storage. https://github.com/facebook/rocksdb.
+                                                                                     of the ACM Symposium on Cloud Computing. 337–350.
+ [9] [n. d.]. Storage Performance Development Kit. https://spdk.io/.
+                                                                                [30] Linsong Guo, Danial Zuberi, Tal Garfinkel, and Amy Ousterhout.
+[10] Austin Clement. 2020. Pardon the Interruption:loop preemption in Go
+                                                                                     2025. The Benefits and Limitations of User Interrupts for Preemptive
+     1.14. https://www.youtube.com/watch?v=1I1WmeSjRSw
+                                                                                     Userspace Scheduling. In Proceedings of the 22nd USENIX Symposium
+[11] Luiz Barroso, Mike Marty, David Patterson, and Parthasarathy Ran-
+                                                                                     on Networked Systems Design and Implementation (NSDI). To appear.
+     ganathan. 2017. Attack of the killer microseconds. Commun. ACM 60,
+                                                                                [31] Intel. 2020. Intel® 64 and IA-32 Architectures Software Developer’s
+     4 (2017), 48–54.
+                                                                                     Manual.
+[12] Adam Belay, Andrea Bittau, Ali José Mashtizadeh, David Terei, David
+                                                                                [32] Intel. 2023. Intel® Architecture Instruction Set Extensions and Fu-
+     Mazières, and Christos Kozyrakis. 2012. Dune: Safe User-level Access
+                                                                                     ture Features. https://cdrdv2-public.intel.com/812218/architecture-
+     to Privileged CPU Features. In Proceedings of the USENIX Symposium
+                                                                                     instruction-set-extensions-programming-reference.pdf.
+     on Operating Systems Design and Implementation (OSDI).
+Extended User Interrupts (xUI): Fast and Flexible Notification without Polling               ASPLOS ’25, March 30–April 3, 2025, Rotterdam, Netherlands.
+
+
+[33] Intel Corporation. 2024. What is Intel® QuickAssist Technology (Intel®      [47] Amirhossein Mirhosseini, Hossein Golestani, and Thomas F Wenisch.
+     QAT)? https://www.intel.com/content/www/us/en/products/docs/                     2020. HyperPlane: A scalable low-latency notification accelerator for
+     accelerator-engines/what-is-intel-qat.html. Accessed: 2024-18-10.                software data planes. In 2020 53rd Annual IEEE/ACM International
+[34] Rishabh Iyer, Musa Unal, Marios Kogias, and George Candea. 2023.                 Symposium on Microarchitecture (MICRO). IEEE, 852–867.
+     Achieving Microsecond-Scale Tail Latency Efficiently with Approx-           [48] Amy Ousterhout, Joshua Fried, Jonathan Behrens, Adam Belay, and
+     imate Optimal Scheduling. In Proceedings of the 29th Symposium on                Hari Balakrishnan. 2019. Shenango: Achieving High CPU Efficiency for
+     Operating Systems Principles. 466–481.                                           Latency-sensitive Datacenter Workloads. In 16th USENIX Symposium
+[35] Yuekai Jia, Kaifu Tian, Yuyang You, Yu Chen, and Kang Chen. 2024.                on Networked Systems Design and Implementation (NSDI 19). 361–378.
+     Skyloft: A General High-Efficient Scheduling Framework in User Space.       [49] John Ousterhout, Arjun Gopalan, Ashish Gupta, Ankita Kejriwal,
+     In ACM Symposium on Operating Systems Principles (SOSP).                         Collin Lee, Behnam Montazeri, Diego Ongaro, Seo Jin Park, Henry
+[36] Richard Jones, Antony Hosking, and Eliot Moss. 2023. The garbage                 Qin, Mendel Rosenblum, et al. 2015. The RAMCloud storage system.
+     collection handbook: the art of automatic memory management. CRC                 ACM Transactions on Computer Systems (TOCS) 33, 3 (2015), 1–55.
+     Press.                                                                      [50] J.C. Park and M.S. Schlansker. 1991. On predicated execution. Technical
+[37] Kostis Kaffes, Timothy Chong, Jack Tigar Humphries, Adam Belay,                  Report. Hewlett Packard Tech. Rep. HPL-91-58.
+     David Mazières, and Christos Kozyrakis. 2019. Shinjuku: Preemptive          [51] Mike Parker. 2002. A case for user-level interrupts. ACM SIGARCH
+     scheduling for 𝜇second-scale tail latency. In 16th USENIX Symposium              Computer Architecture News 30, 3 (2002), 17–18.
+     on Networked Systems Design and Implementation (NSDI 19). 345–360.          [52] George Prekas, Marios Kogias, and Edouard Bugnion. 2017. Zygos:
+[38] Utkarsh Y. Kakaiya, Sanjay Kumar, Rajesh Madukkarumuku-                          Achieving low tail latency for microsecond-scale networked tasks. In
+     mana Sankaran, and Prashant Seth. 2022.              Scalable I/O Be-            Proceedings of the 26th Symposium on Operating Systems Principles.
+     tween Accelerators and Host Processors. Intel Developer Articles                 325–341.
+     (2022). https://www.intel.com/content/www/us/en/developer/articles/         [53] Korakit Seemakhupt, Brent E Stephens, Samira Khan, Sihang Liu,
+     technical/scalable-io-between-accelerators-host-processors.html                  Hassan Wassel, Soheil Hassas Yeganeh, Alex C Snoeren, Arvind Krish-
+[39] Anuj Kalia, Michael Kaminsky, and David Andersen. 2019. Datacenter               namurthy, David E Culler, and Henry M Levy. 2023. A Cloud-Scale
+     RPCs can be general and fast. In 16th USENIX Symposium on Networked              Characterization of Remote Procedure Calls. In Proceedings of the 29th
+     Systems Design and Implementation (NSDI 19). 1–16.                               Symposium on Operating Systems Principles. 498–514.
+[40] Svilen Kanev, Juan Pablo Darago, Kim Hazelwood, Parthasarathy Ran-          [54] Sangmin Seo, Abdelhalim Amer, Pavan Balaji, Cyril Bordage, George
+     ganathan, Tipp Moseley, Gu-Yeon Wei, and David Brooks. 2015. Pro-                Bosilca, Alex Brooks, Philip Carns, Adrián Castelló, Damien Genet,
+     filing a warehouse-scale computer. In Proceedings of the 42nd Annual             Thomas Herault, et al. 2017. Argobots: A lightweight low-level thread-
+     International Symposium on Computer Architecture. 158–169.                       ing and tasking framework. IEEE Transactions on Parallel and Dis-
+[41] Ana Klimovic, Heiner Litz, and Christos Kozyrakis. 2017. Reflex:                 tributed Systems 29, 3 (2017), 512–526.
+     Remote flash ≈ local flash. ACM SIGARCH Computer Architecture News          [55] Shumpei Shiina, Shintaro Iwasaki, Kenjiro Taura, and Pavan Balaji.
+     45, 1 (2017), 345–359.                                                           2021. Lightweight preemptive user-level threads. In Proceedings of the
+[42] Reese Kuper, Ipoom Jeong, Yifan Yuan, Ren Wang, Narayan Ran-                     26th ACM SIGPLAN Symposium on Principles and Practice of Parallel
+     ganathan, Nikhil Rao, Jiayu Hu, Sanjay Kumar, Philip Lantz, and                  Programming. 374–388.
+     Nam Sung Kim. 2024. A Quantitative Analysis and Guidelines of               [56] Jovan Stojkovic, Chunao Liu, Muhammad Shahbaz, and Josep Torrellas.
+     Data Streaming Accelerator in Modern Intel Xeon Scalable Processors.             2023. 𝜇Manycore: A Cloud-Native CPU for Tail at Scale. In Proceedings
+     In Proceedings of the 29th ACM International Conference on Architectural         of the 50th Annual International Symposium on Computer Architecture.
+     Support for Programming Languages and Operating Systems, Volume 2.               1–15.
+     37–54.                                                                      [57] Chandramohan A Thekkath and Henry M Levy. 1994. Hardware and
+[43] Bojie Li, Zihao Xiang, Xiaoliang Wang, Han Ruan1 Jingbin Zhou, and               software support for efficient exception handling. In Proceedings of the
+     Kun Tan. 2023. FastWake: Revisiting Host Network Stack for Interrupt-            Sixth International Conference on Architectural Support for Programming
+     mode RDMA. Context 5 (2023), 9.                                                  Languages and Operating Systems. 110–119.
+[44] Yueying Li, Nikita Lazarev, David Koufaty, Tenny Yin, Andy Anderson,        [58] Johnson Umeike, Siddharth Agarwal, Nikita Lazarev, and Mohammad
+     Zhiru Zhang, G Edward Suh, Kostis Kaffes, and Christina Delimitrou.              Alian. 2024. Userspace Networking in gem5. In 2024 IEEE International
+     2024. LibPreemptible: Enabling Fast, Adaptive, and Hardware-Assisted             Symposium on Performance Analysis of Systems and Software (ISPASS).
+     User-Space Scheduling. In 2024 IEEE International Symposium on High-             179–191. doi:10.1109/ISPASS61541.2024.00026
+     Performance Computer Architecture (HPCA). IEEE, 922–936.                    [59] Kenton Varda. 2018. WebAssembly on Cloudflare Workers. https:
+[45] llvm.org. 2024. Garbage Collection Safepoints in LLVM. https://llvm.             //blog.cloudflare.com/webassembly-on-cloudflare-workers/.
+     org/docs/Statepoints.html.                                                  [60] WhatsApp Blog. 2011. 1 million is so 2011. https://blog.whatsapp.
+[46] Jason Lowe-Power, Abdul Mutaal Ahmad, Ayaz Akram, Mohammad                       com/196/1-million-is-so-2011
+     Alian, Rico Amslinger, Matteo Andreozzi, Adrià Armejach, Nils As-           [61] Adam Wierman and Bert Zwart. 2012. Is tail-optimal scheduling
+     mussen, Brad Beckmann, Srikant Bharadwaj, Gabe Black, Gedare                     possible? Operations research 60, 5 (2012), 1249–1257.
+     Bloom, Bobby R. Bruce, Daniel Rodrigues Carvalho, Jeronimo Cas-             [62] Jisoo Yang, Dave B Minturn, and Frank Hady. 2012. When poll is better
+     trillon, Lizhong Chen, Nicolas Derumigny, Stephan Diestelhorst,                  than interrupt.. In FAST, Vol. 12. 3–3.
+     Wendy Elsasser, Carlos Escuin, Marjan Fariborz, Amin Farmahini-             [63] Yifan Yuan, Ren Wang, Narayan Ranganathan, Nikhil Rao, Sanjay
+     Farahani, Pouya Fotouhi, Ryan Gambord, Jayneel Gandhi, Dibakar                   Kumar, Philip Lantz, Vivekananthan Sanjeepan, Jorge Cabrera, Atul
+     Gope, Thomas Grass, Anthony Gutierrez, Bagus Hanindhito, Andreas                 Kwatra, Rajesh Sankaran, et al. 2024. Intel accelerators ecosystem:
+     Hansson, Swapnil Haria, et al. 2020. The gem5 Simulator: Version                 An soc-oriented perspective: Industry product. In 2024 ACM/IEEE
+     20.0+. doi:10.48550/ARXIV.2007.03152                                             51st Annual International Symposium on Computer Architecture (ISCA).
+                                                                                      IEEE, 848–862.
+
